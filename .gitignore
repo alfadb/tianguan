@@ -1,0 +1,33 @@
+# HarmonyOS IDE 与本机构建产物
+.idea/
+.deveco/
+build/
+oh_modules/
+.hvigor/
+local.properties
+
+# 密钥、证书与签名材料
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.key
+*.cer
+*.csr
+*.p7b
+*.p7c
+*.profile
+*.p7s
+signing/
+signatures/
+# 仅忽略签名 profile 配置，不屏蔽全部 JSON/JSON5 或 build-profile.json5
+signing-profile.json5
+signing-profiles.json5
+*-signing-profile.json5
+profile.json5
+*.profile.json5
+
+# 本地系统文件
+.DS_Store
+Thumbs.db
