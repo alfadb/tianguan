@@ -1,14 +1,16 @@
-# 鸿桌 / HongDesk（HD）
+# 天关 / Tianguan（TG）
 
 面向 HarmonyOS 的 VNC + RDP 远程桌面客户端计划，优先支持 HarmonyOS PC，关注友好的界面与连接管理。
 
-HongDesk (HD) is a planned community VNC and RDP client for HarmonyOS, with HarmonyOS PC as the first target.
+Tianguan (TG) is a planned community VNC and RDP client for HarmonyOS, with HarmonyOS PC as the first target.
 
 ## 当前状态
 
 **pre-implementation（实现前准备）**：本仓库目前只有文档和许可材料，没有实现代码、可运行 App 或可用安装包，也没有可执行的构建流程。以下内容均为计划与验收目标，不代表功能已实现或兼容性已验证。
 
-项目名称为「鸿桌」，英文名 HongDesk，简称 HD；GitHub 仓库为 [alfadb/hongdesk](https://github.com/alfadb/hongdesk)。
+项目名称为「天关」，英文名 Tianguan，简称 TG；GitHub 仓库为 [alfadb/tianguan](https://github.com/alfadb/tianguan)。
+
+名称沿用「太一」体系的星官命名意象。[《晋书·卷十一》](https://zh.wikisource.org/zh-hans/晉書/卷011)记载：“天关一星，在五车南，亦曰天门，日月之所行也，主边事，主关闭。”本项目借「天关」表达通往远端桌面的入口；“远端入口”是现代寓意。
 
 这是独立社区项目，非华为官方项目，与华为不存在官方隶属或背书关系。
 

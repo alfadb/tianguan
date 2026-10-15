@@ -2,7 +2,7 @@
 
 ## 自有代码的授权
 
-鸿桌 / HongDesk（HD）的自有代码采用 GNU General Public License v3.0 or later，SPDX 标识为 `GPL-3.0-or-later`。接收者可以选择遵循 GPL 第 3 版，或自由软件基金会发布的任何后续版本。
+天关 / Tianguan（TG）的自有代码采用 GNU General Public License v3.0 or later，SPDX 标识为 `GPL-3.0-or-later`。接收者可以选择遵循 GPL 第 3 版，或自由软件基金会发布的任何后续版本。
 
 选择 GPLv3 是为了让分发的衍生作品继续提供相应源码与修改自由，并为评估可能采用不同许可的协议内核保留兼容空间。GPLv3 的强著佐权义务须在实际组合与分发方式明确后落实。
 
