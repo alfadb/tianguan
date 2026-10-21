@@ -1,26 +1,76 @@
-import diag from 'libtianguan_diag.so';
-import { common } from '@kit.AbilityKit';
-import { fileIo as fs } from '@kit.CoreFileKit';
+/**
+ * Remote desktop page — one instance per session, hosted either in its own
+ * sub-window (window name "remote-<sessionId>", the normal path) or inside the
+ * main window (router fallback when sub-window creation failed; the session id
+ * then arrives through router params).
+ *
+ * The session this page drives is NEVER guessed. It comes from one of exactly
+ * two sources: router params (main-window fallback) or this page's OWN window
+ * name, read from its UIContext and mapped back by sessionIdForWindowName().
+ * When neither yields an id the page fails closed: the error is shown, every
+ * input path stays unmounted and the close-session action is hidden. There is
+ * no "last window", FIFO or "first registry session" fallback.
+ *
+ * Everything talks to the native layer through diag/SessionApi.ets with THIS
+ * session's id; the status is parsed as JSON per docs/napi-contract.md (never
+ * the legacy "key=value" text). The 30 ms poll drives frames (takeFrame with
+ * afterVersion/forceFull), the local cursor, the status text, the
+ * trust-required panel and the clipboard edge (clipboard.version ->
+ * clipboard/TianguanClipboard). The poll slows to 1 s (status only) while the
+ * page is hidden.
+ */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { image } from '@kit.ImageKit';
 import { KeyCode } from '@ohos.multimodalInput.keyCode';
 import pointer from '@ohos.multimodalInput.pointer';
 import { window } from '@kit.ArkUI';
+import {
+  copyCursor, parseFrameMeta, reconnectSession, releaseSessionInput, requestFullFrame,
+  sendKey, sendPointer, sessionStatus, takeFrameRaw,
+  SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
+} from '../diag/SessionApi';
+import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
+import { findSession, closeSessionById, markWindowOpen } from '../model/SessionRegistry';
+import { trustFingerprint } from '../model/ConnectionStore';
+import { onRemoteClipboardVersion, clipboardRegisterSession,
+  clipboardUnregisterSession } from '../clipboard/TianguanClipboard';
+import { closeRemoteWindow, sessionIdForWindowName,
+  sessionKeyForWindow } from '../windows/RemoteWindows';
+
+const DOMAIN: number = 0x0000;
+const TAG: string = 'TianguanDiag';
+
+interface RemoteRouterParams {
+  sessionId?: string;
+}
 
 @Entry
 @Component
 struct Remote {
-  @State private status: string = '连接中…';
-  @State private lastEvent: string = '无输入事件';
+  @State private statusText: string = '连接中…';
+  @State private sessionName: string = '';
+  // True once bootstrap() knows which session this page shows: from then on the
+  // Canvas is always part of the tree. It must never wait for a first frame,
+  // because the first frame can only arrive through this Canvas.
+  @State private sessionResolved: boolean = false;
+  // Resolution failed: no session can be attributed to this page. Input stays
+  // unmounted and the only action is going back to the list.
+  @State private resolutionFailed: boolean = false;
+  // "There is already drawable content": only used for secondary UI (the
+  // waiting hint and the local cursor layer), never to gate the Canvas.
   @State private canvasShown: boolean = false;
   @State private cursorPm: image.PixelMap | undefined = undefined;
   @State private cursorLeft: number = -1;
   @State private cursorTop: number = -1;
   @State private cursorDrawW: number = 0;
   @State private cursorDrawH: number = 0;
+  @State private fingerprint: string = '';
+  @State private needsTrust: boolean = false;
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private canvasReady: boolean = false;
+  private sessionId: string = '';
+  private inSubWindow: boolean = false;
   private framePixels: image.PixelMap | undefined = undefined;
   private frameReady: boolean = false;
   private regionBuffer: ArrayBuffer = new ArrayBuffer(0);
@@ -29,9 +79,13 @@ struct Remote {
   private viewWidth: number = 0;
   private viewHeight: number = 0;
   private lastVersion: number = -1;
+  private forceFull: boolean = true;
+  private lastGeneration: number = -1;
   private lastCursorVersion: number = -1;
+  private lastClipboardVersion: number = -1;
+  private badStatusCount: number = 0;
   private timer: number = -1;
-  private hasMouse: boolean = false;
+  private idleTimer: number = -1;
   // Buttons currently held, in RFB mask form (0 = none).
   private pressedMask: number = 0;
   private lastTapMs: number = 0;
@@ -39,70 +93,370 @@ struct Remote {
   private lastTapY: number = -1;
   private shiftDown: boolean = false;
   private pressedKeysym: Map<number, number> = new Map<number, number>();
-  private statFrames: number = 0;
-  private statDecodeMs: number = 0;
-  private statLastAt: number = 0;
-  private statLastVersion: number = -1;
-  private lastStatusText: string = '';
+  // Last remote pixel the pointer was actually at; the release uses it when the
+  // physical pointer is outside the picture (letterbox) by then.
+  private lastRemoteX: number = -1;
+  private lastRemoteY: number = -1;
   private closed: boolean = false;
+  private disposed: boolean = false;
+  private tornDown: boolean = false;
+  private pageVisible: boolean = true;
+  private lastState: string = '';
+  // Single in-flight render: the 30 ms poll must never start overlapping draws.
+  private applying: boolean = false;
+  // Bumped whenever the local mirror is invalidated; a render that started
+  // under an older epoch must not commit its version or draw.
+  private renderEpoch: number = 0;
+  // PixelMaps dropped while a render was inside writePixels(); released when
+  // that render returns so a pixel map is never released under an active write.
+  private staleFramePixels: image.PixelMap[] = [];
+  private ownWindowName: string = '';
+  private ownWindow: window.Window | undefined = undefined;
+  private windowEventCallback: ((event: window.WindowEventType) => void) | undefined = undefined;
   private lastTouchX: number = -1;
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
   private viewPointerY: number = -1;
 
   aboutToAppear(): void {
-    this.timer = setInterval(() => { this.poll(); }, 30);
+    this.bootstrap();
+  }
+
+  onPageShow(): void {
+    this.setPageVisible(true);
+  }
+
+  onPageHide(): void {
+    this.setPageVisible(false);
+  }
+
+  private async bootstrap(): Promise<void> {
+    const resolvedId = await this.resolveSessionId();
+    // The page can be destroyed while the id is being resolved (e.g. the
+    // half-built window of a failed open). A dead page must not register
+    // clipboard hooks or start timers.
+    if (this.disposed) {
+      return;
+    }
+    this.sessionId = resolvedId;
+    if (this.sessionId.length === 0) {
+      this.resolutionFailed = true;
+      this.statusText = '无法确定本页所属的会话（缺少 router 参数，且本窗口名不是远程窗口）';
+      hilog.error(DOMAIN, TAG, 'remote 页面无法确定会话归属，已禁用输入');
+      return;
+    }
+    this.sessionName = this.sessionNameOf(this.sessionId);
+    hilog.info(DOMAIN, TAG, 'remote 页面启动 session=%{public}s sub=%{public}s',
+      this.sessionId, String(this.inSubWindow));
+    markWindowOpen(this.sessionId, true);
+    clipboardRegisterSession(this.sessionId);
+    this.attachWindowEvents();
+    // Mount the Canvas now; onReady() can fire (and frames can start flowing)
+    // even before the first connection status arrives.
+    this.sessionResolved = true;
+    this.startPolling();
   }
 
   aboutToDisappear(): void {
-    this.stopPolling();
-    diag.stopSession();
+    // Losing the view is NOT a user close: the session keeps running (the main
+    // list, the tray and the 断开 button own its lifetime). Only closeWindow()
+    // below ends it.
+    this.disposed = true;
+    this.teardown();
+  }
+
+  private teardown(): void {
+    if (this.tornDown) {
+      return;
+    }
+    this.tornDown = true;
+    this.stopFrameTimer();
+    this.stopIdleTimer();
+    this.detachWindowEvents();
+    this.dropFramePixels();
+    this.releaseCursorPixelMap();
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    this.releaseAllInputs('teardown');
+    clipboardUnregisterSession(this.sessionId);
+    markWindowOpen(this.sessionId, false);
     this.setHostCursorVisible(true);
   }
 
-  private stopPolling(): void {
+  // -------------------------------------------------------------------------
+  // Session id resolution. Exactly two evidence sources, in order:
+  //   1) router params — the main-window fallback opened by Index;
+  //   2) this page's own window name — the sub-window created as
+  //      windowNameForSession(sessionId).
+  // Anything else is a guess and is deliberately absent (F01).
+  // -------------------------------------------------------------------------
+
+  private async resolveSessionId(): Promise<string> {
+    // Which window is this page actually in? getWindowName() answers for THIS
+    // page's UIContext (@ohos.arkui.UIContext.d.ts, API 12), unlike
+    // getLastWindow(), which returns the topmost window and is therefore not
+    // evidence about the window hosting this page.
+    let windowName = '';
+    try {
+      const name = this.getUIContext().getWindowName();
+      if (name !== undefined && name.length > 0) {
+        windowName = name;
+      }
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote 读取本窗口名失败：%{public}s', String(error));
+    }
+    this.ownWindowName = windowName;
+    const windowSession = windowName.length > 0 ? sessionIdForWindowName(windowName) : '';
+    if (windowSession.length > 0) {
+      this.inSubWindow = true;
+    }
+    // 1) Router params — the main-window fallback path opened by Index.
+    try {
+      const params = this.getUIContext().getRouter().getParams() as RemoteRouterParams | undefined;
+      if (params !== undefined && params !== null &&
+          typeof params.sessionId === 'string' && params.sessionId.length > 0) {
+        return params.sessionId;
+      }
+    } catch (error) {
+      // No router context — the sub-window path below still applies.
+    }
+    // 2) The sub-window's own name carries its session id by construction.
+    // Cross-check the binding key written before the page was loaded: a
+    // conflicting key means the window identity is inconsistent, so refuse to
+    // attach instead of silently picking one of the two.
+    if (windowSession.length > 0) {
+      const mapped = AppStorage.get<string>(sessionKeyForWindow(windowName));
+      if (mapped !== undefined && mapped.length > 0 && mapped !== windowSession) {
+        hilog.error(DOMAIN, TAG, 'remote 窗口身份冲突 window=%{public}s key=%{public}s',
+          windowName, mapped);
+        return '';
+      }
+      return windowSession;
+    }
+    // Neither source answers: fail closed. No FIFO/registry fallback.
+    return '';
+  }
+
+  private sessionNameOf(id: string): string {
+    const session = findSession(id);
+    return session === undefined ? '' : session.name;
+  }
+
+  private setHostCursorVisible(visible: boolean): void {
+    try {
+      pointer.setPointerVisible(visible).catch((error: Error): void => {
+        hilog.error(DOMAIN, TAG, '光标可见性设置失败：%{public}s', String(error));
+      });
+    } catch (error) {
+      hilog.error(DOMAIN, TAG, '光标可见性异常：%{public}s', String(error));
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Page visibility and window focus.
+  // -------------------------------------------------------------------------
+
+  private attachWindowEvents(): void {
+    const name = this.ownWindowName;
+    if (name.length === 0) {
+      // No named window (main-window path on hosts that do not expose a name):
+      // the page lifecycle below still covers hide/show and teardown.
+      return;
+    }
+    try {
+      // findWindow() is synchronous and throws when the name is unknown; the
+      // name came from this page's own UIContext, so this is THIS window.
+      const own = window.findWindow(name);
+      const callback = (event: window.WindowEventType): void => {
+        this.onWindowEvent(event);
+      };
+      own.on('windowEvent', callback);
+      this.ownWindow = own;
+      this.windowEventCallback = callback;
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '监听窗口事件失败（改用页面生命周期）：%{public}s', String(error));
+    }
+  }
+
+  private detachWindowEvents(): void {
+    const own = this.ownWindow;
+    const callback = this.windowEventCallback;
+    this.ownWindow = undefined;
+    this.windowEventCallback = undefined;
+    if (own === undefined || callback === undefined) {
+      return;
+    }
+    try {
+      own.off('windowEvent', callback);
+    } catch (error) {
+      // The window may already be destroyed; the listener dies with it.
+    }
+  }
+
+  private onWindowEvent(event: window.WindowEventType): void {
+    if (event === window.WindowEventType.WINDOW_INACTIVE) {
+      // Another window now owns the keyboard/mouse: anything held here would
+      // otherwise stay pressed on the server.
+      this.releaseAllInputs('window-inactive');
+    } else if (event === window.WindowEventType.WINDOW_HIDDEN) {
+      this.setPageVisible(false);
+    } else if (event === window.WindowEventType.WINDOW_SHOWN) {
+      this.setPageVisible(true);
+    }
+  }
+
+  private setPageVisible(visible: boolean): void {
+    this.pageVisible = visible;
+    if (this.disposed || this.closed || this.sessionId.length === 0) {
+      return;
+    }
+    if (visible) {
+      this.startFrameTimer();
+      // Content that changed while hidden was never fetched: repaint from a
+      // complete frame right away instead of waiting for a diff.
+      this.requestFull();
+      this.applyPending();
+    } else {
+      // Nobody can see the frames, so stop fetching them; the 1 s status poll
+      // keeps reconnects/trust prompts advancing.
+      this.releaseAllInputs('page-hidden');
+      this.stopFrameTimer();
+      this.startIdleTimer();
+    }
+  }
+
+  private startPolling(): void {
+    if (this.pageVisible) {
+      this.startFrameTimer();
+    } else {
+      this.startIdleTimer();
+    }
+  }
+
+  private startFrameTimer(): void {
+    // Exactly one poll runs at a time: fast (frames) or slow (status only).
+    this.stopIdleTimer();
+    if (this.timer >= 0) {
+      return;
+    }
+    if (this.disposed || this.closed || this.sessionId.length === 0) {
+      return;
+    }
+    this.timer = setInterval((): void => { this.poll(); }, 30);
+  }
+
+  private stopFrameTimer(): void {
     if (this.timer >= 0) {
       clearInterval(this.timer);
       this.timer = -1;
     }
   }
 
-  private filesDir(): string {
-    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    return context.filesDir;
+  private startIdleTimer(): void {
+    this.stopFrameTimer();
+    if (this.idleTimer >= 0) {
+      return;
+    }
+    if (this.disposed || this.closed || this.sessionId.length === 0) {
+      return;
+    }
+    this.idleTimer = setInterval((): void => { this.poll(); }, 1000);
   }
 
-  private recordEvent(text: string): void {
-    this.lastEvent = text;
-    // Append instead of overwrite: the order (focus result, then key events) is
-    // the evidence. The file is capped so it cannot grow without bound.
-    try {
-      const path = this.filesDir() + '/last-input.txt';
-      if (fs.accessSync(path)) {
-        const size = fs.statSync(path).size;
-        if (size > 8192) {
-          fs.unlinkSync(path);
-        }
-      }
-      const file = fs.openSync(path,
-        fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND);
-      try {
-        fs.writeSync(file.fd, text + '\n');
-      } finally {
-        fs.closeSync(file);
-      }
-    } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '记录输入事件失败：%{public}s', String(error));
+  private stopIdleTimer(): void {
+    if (this.idleTimer >= 0) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = -1;
     }
   }
 
-  private setHostCursorVisible(visible: boolean): void {
+  // -------------------------------------------------------------------------
+  // Input release: one entry point for focus loss, hide, teardown, reconnect
+  // and leaving the connected state.
+  // -------------------------------------------------------------------------
+
+  private releaseAllInputs(reason: string): void {
+    const hadLocalState = this.pressedMask !== 0 || this.shiftDown ||
+      this.pressedKeysym.size > 0;
+    this.pressedMask = 0;
+    this.shiftDown = false;
+    this.pressedKeysym.clear();
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    // The native session releases exactly the keys/buttons it recorded, so the
+    // server never keeps a key down just because local bookkeeping was lost.
+    if (hadLocalState) {
+      hilog.info(DOMAIN, TAG, '释放输入 reason=%{public}s session=%{public}s',
+        reason, this.sessionId);
+    }
+    releaseSessionInput(this.sessionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Frame buffer lifetime.
+  // -------------------------------------------------------------------------
+
+  /** Invalidates the local mirror and any render that is currently in flight. */
+  private invalidateRender(): void {
+    this.renderEpoch += 1;
+    this.dropFramePixels();
+    this.lastVersion = -1;
+    this.forceFull = true;
+  }
+
+  /** Asks the server for a non-incremental frame when one can be used now. */
+  private requestFull(): void {
+    this.forceFull = true;
+    if (this.sessionId.length > 0 && this.pageVisible && !this.disposed) {
+      requestFullFrame(this.sessionId);
+    }
+  }
+
+  private dropFramePixels(): void {
+    const old = this.framePixels;
+    this.framePixels = undefined;
+    this.frameReady = false;
+    if (old === undefined) {
+      return;
+    }
+    if (this.applying) {
+      // A render is inside writePixels() on this PixelMap right now; releasing
+      // it here would race the write. The render's finally block releases it.
+      this.staleFramePixels.push(old);
+      return;
+    }
+    this.releasePixelMap(old);
+  }
+
+  private releaseStalePixelMaps(): void {
+    if (this.staleFramePixels.length === 0) {
+      return;
+    }
+    const stale = this.staleFramePixels;
+    this.staleFramePixels = [];
+    for (let i = 0; i < stale.length; i++) {
+      this.releasePixelMap(stale[i]);
+    }
+  }
+
+  private releasePixelMap(pixelMap: image.PixelMap): void {
     try {
-      pointer.setPointerVisible(visible).catch((error: Error) => {
-        hilog.error(0x0000, 'TianguanDiag', '光标可见性设置失败：%{public}s', String(error));
+      pixelMap.release().catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '释放 PixelMap 失败：%{public}s', String(error));
       });
     } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '光标可见性异常：%{public}s', String(error));
+      hilog.warn(DOMAIN, TAG, '释放 PixelMap 异常：%{public}s', String(error));
+    }
+  }
+
+  private releaseCursorPixelMap(): void {
+    const previous = this.cursorPm;
+    this.cursorPm = undefined;
+    this.cursorLeft = -1;
+    if (previous !== undefined) {
+      this.releasePixelMap(previous);
     }
   }
 
@@ -110,72 +464,138 @@ struct Remote {
     if (this.frameReady || this.frameWidth <= 0 || this.frameHeight <= 0) {
       return;
     }
+    const width = this.frameWidth;
+    const height = this.frameHeight;
     try {
-      const empty = new ArrayBuffer(this.frameWidth * this.frameHeight * 4);
+      const empty = new ArrayBuffer(width * height * 4);
       const options: image.InitializationOptions = {
-        size: { width: this.frameWidth, height: this.frameHeight },
+        size: { width: width, height: height },
         pixelFormat: image.PixelMapFormat.BGRA_8888,
         editable: true,
         alphaType: image.AlphaType.OPAQUE
       };
-      this.framePixels = await image.createPixelMap(empty, options);
+      const created = await image.createPixelMap(empty, options);
+      // The size may have changed (or the page gone) while the PixelMap was
+      // being created; keep the mirror consistent with the current frame size.
+      if (this.disposed || width !== this.frameWidth || height !== this.frameHeight) {
+        this.releasePixelMap(created);
+        return;
+      }
+      this.framePixels = created;
       this.frameReady = true;
-      // The mirror starts empty, so ask the server for one complete frame.
-      diag.requestFullFrame();
+      // The mirror starts empty: ask for one complete frame. This is also a
+      // real non-incremental request to the server — an idle desktop never
+      // volunteers the whole picture by itself.
+      this.requestFull();
     } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '创建帧缓冲失败：%{public}s', String(error));
+      hilog.error(DOMAIN, TAG, '创建帧缓冲失败：%{public}s', String(error));
     }
   }
 
+  // A frame belongs to the generation the status snapshot (and therefore the
+  // local PixelMap layout) was prepared for. Every reconnect bumps the native
+  // generation, so anything else is a stale frame from the previous mirror.
+  private static sameGeneration(frameGeneration: number, lastGeneration: number): boolean {
+    return frameGeneration === lastGeneration;
+  }
+
   // Applies the changed rectangle to the local framebuffer mirror and blits the
-  // whole picture once — the same model vncviewer uses.
+  // whole picture once — the same model vncviewer uses. Only ONE render may run
+  // at a time: overlapping applies share regionBuffer/framePixels and could
+  // commit versions that were never drawn.
   private async applyPending(): Promise<void> {
-    const started = Date.now();
+    if (this.applying || this.disposed || this.closed || !this.pageVisible) {
+      return;
+    }
     if (!this.canvasReady || this.viewWidth <= 0 || this.frameWidth <= 0) {
       return;
     }
-    await this.ensureFrameBuffer();
-    if (this.framePixels === undefined) {
-      return;
-    }
+    this.applying = true;
+    const epoch = this.renderEpoch;
     try {
-      if (this.regionBuffer.byteLength < this.frameWidth * this.frameHeight * 4) {
-        this.regionBuffer = new ArrayBuffer(this.frameWidth * this.frameHeight * 4);
+      await this.ensureFrameBuffer();
+      if (epoch !== this.renderEpoch || this.disposed) {
+        return;
+      }
+      const pixels = this.framePixels;
+      if (pixels === undefined) {
+        return;
+      }
+      const needed = this.frameWidth * this.frameHeight * 4;
+      if (this.regionBuffer.byteLength < needed) {
+        this.regionBuffer = new ArrayBuffer(needed);
       }
       // One call returns both pixels and rectangle, so a frame arriving in
       // between cannot mix sizes and tear the picture.
-      const rect = diag.takeRegion(this.regionBuffer);
-      if (rect === 'NONE') {
+      const raw = takeFrameRaw(this.sessionId, this.regionBuffer, this.lastVersion, this.forceFull);
+      if (raw === 'NONE') {
         return;
       }
-      const parts = rect.split(',');
-      if (parts.length !== 4) {
+      if (raw.startsWith('ERROR')) {
+        hilog.warn(DOMAIN, TAG, 'takeFrame：%{public}s', raw);
+        if (raw.indexOf('BUFFER_TOO_SMALL') >= 0) {
+          this.regionBuffer = new ArrayBuffer(0);
+          this.forceFull = true;
+        }
         return;
       }
-      const x = Number(parts[0]);
-      const y = Number(parts[1]);
-      const w = Number(parts[2]);
-      const h = Number(parts[3]);
-      if (w <= 0 || h <= 0) {
+      const meta: FrameMeta | undefined = parseFrameMeta(raw);
+      if (meta === undefined || meta.w <= 0 || meta.h <= 0) {
+        return;
+      }
+      // The status snapshot may be older than the frame: a reconnect between
+      // the status read and this takeFrame (or while a previous await was in
+      // flight) bumps the native generation and rebuilds the mirror with a new
+      // layout. Writing such a frame would mix the old picture into the
+      // PixelMap prepared for the new generation, so drop it entirely: no
+      // PixelMap write, no lastVersion advance. Invalidate the local mirror so
+      // the next render cycle rebuilds it from one complete new-generation
+      // frame.
+      if (!Remote.sameGeneration(meta.generation, this.lastGeneration)) {
+        hilog.warn(DOMAIN, TAG,
+          '丢弃旧代次帧：帧代次=%{public}d 状态代次=%{public}d session=%{public}s',
+          meta.generation, this.lastGeneration, this.sessionId);
+        this.forceFull = true;
+        this.invalidateRender();
+        return;
+      }
+      if (epoch !== this.renderEpoch || this.disposed || pixels !== this.framePixels) {
         return;
       }
       const area: image.PositionArea = {
         pixels: this.regionBuffer,
         offset: 0,
-        stride: w * 4,
-        region: { size: { width: w, height: h }, x: x, y: y }
+        stride: meta.w * 4,
+        region: { size: { width: meta.w, height: meta.h }, x: meta.x, y: meta.y }
       };
-      await this.framePixels.writePixels(area);
+      await pixels.writePixels(area);
+      // The version may only advance once the pixels really landed AND were
+      // drawn from the same mirror generation. A reconnect during the await
+      // bumps both the epoch and the generation; either mismatch means the
+      // pixels just written belong to a layout nobody will draw.
+      if (epoch !== this.renderEpoch || this.disposed || pixels !== this.framePixels ||
+          !Remote.sameGeneration(meta.generation, this.lastGeneration)) {
+        return;
+      }
       const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
       const offsetX = (this.viewWidth - this.frameWidth * scale) / 2;
       const offsetY = (this.viewHeight - this.frameHeight * scale) / 2;
       const dw = Math.round(this.frameWidth * scale);
       const dh = Math.round(this.frameHeight * scale);
-      this.ctx.drawImage(this.framePixels, Math.round(offsetX), Math.round(offsetY), dw, dh);
-      this.statFrames += 1;
-      this.statDecodeMs += Date.now() - started;
+      this.ctx.drawImage(pixels, Math.round(offsetX), Math.round(offsetY), dw, dh);
+      this.lastVersion = meta.version;
+      this.forceFull = false;
+      if (!this.canvasShown) {
+        this.canvasShown = true;
+      }
     } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '应用画面失败：%{public}s', String(error));
+      hilog.error(DOMAIN, TAG, '应用画面失败：%{public}s', String(error));
+      // A failed apply must not skip this version: ask for a complete frame.
+      this.forceFull = true;
+      this.requestFull();
+    } finally {
+      this.applying = false;
+      this.releaseStalePixelMaps();
     }
   }
 
@@ -186,27 +606,29 @@ struct Remote {
     }
     try {
       const buffer = new ArrayBuffer(cw * ch * 4);
-      diag.copyCursor(buffer);
+      copyCursor(this.sessionId, buffer);
       const options: image.InitializationOptions = {
         size: { width: cw, height: ch },
         pixelFormat: image.PixelMapFormat.RGBA_8888,
         editable: false,
         alphaType: image.AlphaType.UNPREMUL
       };
+      const created = await image.createPixelMap(buffer, options);
+      if (this.disposed) {
+        this.releasePixelMap(created);
+        return;
+      }
       const previous = this.cursorPm;
-      this.cursorPm = await image.createPixelMap(buffer, options);
+      this.cursorPm = created;
       if (previous !== undefined) {
-        previous.release();
+        this.releasePixelMap(previous);
       }
     } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '更新光标失败：%{public}s', String(error));
+      hilog.error(DOMAIN, TAG, '更新光标失败：%{public}s', String(error));
     }
   }
 
-  // Repositioning the local cursor is pure layout work: no image rebuild, no
-  // server round trip.
-  // The local cursor follows the physical pointer, like a normal viewer: its
-  // position never needs a server round trip.
+  // The local cursor follows the physical pointer: no server round trip.
   private placeCursor(cw: number, ch: number, hotX: number, hotY: number): void {
     if (this.viewWidth <= 0 || this.frameWidth <= 0 || cw <= 0 || ch <= 0) {
       return;
@@ -221,135 +643,124 @@ struct Remote {
     this.cursorTop = Math.round(this.viewPointerY - hotY * scale);
   }
 
-  private poll(): void {
-    let text = '';
-    try {
-      text = diag.sessionStatus();
-    } catch (error) {
-      this.lastStatusText = 'THROW ' + String(error);
-      return;
+  private applyStatus(status: SessionStatus): void {
+    const width = status.width === undefined ? 0 : status.width;
+    const height = status.height === undefined ? 0 : status.height;
+    if (width > 0 && height > 0 &&
+        (width !== this.frameWidth || height !== this.frameHeight)) {
+      // The mirror no longer matches: invalidate the in-flight render, drop the
+      // old PixelMap (~9 MB at 1920x1200) and rebuild it for the new size.
+      this.invalidateRender();
+      this.frameWidth = width;
+      this.frameHeight = height;
     }
-    this.lastStatusText = text;
-    const running = text.indexOf('running=1') >= 0;
-    const versionAt = text.indexOf('version=');
-    const sizeAt = text.indexOf('size=');
-    const errorAt = text.indexOf('error=');
-    if (sizeAt >= 0) {
-      const raw = text.substring(sizeAt + 5, text.indexOf(' ', sizeAt) >= 0
-        ? text.indexOf(' ', sizeAt) : text.length);
-      const parts = raw.split('x');
-      if (parts.length === 2) {
-        this.frameWidth = Number(parts[0]);
-        this.frameHeight = Number(parts[1]);
+    // A reconnect (generation bump) rebuilt the native mirror: the local
+    // PixelMap now describes a picture that no longer exists. Drop it, so the
+    // next frame starts from a fresh mirror, and ask for a complete frame
+    // instead of waiting for the server to volunteer one. Inputs pressed on the
+    // old generation must be released as well.
+    const generation = status.generation === undefined ? 0 : status.generation;
+    if (generation > 0) {
+      if (this.lastGeneration >= 0 && generation !== this.lastGeneration) {
+        this.releaseAllInputs('generation');
+        this.invalidateRender();
+        this.requestFull();
       }
+      this.lastGeneration = generation;
     }
-    if (versionAt >= 0) {
-      const version = Number(text.substring(versionAt + 8, text.indexOf(' ', versionAt)));
-      if (!Number.isNaN(version) && version > 0) {
-        this.canvasShown = true;
-        this.applyPending();
-      }
+    // Leaving "connected" (reconnect, failure, trust prompt, disconnect) means
+    // the server side may never have seen the key/button releases.
+    if (this.lastState === SESSION_STATE_CONNECTED && status.state !== SESSION_STATE_CONNECTED) {
+      this.releaseAllInputs('state-left-connected');
+    }
+    this.lastState = status.state;
+    // Clipboard edge: one take per version bump.
+    const clip = status.clipboard;
+    if (clip !== undefined && typeof clip.version === 'number' &&
+        clip.version !== this.lastClipboardVersion) {
+      this.lastClipboardVersion = clip.version;
+      onRemoteClipboardVersion(this.sessionId, clip.version);
     }
     // Cursor shape and position come from the server but are drawn locally.
+    const cursor: CursorInfo | undefined = status.cursor;
     let cw = 0;
     let ch = 0;
     let hotX = 0;
     let hotY = 0;
     let cursorVersion = 0;
-    const cursorAt = text.indexOf('cursor=');
-    if (cursorAt >= 0) {
-      const end = text.indexOf(' ', cursorAt);
-      const raw = text.substring(cursorAt + 7, end < 0 ? text.length : end);
-      const parts = raw.split(',');
-      if (parts.length === 4) {
-        const dims = parts[0].split('x');
-        if (dims.length === 2) {
-          cw = Number(dims[0]);
-          ch = Number(dims[1]);
-        }
-        hotX = Number(parts[1]);
-        hotY = Number(parts[2]);
-        cursorVersion = Number(parts[3]);
-      }
-    }
-    let posX = 0;
-    let posY = 0;
-    const posAt = text.indexOf('cpos=');
-    if (posAt >= 0) {
-      const end = text.indexOf(' ', posAt);
-      const parts = text.substring(posAt + 5, end < 0 ? text.length : end).split(',');
-      if (parts.length === 2) {
-        posX = Number(parts[0]);
-        posY = Number(parts[1]);
-      }
-    }
     let cursorBlank = false;
-    const blankAt = text.indexOf('blank=');
-    if (blankAt >= 0) {
-      cursorBlank = text.substring(blankAt + 6, blankAt + 7) === '1';
+    if (cursor !== undefined) {
+      cw = cursor.w;
+      ch = cursor.h;
+      hotX = cursor.hotX;
+      hotY = cursor.hotY;
+      cursorVersion = cursor.version;
+      cursorBlank = cursor.blank === true;
     }
     if (cursorBlank) {
       // The server told us it drew the pointer into the picture itself.
-      if (this.cursorPm !== undefined) {
-        const previous = this.cursorPm;
-        this.cursorPm = undefined;
-        previous.release();
-      }
-      this.cursorLeft = -1;
-    } else if (cw > 0 && ch > 0 && cursorVersion !== this.lastCursorVersion &&
-        this.canvasShown) {
+      this.releaseCursorPixelMap();
+    } else if (cw > 0 && ch > 0 && cursorVersion !== this.lastCursorVersion && this.canvasShown) {
       this.lastCursorVersion = cursorVersion;
       this.updateCursorShape(cw, ch);
     }
     if (this.canvasShown && !cursorBlank) {
       this.placeCursor(cw, ch, hotX, hotY);
     }
-    if (errorAt >= 0) {
-      // The session thread keeps retrying in the background, so report the
-      // state but keep polling; stopping here made a dropped connection look
-      // like a frozen window.
-      this.status = '连接中断，正在重连：' + text.substring(errorAt + 6);
+    // State machine -> status text.
+    if (status.state === SESSION_STATE_TRUST_REQUIRED) {
+      this.needsTrust = true;
+      this.fingerprint = status.fingerprint === undefined ? '' : status.fingerprint;
+      this.statusText = '需要确认身份';
       return;
     }
-    this.status = running ? '已连接（实时刷新）' : '连接中…';
-    this.writeStats(versionAt >= 0 ? this.lastVersion : -1);
-  }
-
-  private writeStats(version: number): void {
-    const now = Date.now();
-    if (this.statLastAt === 0) {
-      this.statLastAt = now;
-      this.statLastVersion = version;
-      return;
-    }
-    const elapsed = now - this.statLastAt;
-    if (elapsed < 3000) {
-      return;
-    }
-    const fps = elapsed > 0 ? (this.statFrames * 1000 / elapsed) : 0;
-    const decodeAvg = this.statFrames > 0 ? (this.statDecodeMs / this.statFrames) : 0;
-    const versions = version - this.statLastVersion;
-    const line = 'fps=' + fps.toFixed(1) + ' frames=' + this.statFrames +
-      ' decodeMs=' + decodeAvg.toFixed(1) + ' versions=' + versions +
-      ' windowMs=' + elapsed + ' status=[' + this.lastStatusText + ']';
-    try {
-      const file = fs.openSync(this.filesDir() + '/perf.txt',
-        fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND);
-      try {
-        fs.writeSync(file.fd, line + '\n');
-      } finally {
-        fs.closeSync(file);
+    this.needsTrust = false;
+    this.fingerprint = '';
+    switch (status.state) {
+      case SESSION_STATE_CONNECTED:
+        this.statusText = '已连接（实时刷新）';
+        this.applyPending();
+        return;
+      case 'reconnecting': {
+        const retry = status.retryInMs === undefined ? 0 : status.retryInMs;
+        this.statusText = '连接中断，正在重连（' + Math.max(1, Math.ceil(retry / 1000)) + 's）';
+        return;
       }
-    } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '写性能日志失败：%{public}s', String(error));
+      case 'failed':
+        this.statusText = '失败：' + (status.error.length > 0 ? status.error : status.errorCode);
+        return;
+      case 'disconnected':
+        this.statusText = '已断开';
+        return;
+      case 'connecting':
+        this.statusText = '连接中…';
+        return;
+      default:
+        this.statusText = status.state;
+        return;
     }
-    this.statFrames = 0;
-    this.statDecodeMs = 0;
-    this.statLastAt = now;
-    this.statLastVersion = version;
   }
 
-  // RFB button bits: 1 left, 2 middle, 4 right (8 and 16 are the wheel notches).
+  private poll(): void {
+    if (this.sessionId.length === 0 || this.closed || this.disposed) {
+      return;
+    }
+    const status = sessionStatus(this.sessionId);
+    if (status === undefined) {
+      this.badStatusCount += 1;
+      if (this.badStatusCount >= 10 && this.badStatusCount % 50 === 10) {
+        hilog.warn(DOMAIN, TAG, 'sessionStatus 解析失败 session=%{public}s', this.sessionId);
+      }
+      if (this.badStatusCount === 10) {
+        this.statusText = '状态不可用（原生层未就绪）';
+      }
+      return;
+    }
+    this.badStatusCount = 0;
+    this.applyStatus(status);
+  }
+
+  // RFB button bits: 1 left, 2 middle, 4 right (8/16 are the wheel notches).
   private static buttonMask(button: MouseButton): number {
     if (button === MouseButton.Right) {
       return 4;
@@ -360,7 +771,7 @@ struct Remote {
     return 1;
   }
 
-  private pointerDown(x: number, y: number, mask: number = 1): void {
+  private pointerDown(x: number, y: number, mask: number): void {
     this.pressedMask = mask;
     // Move first: the working desktop path sends move, press, release; sending
     // the press without moving the pointer can be ignored by the server.
@@ -373,39 +784,34 @@ struct Remote {
       return;
     }
     this.pressedMask = 0;
-    const released = this.sendPointerReport(x, y, 0);
-    // Touch screens have no double-click gesture, so two quick taps at the same
-    // spot are turned into a real double click. A mouse already sends its own
-    // double click, so that path must not add a third one.
+    // Release with the last known-good remote coordinates: the physical point
+    // may be outside the picture (letterbox) by now, and dropping the release
+    // would leave the button pressed on the server forever.
+    const point = this.mapToRemote(x, y);
+    let rx = point[0];
+    let ry = point[1];
+    if (rx < 0 || ry < 0) {
+      rx = this.lastRemoteX;
+      ry = this.lastRemoteY;
+    }
+    if (rx >= 0 && ry >= 0) {
+      this.lastRemoteX = rx;
+      this.lastRemoteY = ry;
+      sendPointer(this.sessionId, rx, ry, 0);
+    }
+    // Touch screens have no double-click gesture: two quick taps at the same
+    // spot become a real double click. A mouse already sends its own.
     const now = Date.now();
     const near = Math.abs(x - this.lastTapX) < 24 && Math.abs(y - this.lastTapY) < 24;
-    if (fromTouch && now - this.lastTapMs < 400 && near) {
-      const secondMove = this.sendPointerReport(x, y, 0);
-      const secondPress = this.sendPointerReport(x, y, 1);
-      const secondRelease = this.sendPointerReport(x, y, 0);
+    if (fromTouch && now - this.lastTapMs < 400 && near && rx >= 0 && ry >= 0) {
+      sendPointer(this.sessionId, rx, ry, 1);
+      sendPointer(this.sessionId, rx, ry, 0);
       this.lastTapMs = 0;
-      this.recordEvent('double x=' + Math.round(x) + ' y=' + Math.round(y) +
-        ' ' + secondMove + '/' + secondPress + '/' + secondRelease + ' first=' + released);
       return;
     }
     this.lastTapMs = now;
     this.lastTapX = x;
     this.lastTapY = y;
-    this.recordEvent('release x=' + Math.round(x) + ' y=' + Math.round(y) +
-      ' release=' + released);
-  }
-
-  private testClick(): void {
-    // Probe target: double-click the desktop Home icon at remote (63, 68).
-    // Opening the file manager is unmistakable, and this bypasses touch
-    // coordinate mapping so it isolates the send path from the mapping.
-    let report = 'test';
-    for (let round = 0; round < 2; round++) {
-      report += ' ' + diag.sendPointer(63, 68, 0);
-      report += '/' + diag.sendPointer(63, 68, 1);
-      report += '/' + diag.sendPointer(63, 68, 0);
-    }
-    this.recordEvent(report);
   }
 
   // Maps a view point to remote pixels; returns -1,-1 when outside the picture.
@@ -428,11 +834,8 @@ struct Remote {
     ];
   }
 
-  // RFB has no wheel message: a wheel notch is button 4 (up) or 5 (down),
-  // sent as press + release with the pointer mask carrying that bit.
-  // The global focusControl.requestFocus only asks for a transfer on the next
-  // frame and returned false here; the UIContext FocusController transfers
-  // synchronously, which is what a click handler needs.
+  // The UIContext FocusController transfers synchronously, which is what a
+  // click handler needs.
   private requestViewFocus(): void {
     try {
       this.getUIContext().getFocusController().activate(true);
@@ -456,43 +859,34 @@ struct Remote {
       return;
     }
     const mask = vertical > 0 ? 16 : 8;
-    diag.sendPointer(point[0], point[1], mask);
-    diag.sendPointer(point[0], point[1], 0);
+    sendPointer(this.sessionId, point[0], point[1], mask);
+    sendPointer(this.sessionId, point[0], point[1], 0);
   }
 
-  private sendPointerReport(x: number, y: number, mask: number): string {
-    if (this.frameWidth <= 0 || this.frameHeight <= 0 || this.viewWidth <= 0 || this.viewHeight <= 0) {
-      return 'NODIM';
+  private sendPointerReport(x: number, y: number, mask: number): void {
+    const point = this.mapToRemote(x, y);
+    if (point[0] < 0 || point[1] < 0) {
+      return;
     }
-    const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
-    const contentW = this.frameWidth * scale;
-    const contentH = this.frameHeight * scale;
-    const offsetX = (this.viewWidth - contentW) / 2;
-    const offsetY = (this.viewHeight - contentH) / 2;
-    if (x < offsetX || y < offsetY || x > offsetX + contentW || y > offsetY + contentH) {
-      return 'OUTSIDE';
-    }
-    const fx = Math.max(0, Math.min(this.frameWidth - 1, Math.round((x - offsetX) / scale)));
-    const fy = Math.max(0, Math.min(this.frameHeight - 1, Math.round((y - offsetY) / scale)));
-    return diag.sendPointer(fx, fy, mask);
+    this.lastRemoteX = point[0];
+    this.lastRemoteY = point[1];
+    sendPointer(this.sessionId, point[0], point[1], mask);
   }
 
   private sendPointerAt(x: number, y: number, mask: number): void {
-    if (this.frameWidth <= 0 || this.frameHeight <= 0 || this.viewWidth <= 0 || this.viewHeight <= 0) {
+    const point = this.mapToRemote(x, y);
+    if (point[0] >= 0 && point[1] >= 0) {
+      this.lastRemoteX = point[0];
+      this.lastRemoteY = point[1];
+      sendPointer(this.sessionId, point[0], point[1], mask);
       return;
     }
-    const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
-    const contentW = this.frameWidth * scale;
-    const contentH = this.frameHeight * scale;
-    const offsetX = (this.viewWidth - contentW) / 2;
-    const offsetY = (this.viewHeight - contentH) / 2;
-    if (x < offsetX || y < offsetY || x > offsetX + contentW || y > offsetY + contentH) {
-      return;
+    // Dragged outside the picture (letterbox): keep sending at the last valid
+    // point while a button is held, so the release still ends the drag inside
+    // the remote desktop.
+    if (mask !== 0 && this.lastRemoteX >= 0 && this.lastRemoteY >= 0) {
+      sendPointer(this.sessionId, this.lastRemoteX, this.lastRemoteY, mask);
     }
-    const fx = Math.round((x - offsetX) / scale);
-    const fy = Math.round((y - offsetY) / scale);
-    diag.sendPointer(Math.max(0, Math.min(this.frameWidth - 1, fx)),
-      Math.max(0, Math.min(this.frameHeight - 1, fy)), mask);
   }
 
   private keysymFor(event: KeyEvent): number {
@@ -577,6 +971,11 @@ struct Remote {
   }
 
   private forwardKey(event: KeyEvent): void {
+    // The page root stays mounted when resolution failed; never forward keys to
+    // a session this page could not bind itself to.
+    if (this.sessionId.length === 0 || !this.sessionResolved) {
+      return;
+    }
     // Track modifiers locally: the server did not apply the Shift keysym we
     // sent, so shifted characters are translated to their own keysym instead.
     if (event.keyCode === KeyCode.KEYCODE_SHIFT_LEFT ||
@@ -598,14 +997,14 @@ struct Remote {
       // Remember what was pressed per physical key so the release always uses
       // the same keysym even if the modifiers changed in between.
       this.pressedKeysym.set(event.keyCode, keysym);
-      diag.sendKey(keysym, 1);
+      sendKey(this.sessionId, keysym, 1);
     } else if (event.type === KeyType.Up) {
       const pressedSym = this.pressedKeysym.get(event.keyCode);
       if (pressedSym !== undefined) {
         keysym = pressedSym;
         this.pressedKeysym.delete(event.keyCode);
       }
-      diag.sendKey(keysym, 0);
+      sendKey(this.sessionId, keysym, 0);
     }
   }
 
@@ -628,26 +1027,115 @@ struct Remote {
     return shifted === undefined ? 0 : shifted;
   }
 
+  /** 确认并信任: persist the fingerprint, reconnect this session. */
+  private trustAndReconnect(): void {
+    if (this.fingerprint.length === 0) {
+      return;
+    }
+    const session = findSession(this.sessionId);
+    const endpoint = session === undefined ? '' : session.endpoint;
+    if (endpoint.length === 0) {
+      // Without an endpoint the fingerprint cannot be stored, so reconnecting
+      // would just land on "trust required" again. Fail closed rather than
+      // claiming the server is trusted.
+      this.statusText = '无法确定该服务器地址，请在连接列表里确认身份';
+      return;
+    }
+    trustFingerprint(endpoint, this.fingerprint);
+    reconnectSession(this.sessionId);
+    // The reconnect is already in flight; do not wait for the next 1 s status
+    // poll to learn the generation changed. Invalidate the in-flight render and
+    // the local mirror NOW and make the next render request a complete frame.
+    this.invalidateRender();
+    this.forceFull = true;
+    this.needsTrust = false;
+    this.statusText = '已信任，正在重连…';
+  }
+
   private async closeWindow(): Promise<void> {
     if (this.closed) {
       return;
     }
     this.closed = true;
-    this.stopPolling();
-    diag.stopSession();
-    this.setHostCursorVisible(true);
+    this.teardown();
+    // Explicit user action (断开): the ONLY place that ends the session.
+    if (this.sessionId.length > 0) {
+      closeSessionById(this.sessionId);
+    }
+    if (this.inSubWindow) {
+      await closeRemoteWindow(this.sessionId);
+    } else {
+      try {
+        this.getUIContext().getRouter().back();
+      } catch (error) {
+        hilog.warn(DOMAIN, TAG, '返回连接列表失败：%{public}s', String(error));
+      }
+    }
+  }
+
+  /**
+   * The only action left when this page could not attribute itself to a
+   * session: a sub-window is destroyed (there is no list behind it), the
+   * main-window fallback pops back to the list. No session is touched.
+   */
+  private async leavePage(): Promise<void> {
+    this.teardown();
+    if (this.inSubWindow) {
+      try {
+        const name = this.ownWindowName;
+        if (name.length > 0) {
+          await window.findWindow(name).destroyWindow();
+          return;
+        }
+      } catch (error) {
+        hilog.warn(DOMAIN, TAG, '关闭无法归属的远程窗口失败：%{public}s', String(error));
+      }
+    }
     try {
-      const remote = await window.findWindow('remote');
-      await remote.destroyWindow();
+      this.getUIContext().getRouter().back();
     } catch (error) {
-      hilog.error(0x0000, 'TianguanDiag', '关闭远程窗口失败：%{public}s', String(error));
+      hilog.warn(DOMAIN, TAG, '返回连接列表失败：%{public}s', String(error));
     }
   }
 
   build() {
     Column({ space: 8 }) {
-      Text(this.status).fontSize(14).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      if (this.canvasShown) {
+      Row({ space: 12 }) {
+        Text(this.sessionName.length > 0 ? this.sessionName : '远程桌面')
+          .fontSize(16).fontWeight(FontWeight.Medium).maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+        Text(this.statusText).fontSize(13).maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        // Closing a session is only offered once this page knows which session
+        // it shows; a failed resolution must not be able to close anything.
+        if (this.sessionResolved) {
+          Button('断开').fontSize(13).height(40).focusable(false)
+            .onClick(() => { this.closeWindow(); })
+        }
+      }.width('100%')
+      if (this.needsTrust) {
+        Column({ space: 8 }) {
+          Text('服务端指纹：' + this.fingerprint).fontSize(14).fontWeight(FontWeight.Medium)
+          Text('请与服务端核对。确认后记住该指纹，之后不一致将拒绝连接。').fontSize(12)
+          Button('确认并信任').onClick(() => { this.trustAndReconnect(); })
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.warning_surface'))
+      }
+      if (this.resolutionFailed) {
+        Column({ space: 12 }) {
+          Text('会话不可用').fontSize(16).fontWeight(FontWeight.Medium)
+          Text(this.statusText).fontSize(13).textAlign(TextAlign.Center)
+          Text('远程输入与断开操作已禁用，避免作用到其它会话。').fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          Button('返回连接列表').onClick(() => { this.leavePage(); })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else if (this.sessionResolved) {
         Stack({ alignContent: Alignment.BottomEnd }) {
           Column() {
             Stack({ alignContent: Alignment.TopStart }) {
@@ -683,9 +1171,10 @@ struct Remote {
           .onAreaChange((oldValue: Area, newValue: Area) => {
             this.viewWidth = Number(newValue.width);
             this.viewHeight = Number(newValue.height);
-            // Canvas content is lost on resize and the first paint may happen
-            // before sizes are known, so ask for one complete frame.
-            diag.requestFullFrame();
+            // Canvas content is lost on resize: ask for one complete frame.
+            // forceFull alone cannot wake an idle server, so request it for
+            // real (non-incremental) once the size is known.
+            this.requestFull();
           })
           // Keys are handled on the page root only: key events bubble, so two
           // handlers forwarded every key twice and broke Shift combinations.
@@ -706,7 +1195,7 @@ struct Remote {
             }
             if (event.type === TouchType.Down) {
               this.requestViewFocus();
-              this.pointerDown(this.lastTouchX, this.lastTouchY);
+              this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
             } else if (event.type === TouchType.Move) {
               this.sendPointerAt(this.lastTouchX, this.lastTouchY, this.pressedMask);
             } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
@@ -735,25 +1224,35 @@ struct Remote {
               .onActionUpdate(() => {})
               .onActionEnd(() => {})
           )
-          Row({ space: 6 }) {
-            // Kept out of the focus chain on purpose: the remote view must be
-            // the only focusable target so keys reach its onKeyEvent.
-            Button('测试点击').fontSize(12).height(30).focusable(false)
-              .onClick(() => { this.testClick(); })
-            Button('断开').fontSize(12).height(30).focusable(false)
-              .onClick(() => { this.closeWindow(); })
+          // Secondary UI only: the Canvas stays mounted underneath while the
+          // first frame is on its way.
+          if (!this.canvasShown) {
+            Column({ space: 12 }) {
+              LoadingProgress().width(36).height(36)
+              Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
+            }
+            .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+            .hitTestBehavior(HitTestMode.None)
           }
-          .padding(6)
         }
         .width('100%')
         .layoutWeight(1)
       } else {
-        Text('等待首帧…').fontSize(16).layoutWeight(1)
+        Column({ space: 12 }) {
+          LoadingProgress().width(36).height(36)
+          Text(this.statusText).fontSize(16)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
       }
     }
-      .padding(10)
+      .padding(12)
       .width('100%')
       .height('100%')
+      .backgroundColor($r('app.color.page_background'))
       .alignItems(HorizontalAlign.Start)
       // The page root also watches keys: key events bubble up from whichever
       // child holds focus, so this path does not depend on the view itself.

@@ -1,0 +1,17 @@
+{
+  "color": [
+    { "name": "start_window_background", "value": "#111318" },
+    { "name": "page_background", "value": "#111318" },
+    { "name": "side_background", "value": "#171A1F" },
+    { "name": "card_background", "value": "#1E2128" },
+    { "name": "chip_background", "value": "#2A2E36" },
+    { "name": "selected_surface", "value": "#1F334D" },
+    { "name": "warning_surface", "value": "#3A2F1B" },
+    { "name": "text_primary", "value": "#E6E8EB" },
+    { "name": "text_secondary", "value": "#9FA3A9" },
+    { "name": "brand", "value": "#4C9DFF" },
+    { "name": "success", "value": "#6FDB9B" },
+    { "name": "warning", "value": "#F2B45C" },
+    { "name": "danger", "value": "#FF8A80" }
+  ]
+}
