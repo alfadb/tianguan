@@ -53,6 +53,44 @@ function log(action: string, detail: string): void {
 }
 
 /**
+ * Creates the child window WITH system decorations. createSubWindow() alone makes
+ * an undecorated window: no title bar and no frame, so it can neither be dragged
+ * nor resized by the user. createSubWindowWithOptions({decorEnabled:true}) gives
+ * the normal title bar; fall back to the plain call on ROMs without it.
+ */
+async function createDecoratedSubWindow(stage: window.WindowStage, name: string,
+  sessionId: string): Promise<window.Window> {
+  const title: string = '远程会话 ' + sessionId;
+  try {
+    // zLevelAboveParentLoosened (API 26, 2in1): without it a child window is
+    // always stacked above its parent AND the system refuses to show
+    // maximize/minimize title buttons ("Invalid window type..."). With it the
+    // main window can be raised above the remote window and the buttons work.
+    // maximizeSupported is required for a child window to be maximizable at all
+    // (Window.maximize doc: "set maximizeSupported to true when creating").
+    const options: window.SubWindowOptions = {
+      title: title,
+      decorEnabled: true,
+      zLevelAboveParentLoosened: true,
+      maximizeSupported: true
+    };
+    return await stage.createSubWindowWithOptions(name, options);
+  } catch (error) {
+    log('decor-loosened-unavailable', String(error));
+  }
+  try {
+    const plainDecor: window.SubWindowOptions = {
+      title: title,
+      decorEnabled: true
+    };
+    return await stage.createSubWindowWithOptions(name, plainDecor);
+  } catch (error) {
+    log('decor-unavailable', String(error));
+    return await stage.createSubWindow(name);
+  }
+}
+
+/**
  * Opens (or activates) the window for one session. Never destroys an existing
  * window for that session.
  */
@@ -104,7 +142,7 @@ export async function openRemoteWindow(sessionId: string): Promise<RemoteOpenRes
     const rect = main.getWindowProperties().windowRect;
     const width = Math.max(320, Math.round(rect.width * 0.92));
     const height = Math.max(240, Math.round(rect.height * 0.9));
-    created = await stage.createSubWindow(name);
+    created = await createDecoratedSubWindow(stage, name, sessionId);
     // Redundant binding for the page, written BEFORE setUIContent. The window
     // name is the primary identity channel; the page refuses to attach when
     // this key and the name disagree.
@@ -129,18 +167,29 @@ export async function openRemoteWindow(sessionId: string): Promise<RemoteOpenRes
     // The page's aboutToDisappear() no longer ends the session, so a failure
     // after the page was loaded cannot kill the fallback's session either.
     await created.resize(width, height);
-    try {
-      // Dragging inside the remote desktop must never move this window.
-      created.setWindowTitleMoveEnabled(false);
-    } catch (moveError) {
-      hilog.warn(DOMAIN, TAG, '禁用窗口拖动失败：%{public}s', String(moveError));
-    }
     await created.show();
+    // Window-state APIs must run after show(): calling them earlier fails with
+    // "This window state is abnormal" (observed on device).
+    // Keep the title bar interactive: dragging inside the remote desktop is
+    // already blocked by draggable(false) on the view, so the window only moves
+    // when the title bar itself is dragged.
+    try {
+      created.setWindowTitleMoveEnabled(true);
+    } catch (moveError) {
+      hilog.warn(DOMAIN, TAG, '启用窗口标题拖动失败：%{public}s', String(moveError));
+    }
     // Load the page BEFORE moving the window focus: the SDK requires the focus
     // target to have loadContent()/setUIContent() applied AND effective before
     // shiftAppWindowFocus(), otherwise an invisible window can gain focus and
     // cause function exceptions (@ohos.window.d.ts, shiftAppWindowFocus NOTE).
     await created.setUIContent('pages/Remote');
+    // Decorated sub-windows default to a close button only; show maximize and
+    // minimize as well so the window behaves like a normal desktop window.
+    try {
+      created.setWindowTitleButtonVisible(true, true, true);
+    } catch (buttonError) {
+      hilog.warn(DOMAIN, TAG, '显示标题栏按钮失败：%{public}s', String(buttonError));
+    }
     // Focus shift is best effort: the window is already sized, shown and has
     // its page, so a failure here only means the keyboard focus may not have
     // followed. Never destroy a usable window for that.
