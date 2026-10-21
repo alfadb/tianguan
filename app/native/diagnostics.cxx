@@ -946,11 +946,16 @@ struct SessionState {
   // Kept only so a reconnect can authenticate again; wiped by closeSession and
   // never written to a log or a status string.
   std::string password;
+  // Security types offered to the server. Defaults to the encrypted family; a
+  // "no password" connection passes "None", which is the only way to talk to a
+  // server that advertises nothing but None (type 1).
+  std::string securityTypes = "RA2_256,RA2";
 
   std::mutex meta;   // phase/error/retry/generation decisions
   std::mutex input;  // queued input + release epoch
   std::mutex pix;    // framebuffer mirror, region, cursor, versions
   std::mutex clip;   // clipboard text
+  PerfStats perf;    // own mutex; timing summaries only
 
   std::atomic<bool> stop;
   std::atomic<bool> forceReconnect;
@@ -1086,7 +1091,7 @@ public:
       secret = state->password;
       expectedPin = state->expectedPin;
     }
-    auto types = rfb::parseSecTypes("RA2_256,RA2");
+    auto types = rfb::parseSecTypes(state->securityTypes.c_str());
     security.SetSecTypes(types);
     setShared(true);
     // Raw encoding ships 9 MB per full frame and saturates the link; Tight
@@ -1937,6 +1942,7 @@ struct SessionOptions {
   std::string password;
   std::string expectedPin;
   std::string name;
+  std::string securityTypes = "RA2_256,RA2";
 };
 
 bool parseSessionOptions(const std::string& json, SessionOptions& options,
@@ -1963,6 +1969,10 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
       options.expectedPin = jsonValue(json, "expectedFingerprint");
     if (json.find("\"name\"") != std::string::npos)
       options.name = jsonValue(json, "name");
+    if (json.find("\"security\"") != std::string::npos) {
+      const std::string requested = jsonValue(json, "security");
+      if (!requested.empty()) options.securityTypes = requested;
+    }
   } catch (const std::exception& failure) {
     error = sanitizeLine(failure.what());
     return false;
@@ -1987,6 +1997,10 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
     error = "name too long";
     return false;
   }
+  if (options.securityTypes.size() > 256) {
+    error = "security types too long";
+    return false;
+  }
   return true;
 }
 
@@ -1999,6 +2013,7 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   state->password = options.password;
   state->expectedPin = options.expectedPin;
   state->profileName = options.name.empty() ? "session" : options.name;
+  state->securityTypes = options.securityTypes;
   // Start the thread before publishing the session so closeSession() can never
   // find a session whose thread is still not joinable.
   try {
@@ -2501,6 +2516,10 @@ std::string tianguan::startSession(const std::string& dataDir) {
       throw std::runtime_error("invalid port in vnc-test.json");
     if (json.find("\"expectedFingerprint\"") != std::string::npos)
       options.expectedPin = jsonValue(json, "expectedFingerprint");
+    if (json.find("\"security\"") != std::string::npos) {
+      const std::string requested = jsonValue(json, "security");
+      if (!requested.empty()) options.securityTypes = requested;
+    }
   } catch (const std::exception& error) {
     return std::string("FAIL session: ") + error.what();
   }

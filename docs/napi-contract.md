@@ -26,8 +26,11 @@
 { "host": "192.168.50.62", "port": 5901,
   "password": "…",            // 可选，短生命周期，不落盘、不入日志
   "expectedFingerprint": "…", // 可选，来自信任库
+  "security": "None",         // 可选，默认 "RA2_256,RA2"
   "name": "测试机" }
 ```
+
+`security` 是向服务端声明的 RFB 安全类型（逗号分隔）。默认只声明加密的 `RA2_256,RA2`；**服务器若只公布 `None`(1)**，必须显式传 `"None"`，否则握手会以 `No matching security types` 失败。界面在「该服务器无需密码」勾选时传 `None`。
 
 ## 状态 JSON
 

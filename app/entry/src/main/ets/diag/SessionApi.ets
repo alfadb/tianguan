@@ -20,6 +20,10 @@ export interface SessionOptions {
   password?: string;
   expectedFingerprint?: string;
   name?: string;
+  // Offered RFB security types, comma separated. Omit for the default
+  // encrypted family (RA2_256,RA2); use "None" for a server that requires no
+  // authentication (it advertises type 1 only).
+  security?: string;
 }
 
 /** cursor object inside the status JSON. */

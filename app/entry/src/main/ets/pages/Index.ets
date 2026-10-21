@@ -805,6 +805,11 @@ struct Index {
         port: Number(entry.port),
         name: entry.name
       };
+      // Servers that publish only None (type 1) reject the encrypted-only
+      // default, so a "no password" connection offers None explicitly.
+      if (entry.noPassword === true) {
+        options.security = 'None';
+      }
       // password is optional in the contract: omit it entirely for servers that
       // need none instead of sending an empty credential.
       if (password.length > 0) {
