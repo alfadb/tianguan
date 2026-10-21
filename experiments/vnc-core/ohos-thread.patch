@@ -1,0 +1,14 @@
+--- a/Thread.cxx
++++ b/Thread.cxx
+@@ -52,7 +52,11 @@
+   delete (HANDLE*)threadId;
+ #else
+   if (isRunning())
++#ifdef TG_OHOS_NO_PTHREAD_CANCEL
++    __builtin_trap();
++#else
+     pthread_cancel(*(pthread_t*)threadId);
++#endif
+   delete (pthread_t*)threadId;
+ #endif
+ 

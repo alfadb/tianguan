@@ -1,0 +1,1 @@
+{ name: 'libtianguan_diag.so', version: '0.0.1', types: './index.d.ts', description: 'Native diagnostic N-API contract' }

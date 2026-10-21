@@ -1,0 +1,1 @@
+{ modelVersion: '26.0.0', dependencies: { '@ohos/hvigor-ohos-plugin': 'file:/home/worker/harmonyos/command-line-tools/26.0.0.821/hvigor/hvigor-ohos-plugin' }, execution: { daemon: false, incremental: true, parallel: true }, logging: { level: 'info' } }

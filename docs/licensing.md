@@ -10,7 +10,13 @@
 
 ## 候选上游与兼容边界
 
-TigerVNC 和 FreeRDP 目前只是候选方案，本仓库尚未包含其代码或依赖。本文不构成对其全部文件许可或最终组合方式的审核结论。
+TigerVNC 已进入隔离实验评估，使用官方 v1.15.0，固定 commit 为 `8bdf8734ce12c8ed3c232496fc8a4ccdb04636b8`。[源码获取脚本](../scripts/fetch-tigervnc.sh)将原始源码保留在 `.work/sources` 外部 checkout，未将上游代码 vendor 入仓库；依赖与构建产物置于 `.work` 本地缓存。原始 checkout 保持 clean，host 正式目标使用原源码；OHOS 目标编译的是含明确变更的 `Thread.cxx` 构建副本，不能称为完全未修改上游实现。此评估尚不构成最终内核选型或 HarmonyOS 应用集成。FreeRDP 仍为候选，尚未引入。
+
+唯一平台补丁为 [experiments/vnc-core/ohos-thread.patch](../experiments/vnc-core/ohos-thread.patch)：官方 `Thread` 析构引用 SDK 缺失的 `pthread_cancel`，构建副本以 `TG_OHOS_NO_PTHREAD_CANCEL` 将仍在运行时的析构分支改为 trap；正常 `DecodeThread` 的 `stop()` / `wait()` 协作退出保持。该宏仅用于 OHOS 正式构建及 host 专用适配测试，原版权声明保留。分发相应二进制时，须按适用许可提供与实际编译内容对应的源码，包括此补丁、编译源变更及所需构建材料，并保留适用的版权、许可与 NOTICE 声明。
+
+已完成的有界核对及证据见 [VNC 实验说明](../experiments/vnc-core/README.md#有界许可核对)：检查 TigerVNC 的 `LICENCE.TXT`，并依据实际编译依赖检查 131 个上游源码/头文件的文件头，其中 126 个明确为 GPL-2.0-or-later；其余五个输入涉及 The Open Group / Digital Equipment Corporation 条款、生成表及 DES 来源与授权证据，须保留各自声明并补核。实际链接依赖的核对限于本机 Debian copyright 元数据及相关许可段落，未逐文件审计这些依赖的完整源码。pixman 构建另保留上游 `COPYING`，也不代表完整文件级审计。
+
+这些记录仅支持本地可行性实验，尚未发布二进制，不是完整产品分发审计，也不构成对全部上游文件、最终组合方式或 SDK / 商店条件的审核结论。正式引入与分发前的文件级审查要求仍须落实。
 
 Apache License 2.0 与 GPLv3 兼容：在满足 Apache-2.0 的版权、许可、NOTICE 等要求的前提下，可以将相关代码与 GPLv3 代码组合并按 GPLv3 的适用条件分发。Apache-2.0 与 GPL-2.0-only 不兼容；不能据此将仅限 GPL 第 2 版的代码直接纳入这样的组合。带有“or later”选项的代码须按具体授权判断是否可选择兼容版本。
 

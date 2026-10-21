@@ -31,3 +31,6 @@ profile.json5
 # 本地系统文件
 .DS_Store
 Thumbs.db
+/.work/
+__pycache__/
+*.pyc

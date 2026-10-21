@@ -1,0 +1,1 @@
+{ modelVersion: '26.0.0', name: 'tianguan-diagnostics', version: '0.0.1', description: '天关原生内核诊断', dependencies: {}, devDependencies: {} }

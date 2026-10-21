@@ -6,7 +6,17 @@ Tianguan (TG) is a planned community VNC and RDP client for HarmonyOS, with Harm
 
 ## 当前状态
 
-**pre-implementation（实现前准备）**：本仓库目前只有文档和许可材料，没有实现代码、可运行 App 或可用安装包，也没有可执行的构建流程。以下内容均为计划与验收目标，不代表功能已实现或兼容性已验证。
+**host 隔离真实 RA2_256 链路已通过；HarmonyOS 应用已在 MateBook Fold 与手机 PLA-AL10 上连上真实 VNC 服务**：原 host CTest **9/9** 通过，独立真实 TigerVNC 1.15.0 RA2_256 harness **3/3** 通过；OHOS API26 ARM64 客户端已交叉编译、链接成功。独立诊断 HAP 已用企业账号调试证书签名，在两台设备上均安装、启动成功，三项原生诊断全部 PASS。含 `ohos.permission.INTERNET` 的测试包在两台设备上均完成真实 TCP 连接、RA2_256 加密认证、1920×1200 首帧解码与键鼠事件发送（测试服务 `192.168.50.62:5901`）；安全类型协商已覆盖 RA2_256 / RA2 / VncAuth，错误密码在两台设备上均返回可读的 `Authentication failed`。已实现服务端指纹确认（首次 `NEEDS_CONFIRMATION`、确认后写入信任库、不匹配拒绝）与可输入的连接界面；PC 上人工确认流程已实测通过。首帧已能编码为 JPEG 并在界面以 `PixelMap` 显示（开发机对 62 实测为真实 XFCE 桌面画面）。输入侧已做服务端闭环验证：双击桌面 Home 图标后，服务端画面出现被真实打开的应用程序菜单、Thunar 文件管理器与 Application Finder 窗口，逐像素比较 26 万像素变化，证明点击到达并由服务端执行。本轮已改为长连接会话：后台线程持续收帧并刷新 `snapshot.jpg`，界面每 250 ms 轮询版本并重载画面，触摸/鼠标按内容区坐标换算后发 VNC 指针事件（PC 上补了 `onMouse` 连续移动与黑边偏移修正）——开发机自测帧版本在 2 秒内由 1 增至 6、`sendPointer` 返回 OK。键盘也已接入：`sendKey(keysym, pressed)` 转成 X11 keysym，开发机对 62 用“打开菜单后按方向键”验证到选中项移动（`PASS keyboard observed: 110 pixels changed`）。增量编码、中文输入法、本地光标隐藏、RDP、X509 尚未实现。以下四项产品验收目标仍未整体通过。
+
+实验使用真实 TigerVNC `CConnection` / `ManagedPixelBuffer`。原 2×1 fixture 验证 Raw 像素 `112233` / `445566` 与键鼠，另有线程适配行为测试；独立真实 64×48 case 已证明 `authSuccess` → 首帧中心 RGB `112233` → 服务端 X observer 收到 `a` 按放及 `(16,12)` button1 按放。wrong-pin 在 `getUserPasswd` 前拒绝，wrong-password 有 owned 服务端唯一连接的精确认证失败及关闭证据。只打印 callback 后退出、不连接的假 client 会被 harness 判 FAIL，此防假通过反例不计入正式通过数。默认无参数不连接；真实测试须显式使用 `--ra2-test`，仅限隔离 loopback、非 5901 端口、credential-file 与 pin。pin 仅为上游 64-bit 截断指纹核对，本实验不是生产身份校验方案。
+
+复现步骤、日志与验证边界见 [VNC 实验说明](experiments/vnc-core/README.md)。三个入口为[源码获取脚本](scripts/fetch-tigervnc.sh)、[五依赖构建脚本](scripts/build-vnc-deps.sh)（`host|ohos [jobs: 1..4]`）及 [pixman 构建脚本](scripts/build-vnc-pixman.sh)（`host|ohos-arm64 [jobs: 1..4]`）。五依赖每次创建 unique run，必须使用本次日志打印的 `PREFIX=`；pixman prefix 按所选模式及日志取用。上游固定为 TigerVNC v1.15.0（commit `8bdf8734ce12c8ed3c232496fc8a4ccdb04636b8`），外部 checkout 保持 clean，未 vendor 入仓库；源码、依赖与产物位于 `.work`。
+
+OHOS 产物为 `.work/vnc-core-ohos-api26/vnc-core`：ELF `Machine: AArch64`，interpreter `/lib/ld-musl-aarch64.so.1`，NEEDED 仅 `libdeviceinfo_ndk.z.so`、`libc++_shared.so`、`libc.so`；无 host 库、RPATH/RUNPATH 或 `pthread_cancel` 符号，真实 RA2（`CSecurityRSAAES`）及 `RawDecoder` 实现符号保留。唯一平台补丁见 [ohos-thread.patch](experiments/vnc-core/ohos-thread.patch)：官方 `Thread` 析构调用 SDK 缺失的 `pthread_cancel`，因此仅在 OHOS 构建副本启用 `TG_OHOS_NO_PTHREAD_CANCEL`（host 专用测试也启用）；析构时仍 running 则 trap 终止进程，正常 `DecodeThread` 的 `stop()` / `wait()` 协作退出路径保持。编译副本有明确源码变更，不能称为完全未修改上游实现。
+
+已确认目标 PC 为 MateBookFold SLM-W32、API26 ARM64。原未签产物在 `/data/local/tmp` 执行返回 126 / `Permission denied`；SDK 官方 `selfSign1` 副本经 `display-sign` 确认 selfsigned 后，同目录仍返回 126，不能归因于缺签名。按[官方 Docs/hishell 说明](https://consumer.huawei.com/cn/support/content/zh-cn16078461/)可新建目录并投递文件，但 Docs 下 `chmod` 被拒（remote 1）后即停止，未执行 capabilities，不能称为 Docs exec126 或 hishell 失败。`hdc` 返回 0 不等于程序返回 0，具体策略原因仍未确定；未改变设备安全属性，不能说 PC 程序已运行。[官方二进制签名文档](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/binary-sign-tool)及 Docs/hishell 支持也不等于 hdc 身份具有执行权限。
+
+独立诊断 HAP `cn.alfadb.tianguan` 0.0.1 / code 1、API26、`2in1` 与 `phone` 双设备，见[应用诊断说明](app/README.md)。真实共享库 `.work/hap-native-ohos/libtianguan_diag.so` 已构建为 AArch64 shared ELF，包含 NAPI async + promise；同源 host 诊断 **3/3 PASS**（RA2 工厂、完整内存 RFB 3.8 Raw 2×1、真实 Thread 协作退出），无 socket/main/alarm。签名使用企业账号调试证书与含两台设备的调试 Profile（`verify-app` 通过、包内 Profile 与外部 `.p7b` 一致），签名包 SHA-256 `02215cfacfcc703685afd795352e58bd0de0014029a707a26ec13fadcf1611f4`。MateBook Fold 上安装、启动成功，取回的 `diag-result.txt` 三项均 PASS（证据 `.work/device-runs/pc-diag/diag-result.txt`）；手机 PLA-AL10 安装成功但锁屏下无法远程启动。RA2 主线目前仍只有 host 证明；画面 UI、中文 IME、X509、RDP 与手机端 native 运行均未通过。
 
 项目名称为「天关」，英文名 Tianguan，简称 TG；GitHub 仓库为 [alfadb/tianguan](https://github.com/alfadb/tianguan)。
 
@@ -22,14 +32,14 @@ Tianguan (TG) is a planned community VNC and RDP client for HarmonyOS, with Harm
 - RDP：FreeRDP 是候选协议内核；目标包括 NLA/TLS 连接与 Unicode 输入。
 - 中文输入：须对 VNC 与 RDP 分别验证输入链路，包括本地输入法提交、协议编码与远端应用接收；不能从某一协议的结果推断另一协议支持情况。
 
-目前尚未引入 TigerVNC、FreeRDP 或其他第三方实现，候选方案不构成依赖已集成的声明。
+TigerVNC 已进入隔离实验评估，尚未确定为最终协议内核，也未集成到 HarmonyOS 应用；FreeRDP 仍为候选，尚未引入。实验与第三方许可核对范围见 [VNC 实验说明](experiments/vnc-core/README.md)及[许可说明](docs/licensing.md)。
 
 ## 分阶段验收目标
 
 以下阶段均未完成，需保留设备、版本、配置与测试结果作为验收证据：
 
-1. **OHOS 交叉编译与真机运行**：验证候选内核及最小调用链能够使用适用的 OHOS 工具链交叉编译，并在目标 HarmonyOS PC 真机运行。
-2. **VNC RA2_256 主线**：连接现有 TigerVNC 服务端，完成 RA2_256 握手，显示远端画面并验证键盘、鼠标交互；同时记录 RA2 的互通验证结果。
+1. **OHOS 交叉编译与真机运行（部分完成）**：最小 VNC 实验已通过 OHOS API26 ARM64 交叉编译与链接；目标 HarmonyOS PC 真机运行尚未验证，本阶段仍未通过整体验收。
+2. **VNC RA2_256 主线（host 部分完成）**：隔离真实 TigerVNC 1.15.0 已完成 RA2_256 认证、像素解码与服务端键鼠见证；仍需在目标 PC 应用中连接服务端、显示远端画面并验证交互，同时记录 RA2 的独立互通结果。
 3. **VNC X509Vnc**：验证 X509Vnc 连接与证书验证，包括可信证书成功连接，以及不可信、过期或身份不匹配证书的处理。
 4. **RDP 安全连接与输入**：验证 NLA/TLS 连接、远端画面和键鼠交互，并验证 Unicode 与中文输入在远端应用中的实际结果。
 

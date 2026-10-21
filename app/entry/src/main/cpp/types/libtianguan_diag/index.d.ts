@@ -1,0 +1,11 @@
+export const runDiagnostics: () => Promise<string>;
+export const runNetworkTest: (filesDir: string) => Promise<string>;
+export const startSession: (filesDir: string) => string;
+export const stopSession: () => string;
+export const sessionStatus: () => string;
+export const sendPointer: (x: number, y: number, mask: number) => string;
+export const sendKey: (keysym: number, pressed: number) => string;
+export const requestFullFrame: () => string;
+export const copyRegion: (buffer: ArrayBuffer) => string;
+export const copyCursor: (buffer: ArrayBuffer) => string;
+export const takeRegion: (buffer: ArrayBuffer) => string;

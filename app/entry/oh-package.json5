@@ -1,0 +1,1 @@
+{ modelVersion: '26.0.0', name: 'entry', version: '0.0.1', dependencies: { 'libtianguan_diag.so': 'file:./src/main/cpp/types/libtianguan_diag' } }

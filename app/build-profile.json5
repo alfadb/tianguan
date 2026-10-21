@@ -1,0 +1,7 @@
+{
+  app: {
+    products: [{ name: 'default', label: '$string:app_name', bundleName: 'cn.alfadb.tianguan', runtimeOS: 'HarmonyOS', compileSdkVersion: '26.0.0', compatibleSdkVersion: '26.0.0', targetSdkVersion: '26.0.0', bundleType: 'app', versionCode: 1, versionName: '0.0.1' }],
+    buildModeSet: [{ name: 'debug' }, { name: 'release' }]
+  },
+  modules: [{ name: 'entry', srcPath: './entry', targets: [{ name: 'default', applyToProducts: ['default'] }] }]
+}
