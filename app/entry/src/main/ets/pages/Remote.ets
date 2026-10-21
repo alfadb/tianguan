@@ -7,9 +7,14 @@
  * The session this page drives is NEVER guessed. It comes from one of exactly
  * two sources: router params (main-window fallback) or this page's OWN window
  * name, read from its UIContext and mapped back by sessionIdForWindowName().
- * When neither yields an id the page fails closed: the error is shown, every
- * input path stays unmounted and the close-session action is hidden. There is
- * no "last window", FIFO or "first registry session" fallback.
+ * When neither yields an id the page fails closed: the error is shown and every
+ * input path stays unmounted. There is no "last window", FIFO or "first
+ * registry session" fallback.
+ *
+ * The page is pure picture: no title row, no disconnect button and no padding,
+ * so the Canvas fills the whole window. The connection name belongs to the
+ * window title (set by RemoteWindows), and the disconnect path is closing that
+ * window — never an action inside this page.
  *
  * Everything talks to the native layer through diag/SessionApi.ets with THIS
  * session's id; the status is parsed as JSON per docs/napi-contract.md (never
@@ -30,12 +35,11 @@ import {
   SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
-import { findSession, closeSessionById, markWindowOpen } from '../model/SessionRegistry';
+import { findSession, markWindowOpen } from '../model/SessionRegistry';
 import { trustFingerprint } from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession } from '../clipboard/TianguanClipboard';
-import { closeRemoteWindow, sessionIdForWindowName,
-  sessionKeyForWindow } from '../windows/RemoteWindows';
+import { sessionIdForWindowName, sessionKeyForWindow } from '../windows/RemoteWindows';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -48,7 +52,6 @@ interface RemoteRouterParams {
 @Component
 struct Remote {
   @State private statusText: string = '连接中…';
-  @State private sessionName: string = '';
   // True once bootstrap() knows which session this page shows: from then on the
   // Canvas is always part of the tree. It must never wait for a first frame,
   // because the first frame can only arrive through this Canvas.
@@ -97,7 +100,6 @@ struct Remote {
   // physical pointer is outside the picture (letterbox) by then.
   private lastRemoteX: number = -1;
   private lastRemoteY: number = -1;
-  private closed: boolean = false;
   private disposed: boolean = false;
   private tornDown: boolean = false;
   private pageVisible: boolean = true;
@@ -117,6 +119,9 @@ struct Remote {
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
   private viewPointerY: number = -1;
+  // True once a real MouseEvent arrived: the mouse path then owns input and the
+  // synthetic touch events (one per click on PC) are ignored.
+  private hasMouse: boolean = false;
 
   aboutToAppear(): void {
     this.bootstrap();
@@ -145,7 +150,6 @@ struct Remote {
       hilog.error(DOMAIN, TAG, 'remote 页面无法确定会话归属，已禁用输入');
       return;
     }
-    this.sessionName = this.sessionNameOf(this.sessionId);
     hilog.info(DOMAIN, TAG, 'remote 页面启动 session=%{public}s sub=%{public}s',
       this.sessionId, String(this.inSubWindow));
     markWindowOpen(this.sessionId, true);
@@ -158,9 +162,10 @@ struct Remote {
   }
 
   aboutToDisappear(): void {
-    // Losing the view is NOT a user close: the session keeps running (the main
-    // list, the tray and the 断开 button own its lifetime). Only closeWindow()
-    // below ends it.
+    // Losing the view is NOT itself a user close: the session keeps running
+    // (the main list and the tray own its lifetime). In a sub-window the user
+    // closing the window reaches RemoteWindows' WINDOW_DESTROYED handler,
+    // which is what ends the session; this page never closes it here.
     this.disposed = true;
     this.teardown();
   }
@@ -238,11 +243,6 @@ struct Remote {
     return '';
   }
 
-  private sessionNameOf(id: string): string {
-    const session = findSession(id);
-    return session === undefined ? '' : session.name;
-  }
-
   private setHostCursorVisible(visible: boolean): void {
     try {
       pointer.setPointerVisible(visible).catch((error: Error): void => {
@@ -308,7 +308,7 @@ struct Remote {
 
   private setPageVisible(visible: boolean): void {
     this.pageVisible = visible;
-    if (this.disposed || this.closed || this.sessionId.length === 0) {
+    if (this.disposed || this.sessionId.length === 0) {
       return;
     }
     if (visible) {
@@ -340,7 +340,7 @@ struct Remote {
     if (this.timer >= 0) {
       return;
     }
-    if (this.disposed || this.closed || this.sessionId.length === 0) {
+    if (this.disposed || this.sessionId.length === 0) {
       return;
     }
     this.timer = setInterval((): void => { this.poll(); }, 30);
@@ -358,7 +358,7 @@ struct Remote {
     if (this.idleTimer >= 0) {
       return;
     }
-    if (this.disposed || this.closed || this.sessionId.length === 0) {
+    if (this.disposed || this.sessionId.length === 0) {
       return;
     }
     this.idleTimer = setInterval((): void => { this.poll(); }, 1000);
@@ -504,7 +504,7 @@ struct Remote {
   // at a time: overlapping applies share regionBuffer/framePixels and could
   // commit versions that were never drawn.
   private async applyPending(): Promise<void> {
-    if (this.applying || this.disposed || this.closed || !this.pageVisible) {
+    if (this.applying || this.disposed || !this.pageVisible) {
       return;
     }
     if (!this.canvasReady || this.viewWidth <= 0 || this.frameWidth <= 0) {
@@ -742,7 +742,7 @@ struct Remote {
   }
 
   private poll(): void {
-    if (this.sessionId.length === 0 || this.closed || this.disposed) {
+    if (this.sessionId.length === 0 || this.disposed) {
       return;
     }
     const status = sessionStatus(this.sessionId);
@@ -772,6 +772,12 @@ struct Remote {
   }
 
   private pointerDown(x: number, y: number, mask: number): void {
+    // One physical click on PC can arrive twice: onMouse plus a synthetic
+    // TouchEvent. Forwarding both turned a single click into a double click, so
+    // ignore a press while another button is already being held.
+    if (this.pressedMask !== 0) {
+      return;
+    }
     this.pressedMask = mask;
     // Move first: the working desktop path sends move, press, release; sending
     // the press without moving the pointer can be ignored by the server.
@@ -1052,31 +1058,12 @@ struct Remote {
     this.statusText = '已信任，正在重连…';
   }
 
-  private async closeWindow(): Promise<void> {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    this.teardown();
-    // Explicit user action (断开): the ONLY place that ends the session.
-    if (this.sessionId.length > 0) {
-      closeSessionById(this.sessionId);
-    }
-    if (this.inSubWindow) {
-      await closeRemoteWindow(this.sessionId);
-    } else {
-      try {
-        this.getUIContext().getRouter().back();
-      } catch (error) {
-        hilog.warn(DOMAIN, TAG, '返回连接列表失败：%{public}s', String(error));
-      }
-    }
-  }
-
   /**
    * The only action left when this page could not attribute itself to a
    * session: a sub-window is destroyed (there is no list behind it), the
-   * main-window fallback pops back to the list. No session is touched.
+   * main-window fallback pops back to the list. Destroying the sub-window is
+   * also its disconnect path (RemoteWindows' WINDOW_DESTROYED handler), which
+   * is correct here: the window belongs to a session this page could not use.
    */
   private async leavePage(): Promise<void> {
     this.teardown();
@@ -1100,19 +1087,6 @@ struct Remote {
 
   build() {
     Column({ space: 8 }) {
-      Row({ space: 12 }) {
-        Text(this.sessionName.length > 0 ? this.sessionName : '远程桌面')
-          .fontSize(16).fontWeight(FontWeight.Medium).maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
-        Text(this.statusText).fontSize(13).maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        // Closing a session is only offered once this page knows which session
-        // it shows; a failed resolution must not be able to close anything.
-        if (this.sessionResolved) {
-          Button('断开').fontSize(13).height(40).focusable(false)
-            .onClick(() => { this.closeWindow(); })
-        }
-      }.width('100%')
       if (this.needsTrust) {
         Column({ space: 8 }) {
           Text('服务端指纹：' + this.fingerprint).fontSize(14).fontWeight(FontWeight.Medium)
@@ -1120,7 +1094,6 @@ struct Remote {
           Button('确认并信任').onClick(() => { this.trustAndReconnect(); })
         }
         .width('100%')
-        .padding(12)
         .borderRadius(12)
         .backgroundColor($r('app.color.warning_surface'))
       }
@@ -1128,7 +1101,7 @@ struct Remote {
         Column({ space: 12 }) {
           Text('会话不可用').fontSize(16).fontWeight(FontWeight.Medium)
           Text(this.statusText).fontSize(13).textAlign(TextAlign.Center)
-          Text('远程输入与断开操作已禁用，避免作用到其它会话。').fontSize(12)
+          Text('远程输入已禁用，避免作用到其它会话。').fontSize(12)
             .fontColor($r('app.color.text_secondary'))
           Button('返回连接列表').onClick(() => { this.leavePage(); })
         }
@@ -1160,7 +1133,6 @@ struct Remote {
           }
           .width('100%')
           .height('100%')
-          .borderWidth(1)
           .id('remote_area')
           .key('remote_area')
           .draggable(false)
@@ -1185,8 +1157,12 @@ struct Remote {
             this.setHostCursorVisible(!isHover);
           })
           .onTouch((event: TouchEvent) => {
-            // HarmonyOS may synthesise mouse events from touch, so both handlers
-            // run; the pressed flag is what deduplicates them.
+            // On PC a mouse click also produces a synthetic TouchEvent. Once a
+            // real MouseEvent has been seen, the mouse path owns the input;
+            // handling both forwarded every click twice (single -> double).
+            if (this.hasMouse) {
+              return;
+            }
             if (event.touches.length > 0) {
               this.lastTouchX = event.touches[0].x;
               this.lastTouchY = event.touches[0].y;
@@ -1203,6 +1179,7 @@ struct Remote {
             }
           })
           .onMouse((event: MouseEvent) => {
+            this.hasMouse = true;
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
             if (event.action === MouseAction.Press) {
@@ -1249,7 +1226,6 @@ struct Remote {
         .justifyContent(FlexAlign.Center)
       }
     }
-      .padding(12)
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.page_background'))

@@ -61,10 +61,10 @@ export default class EntryAbility extends UIAbility {
     });
     setTraySessionOpener((sessionId: string) => {
       openRemoteWindow(sessionId).then((result: string) => {
-        if (result === 'fallback-main' || result === 'no-stage') {
-          // No sub-window possible and no page context here: bring the manager
-          // up; the user can open the session from the list.
-          this.showHiddenWindow('tray-fallback');
+        if (result === 'failed' || result === 'no-stage') {
+          // No window could be created (and on failure the session was closed),
+          // so surface the manager instead of showing a view without a window.
+          this.showHiddenWindow('tray-open-failed');
         }
       });
     });

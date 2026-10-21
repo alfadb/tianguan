@@ -667,7 +667,7 @@ struct Index {
     const sessions = sessionsForConnection(entry.id);
     if (sessions.length > 0) {
       // Same session clicked again: activate its window instead of a new one.
-      this.activateSession(sessions[0].sessionId);
+      this.activateSession(sessions[0].sessionId, sessions[0].name);
       return;
     }
     this.connect(entry, '');
@@ -752,7 +752,7 @@ struct Index {
     }
   }
 
-  private activateSession(sessionId: string): void {
+  private activateSession(sessionId: string, displayName: string): void {
     // Opening is async; a double click used to start two opens, and the second
     // one fell back to the main window while the first was still creating the
     // sub-window, leaving two pages (double polling, two input sources) for one
@@ -761,30 +761,18 @@ struct Index {
       return;
     }
     this.openingSessions.add(sessionId);
-    openRemoteWindow(sessionId).then((result: string): void => {
-      if (result === 'fallback-main') {
-        this.openInMainWindow(sessionId);
+    // displayName only titles the window; the session itself is always the id.
+    openRemoteWindow(sessionId, displayName).then((result: string): void => {
+      if (result === 'failed') {
+        // No window means no session (the opener already closed it). Report it
+        // instead of quietly showing the session somewhere else.
+        this.showHint('无法打开远程窗口，会话已结束，请重试', true);
       } else if (result === 'no-stage') {
-        // No stored WindowStage, but this page's router is alive: degrade to
-        // the main-window remote page instead of leaving the user with a hint.
-        this.openInMainWindow(sessionId, '窗口不可用，已在主窗口打开远程画面');
+        this.showHint('窗口环境不可用，无法打开远程窗口', true);
       }
     }).finally((): void => {
       this.openingSessions.delete(sessionId);
     });
-  }
-
-  private openInMainWindow(sessionId: string,
-    note: string = '子窗口不可用，已在主窗口打开远程画面'): void {
-    try {
-      this.getUIContext().getRouter().pushUrl({
-        url: 'pages/Remote', params: { sessionId: sessionId }
-      });
-      this.showHint(note);
-    } catch (error) {
-      hilog.error(DOMAIN, TAG, '主窗口打开远程画面失败：%{public}s', String(error));
-      this.showHint('打开远程画面失败：' + String(error), true);
-    }
   }
 
   private async connect(entry: ConnectionEntry, explicitPassword: string): Promise<void> {
@@ -836,11 +824,12 @@ struct Index {
       // stamped by the registry poll when the session reaches connected.
       registerSession(sessionId, entry.id, entry.name, endpoint);
       this.showHint('连接中：' + entry.name);
-      const result = await openRemoteWindow(sessionId);
-      if (result === 'fallback-main') {
-        this.openInMainWindow(sessionId);
+      const result = await openRemoteWindow(sessionId, entry.name);
+      if (result === 'failed') {
+        // The opener closed the session because no window could be created.
+        this.showHint('无法打开远程窗口，会话已结束，请重试', true);
       } else if (result === 'no-stage') {
-        this.openInMainWindow(sessionId, '窗口不可用，已在主窗口打开远程画面');
+        this.showHint('窗口环境不可用，无法打开远程窗口', true);
       }
     } finally {
       // Result received (success or failure): let the button act again. Only
