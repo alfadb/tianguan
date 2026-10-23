@@ -372,3 +372,73 @@ export function copyCursor(sessionId: string, buffer: ArrayBuffer): string {
     return '';
   }
 }
+
+/** Native GL renderer stats parsed from renderStats(); undefined when absent. */
+export interface RenderStatsInfo {
+  state: string;
+  surfaceId: string;
+  error: string;
+  frames: number;
+  swapFailures: number;
+  uploads: number;
+  fullUploads: number;
+  skips: number;
+  fps: number;
+  width: number;
+  height: number;
+  texWidth: number;
+  texHeight: number;
+  frameVersion: number;
+  elapsedMs: number;
+  lastEglError: number;
+  suspended: boolean;
+}
+
+/**
+ * Binds this session's XComponent surface to the native EGL render thread.
+ * The renderer then IS the frame consumer: callers must not takeFrame for
+ * this session while it is attached. startSuspended begins the thread parked
+ * (for a surface created while the window is hidden).
+ */
+export function attachRenderSurface(sessionId: string, surfaceId: string,
+  startSuspended: boolean = false): string {
+  try {
+    return diag.attachRenderSurface(sessionId, surfaceId, startSuspended);
+  } catch (error) {
+    warn('attachRenderSurface', error);
+    return 'ERROR:' + String(error);
+  }
+}
+
+export function detachRenderSurface(sessionId: string): string {
+  try {
+    return diag.detachRenderSurface(sessionId);
+  } catch (error) {
+    warn('detachRenderSurface', error);
+    return 'ERROR:' + String(error);
+  }
+}
+
+export function renderStats(sessionId: string): RenderStatsInfo | undefined {
+  let raw = '';
+  try {
+    raw = diag.renderStats(sessionId);
+  } catch (error) {
+    warn('renderStats', error);
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw) as RenderStatsInfo;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+/** Parks (true) or resumes (false) the render thread of a hidden/shown window. */
+export function suspendRenderSurface(sessionId: string, suspended: boolean): void {
+  try {
+    diag.suspendRenderSurface(sessionId, suspended);
+  } catch (error) {
+    warn('suspendRenderSurface', error);
+  }
+}

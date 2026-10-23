@@ -27,7 +27,7 @@ import type { TraySessionLine } from '../tray/TianguanTrayModel';
 import { initConnectionStore } from '../model/ConnectionStore';
 import { addSessionsListener, allSessions, closeAllSessions,
   startRegistryPolling, stopRegistryPolling } from '../model/SessionRegistry';
-import { openRemoteWindow } from '../windows/RemoteWindows';
+import { openRemoteWindow, REMOTE_QUIT_KEY } from '../windows/RemoteWindows';
 import { clipboardReset } from '../clipboard/TianguanClipboard';
 
 const DOMAIN: number = 0x0000;
@@ -37,6 +37,12 @@ const SECOND_TERMINATE_PASS_MS: number = 5000;
 const QUIT_PENDING_POLL_MS: number = 100;
 /** Hard cap: after this the quit continues even if a session is still reaping. */
 const QUIT_CLOSE_TIMEOUT_MS: number = 3000;
+/**
+ * Grace period after remote.quit = true. Remote sessions live in sibling
+ * RemoteAbility instances and each checks that flag every 200 ms; this
+ * ability's own terminateSelf() ends only itself.
+ */
+const REMOTE_QUIT_GRACE_MS: number = 400;
 
 interface BusinessFailure extends Error {
   code?: number;
@@ -60,12 +66,16 @@ export default class EntryAbility extends UIAbility {
       updateTraySessions(lines);
     });
     setTraySessionOpener((sessionId: string) => {
-      openRemoteWindow(sessionId).then((result: string) => {
+      openRemoteWindow(sessionId, undefined, this.context).then((result: string) => {
         if (result === 'failed' || result === 'no-stage') {
           // No window could be created (and on failure the session was closed),
           // so surface the manager instead of showing a view without a window.
           this.showHiddenWindow('tray-open-failed');
         }
+      }).catch((error: Error): void => {
+        // Never leave this promise unhandled: a rejection aborts the app.
+        hilog.warn(DOMAIN, TAG, 'ui_tray open 异常：%{public}s', String(error));
+        this.showHiddenWindow('tray-open-failed');
       });
     });
     startTray(this.context).catch((error: Error): void => {
@@ -75,7 +85,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    // Sub-windows are created from the stage, so keep it reachable.
+    // The remote windows are abilities now; the stage is kept only so opening
+    // can shift focus from the main window when it is the source.
     AppStorage.setOrCreate('windowStage', windowStage);
     windowStage.loadContent('pages/Index', (error) => {
       if (error.code) {
@@ -151,6 +162,18 @@ export default class EntryAbility extends UIAbility {
     } else {
       hilog.info(DOMAIN, TAG, 'ui_terminate sessions-reaped');
     }
+    // Remote sessions are sibling ability instances: this ability's
+    // terminateSelf() only ends itself. Ask them to quit and let the 200 ms
+    // check above run before the process goes away, so no remote window is left
+    // behind owning a dead session.
+    try {
+      AppStorage.setOrCreate<boolean>(REMOTE_QUIT_KEY, true);
+      hilog.info(DOMAIN, TAG, 'ui_terminate remote-quit signalled, grace=%{public}d ms',
+        REMOTE_QUIT_GRACE_MS);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '退出通知远程窗口失败：%{public}s', String(error));
+    }
+    await this.delay(REMOTE_QUIT_GRACE_MS);
     try {
       clipboardReset();
     } catch (error) {

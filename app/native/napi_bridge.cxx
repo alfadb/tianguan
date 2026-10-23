@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "diagnostics.h"
+#include "render.h"
 #include <napi/native_api.h>
 #include <exception>
 #include <memory>
@@ -343,6 +344,52 @@ napi_value CopyCursor(napi_env env, napi_callback_info info) {
   }
   return MakeString(env, "FAIL cursor: need buffer");
 }
+// Remote-page native renderer (render.h): one EGL thread per session bound to
+// that session's XComponent surface. The optional third argument starts the
+// renderer parked (a surface created while the window is hidden).
+napi_value AttachRenderSurface(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  std::string sessionId;
+  std::string surfaceId;
+  bool startSuspended = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2 ||
+      !GetStringArg(env, argv[0], 256, sessionId) ||
+      !GetStringArg(env, argv[1], 32, surfaceId))
+    return MakeString(env, "ERROR:INVALID_ARGUMENTS");
+  if (argc >= 3 && napi_get_value_bool(env, argv[2], &startSuspended) != napi_ok)
+    startSuspended = false;
+  return MakeString(env, tianguan::attachRenderSurface(sessionId, surfaceId, startSuspended));
+}
+napi_value DetachRenderSurface(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  std::string sessionId;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 ||
+      !GetStringArg(env, argv[0], 256, sessionId))
+    return MakeString(env, "INVALID_SESSION");
+  return MakeString(env, tianguan::detachRenderSurface(sessionId));
+}
+napi_value RenderStats(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  std::string sessionId;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 ||
+      !GetStringArg(env, argv[0], 256, sessionId))
+    return MakeString(env, "ERROR:NO_RENDERER");
+  return MakeString(env, tianguan::renderStats(sessionId));
+}
+napi_value SuspendRenderSurface(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  std::string sessionId;
+  bool suspended = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2 ||
+      !GetStringArg(env, argv[0], 256, sessionId) ||
+      napi_get_value_bool(env, argv[1], &suspended) != napi_ok)
+    return MakeString(env, "INVALID_SESSION");
+  return MakeString(env, tianguan::setRenderSurfaceSuspended(sessionId, suspended));
+}
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
     {"runDiagnostics", nullptr, Run, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -364,9 +411,13 @@ napi_value Init(napi_env env, napi_value exports) {
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setClipboard", nullptr, SetClipboard, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"takeClipboard", nullptr, TakeClipboard, nullptr, nullptr, nullptr, napi_default, nullptr}
+    {"takeClipboard", nullptr, TakeClipboard, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"attachRenderSurface", nullptr, AttachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"detachRenderSurface", nullptr, DetachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"renderStats", nullptr, RenderStats, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 20, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 24, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

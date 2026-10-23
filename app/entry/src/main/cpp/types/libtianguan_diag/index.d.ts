@@ -32,3 +32,17 @@ export const startSession: (filesDir: string) => string;
 export const stopSession: () => string;
 export const copyRegion: (buffer: ArrayBuffer) => string;
 export const takeRegion: (buffer: ArrayBuffer) => string;
+
+// Remote-page presenter: the native EGL/GLES render thread bound to one
+// session's XComponent(SURFACE). While attached, the renderer is the frame
+// consumer — ArkTS must not call takeFrame for the same session. The third
+// argument (optional) starts the renderer parked (surface created while the
+// window is hidden).
+export const attachRenderSurface: (sessionId: string, surfaceId: string,
+  startSuspended?: boolean) => string;
+export const detachRenderSurface: (sessionId: string) => string;
+// JSON stats: state/fps/uploads/skips/surface+texture size/EGL error, or
+// 'ERROR:NO_RENDERER' when nothing is attached.
+export const renderStats: (sessionId: string) => string;
+// true parks the render thread (window hidden), false resumes it.
+export const suspendRenderSurface: (sessionId: string, suspended: boolean) => string;

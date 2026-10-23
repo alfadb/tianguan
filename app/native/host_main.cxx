@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "diagnostics.h"
+#include <rdr/MemOutStream.h>
+#include <rfb/CConnection.h>
+#include <rfb/CMsgWriter.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -715,9 +718,181 @@ int extraTest(const TestConfig& config, const std::string& pin) {
             << std::endl;
   return passed ? 0 : 1;
 }
+
+// --- Key release wire test -------------------------------------------------
+// drainSessionInput() must register a press under the same system key code that
+// sendKeyRelease() later looks up. With a press registered under 0 the release
+// misses downKeys[] and CConnection silently drops it, which is the Ctrl/Shift/
+// Alt stuck-key bug. This drives CConnection over an in-memory stream and checks
+// the exact RFB KeyEvent bytes (8 bytes each: type, down, pad2, keysym32).
+class KeyWireConnection : public rfb::CConnection {
+public:
+  void getUserPasswd(bool, std::string*, std::string*) override {}
+  bool showMsgBox(rfb::MsgBoxFlags, const char*, const char*) override { return false; }
+  void initDone() override {}
+  void setCursor(int, int, const rfb::Point&, const uint8_t*) override {}
+  void setCursorPos(const rfb::Point&) override {}
+  void setColourMapEntries(int, int, uint16_t*) override {}
+  void bell() override {}
+  void installWriter(rfb::CMsgWriter* writer) { setWriter(writer); }
+};
+
+struct KeyWireEvent {
+  bool down;
+  uint32_t keysym;
+};
+
+std::vector<KeyWireEvent> keyWireEvents(rdr::MemOutStream& stream) {
+  std::vector<KeyWireEvent> events;
+  const uint8_t* data = stream.data();
+  for (size_t at = 0; at + 8 <= stream.length(); at += 8) {
+    KeyWireEvent event;
+    event.down = data[at + 1] != 0;
+    event.keysym = (static_cast<uint32_t>(data[at + 4]) << 24) |
+                   (static_cast<uint32_t>(data[at + 5]) << 16) |
+                   (static_cast<uint32_t>(data[at + 6]) << 8) |
+                   static_cast<uint32_t>(data[at + 7]);
+    events.push_back(event);
+  }
+  return events;
+}
+
+bool keyWireTest() {
+  bool passed = true;
+
+  // The shape used by the fixed drain path: system key code == keysym.
+  {
+    rdr::MemOutStream stream;
+    KeyWireConnection conn;
+    conn.setStreams(nullptr, &stream);
+    rfb::CMsgWriter writer(&conn.server, &stream);
+    conn.installWriter(&writer);
+    conn.sendKeyPress(0xffe1, 0, 0xffe1);  // Shift_L down
+    conn.sendKeyRelease(0xffe1);           // Shift_L up
+    conn.sendKeyPress(0x61, 0, 0x61);      // a down
+    conn.sendKeyRelease(0x61);             // a up
+    conn.sendKeyRelease(0x61);             // must be a no-op: entry was erased
+    stream.flush();
+    const std::vector<KeyWireEvent> events = keyWireEvents(stream);
+    const bool ok = events.size() == 4 &&
+                    events[0].down && events[0].keysym == 0xffe1 &&
+                    !events[1].down && events[1].keysym == 0xffe1 &&
+                    events[2].down && events[2].keysym == 0x61 &&
+                    !events[3].down && events[3].keysym == 0x61;
+    std::cout << (ok ? "PASS" : "FAIL")
+              << " key wire: press(keysym)+release(keysym) wrote "
+              << events.size()
+              << " KeyEvents (want 4: Shift down/up, a down/up, then no-op)"
+              << std::endl;
+    passed = passed && ok;
+    conn.installWriter(nullptr);  // close() must not delete the stack writer
+  }
+
+  // The pre-fix shape: press registered under 0, release looks up the keysym,
+  // so CConnection finds no downKeys entry and drops the release.
+  {
+    rdr::MemOutStream stream;
+    KeyWireConnection conn;
+    conn.setStreams(nullptr, &stream);
+    rfb::CMsgWriter writer(&conn.server, &stream);
+    conn.installWriter(&writer);
+    conn.sendKeyPress(0, 0, 0x61);
+    conn.sendKeyRelease(0x61);
+    stream.flush();
+    const std::vector<KeyWireEvent> events = keyWireEvents(stream);
+    const bool ok = events.size() == 1 && events[0].down &&
+                    events[0].keysym == 0x61;
+    std::cout << (ok ? "PASS" : "FAIL")
+              << " key wire: legacy press(0,..)+release(keysym) wrote "
+              << events.size() << " KeyEvents (want 1: release dropped)"
+              << std::endl;
+    passed = passed && ok;
+    conn.installWriter(nullptr);
+  }
+
+  std::cout << (passed ? "KEY WIRE TEST PASS" : "KEY WIRE TEST FAIL") << std::endl;
+  return passed;
+}
+
+// End-to-end companion: send one press/release through the real queued session
+// path. A local Xvnc plus xev records the pair (or, before the fix, only the
+// press) on the server side.
+int keySessionTest(const std::string& dir, int keysym) {
+  bool passed = true;
+  std::cout << "start: " << tianguan::startSession(dir) << std::endl;
+  std::this_thread::sleep_for(std::chrono::seconds(6));
+  const std::string status = tianguan::sessionStatus();
+  std::cout << "status: " << status << std::endl;
+  if (status.find("running=1") == std::string::npos) {
+    std::cout << "FAIL session did not connect" << std::endl;
+    tianguan::stopSession();
+    return 1;
+  }
+  // Focus follows the pointer (PointerRoot) in the bare Xvnc fixture, so put
+  // the pointer inside the xev window before sending the key.
+  std::cout << "move: " << tianguan::sendPointer(50, 55, 0) << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string press = tianguan::sendKey(keysym, 1);
+  std::cout << "key press: " << press << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string release = tianguan::sendKey(keysym, 0);
+  std::cout << "key release: " << release << std::endl;
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  std::cout << "status: " << tianguan::sessionStatus() << std::endl;
+  std::cout << "stop: " << tianguan::stopSession() << std::endl;
+  if (press != "QUEUED" || release != "QUEUED") passed = false;
+  std::cout << (passed ? "KEY SESSION TEST PASS" : "KEY SESSION TEST FAIL")
+            << std::endl;
+  return passed ? 0 : 1;
+}
+
+// Same wire check for the other release path: a key is pressed and then
+// releaseSessionInput() must synthesize a matching release for it.
+int releaseSessionTest(const std::string& dir, int keysym) {
+  bool passed = true;
+  TestConfig config;
+  std::string error;
+  if (!loadConfig(dir, config, error)) {
+    std::cout << "FAIL " << error << std::endl;
+    return 1;
+  }
+  const std::string pin = resolvePin(config.host, config.port, "auto");
+  const std::string id = tianguan::createSession(makeOptions(config, pin, "key-release"));
+  std::cout << "create: " << id << std::endl;
+  if (id.empty() || id[0] == 'E') return 1;
+  const std::string connected = waitForState(id, "connected", 20000);
+  std::cout << "status: " << connected << std::endl;
+  if (connected.find("\"state\":\"connected\"") == std::string::npos) {
+    std::cout << "FAIL session did not connect" << std::endl;
+    tianguan::closeSession(id);
+    return 1;
+  }
+  std::cout << "move: " << tianguan::sendPointer(id, 50, 55, 0) << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string press = tianguan::sendKey(id, keysym, 1);
+  std::cout << "key press: " << press << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string released = tianguan::releaseSessionInput(id);
+  std::cout << "releaseSessionInput: " << released << std::endl;
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  std::cout << "close: " << tianguan::closeSession(id) << std::endl;
+  if (press != "QUEUED" || released != "OK") passed = false;
+  std::cout << (passed ? "RELEASE SESSION TEST PASS" : "RELEASE SESSION TEST FAIL")
+            << std::endl;
+  return passed ? 0 : 1;
+}
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--keyevent-test") == 0) {
+    return keyWireTest() ? 0 : 1;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--key-session-test") == 0) {
+    return keySessionTest(argv[2], static_cast<int>(std::strtol(argv[3], nullptr, 0)));
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--release-session-test") == 0) {
+    return releaseSessionTest(argv[2], static_cast<int>(std::strtol(argv[3], nullptr, 0)));
+  }
   if (argc == 3 && std::strcmp(argv[1], "--net-test") == 0) {
     const std::string result = tianguan::runNetworkTest(argv[2]);
     std::cout << result;

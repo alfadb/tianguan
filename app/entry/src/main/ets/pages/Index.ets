@@ -1,7 +1,6 @@
 /**
- * Main window: connection manager ONLY (the remote desktop itself lives in
- * per-session sub-windows; the main window hosts one only as the sub-window
- * fallback path).
+ * Main window: connection manager ONLY (the remote desktop itself lives in one
+ * independent RemoteAbility window per session).
  *
  *  - left: single-level group column (全部 / groups / 未分组);
  *  - right: connection cards (name, host:port, status, last-connected time,
@@ -17,6 +16,7 @@
  * of re-creating every card (the previous key embedded registryVersion).
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import type { common } from '@kit.AbilityKit';
 import {
   createSession, diagMultiSessionAvailable
 } from '../diag/SessionApi';
@@ -282,7 +282,7 @@ struct Index {
   // connects for different entries cannot clear each other's guard.
   private connectingEntryIds: Set<string> = new Set<string>();
   // Sessions whose window is being opened right now: a double click must not
-  // open the sub-window and then a main-window fallback for the same session.
+  // start two multiton instances for the same session.
   private openingSessions: Set<string> = new Set<string>();
   private listener: () => void = (): void => {};
   private hintTimer: number = -1;
@@ -627,7 +627,7 @@ struct Index {
     for (let i = 0; i < sessions.length; i++) {
       const sessionId = sessions[i].sessionId;
       closeSessionById(sessionId);
-      // The sub-window of a dead session must not be left behind.
+      // The window of a dead session must not be left behind.
       closeRemoteWindow(sessionId).then((): void => {});
     }
     removeConnection(entry.id);
@@ -752,17 +752,26 @@ struct Index {
     }
   }
 
+  private abilityContext(): common.UIAbilityContext | undefined {
+    try {
+      return this.getUIContext().getHostContext() as common.UIAbilityContext;
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '获取主窗口 ability context 失败：%{public}s', String(error));
+      return undefined;
+    }
+  }
+
   private activateSession(sessionId: string, displayName: string): void {
-    // Opening is async; a double click used to start two opens, and the second
-    // one fell back to the main window while the first was still creating the
-    // sub-window, leaving two pages (double polling, two input sources) for one
-    // session. Guard per session id and release once the open finishes.
+    // Opening is async; a double click used to start two opens, and multiton
+    // does not deduplicate, so two instances (double polling, two input
+    // sources) would exist for one session. Guard per session id and release
+    // once the open finishes.
     if (this.openingSessions.has(sessionId)) {
       return;
     }
     this.openingSessions.add(sessionId);
     // displayName only titles the window; the session itself is always the id.
-    openRemoteWindow(sessionId, displayName).then((result: string): void => {
+    openRemoteWindow(sessionId, displayName, this.abilityContext()).then((result: string): void => {
       if (result === 'failed') {
         // No window means no session (the opener already closed it). Report it
         // instead of quietly showing the session somewhere else.
@@ -770,6 +779,12 @@ struct Index {
       } else if (result === 'no-stage') {
         this.showHint('窗口环境不可用，无法打开远程窗口', true);
       }
+    }).catch((error: Error): void => {
+      // A rejected open (window APIs can throw on an abnormal window state)
+      // must surface as a hint, never as an unhandled rejection: that aborts
+      // the whole app.
+      hilog.warn(DOMAIN, TAG, '激活/打开远程窗口异常：%{public}s', String(error));
+      this.showHint('无法打开远程窗口，请重试', true);
     }).finally((): void => {
       this.openingSessions.delete(sessionId);
     });
@@ -829,13 +844,19 @@ struct Index {
       // stamped by the registry poll when the session reaches connected.
       registerSession(sessionId, entry.id, entry.name, endpoint);
       this.showHint('连接中：' + entry.name);
-      const result = await openRemoteWindow(sessionId, entry.name);
+      const result = await openRemoteWindow(sessionId, entry.name, this.abilityContext());
       if (result === 'failed') {
         // The opener closed the session because no window could be created.
         this.showHint('无法打开远程窗口，会话已结束，请重试', true);
       } else if (result === 'no-stage') {
         this.showHint('窗口环境不可用，无法打开远程窗口', true);
       }
+    } catch (error) {
+      // createSession/openRemoteWindow throwing must not escape as an
+      // unhandled rejection (that aborts the app); report and let the button
+      // act again.
+      hilog.warn(DOMAIN, TAG, '连接流程异常：%{public}s', String(error));
+      this.showHint('连接失败：' + String(error), true);
     } finally {
       // Result received (success or failure): let the button act again. Only
       // this entry's guard is cleared, so another entry's connect keeps its own.

@@ -1,6 +1,6 @@
 # 天关：原生内核诊断 HAP
 
-这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `0.0.1` / code `1`，API 26，`2in1` 与 `phone` 双设备。它用于通过正式 HAP 加载原生内核诊断库；当前界面提供内存内核诊断与带指纹确认的受控 VNC 连接测试。仅申请 `ohos.permission.INTERNET`（普通权限，无需 ACL），不申请后台或 VPN 权限。
+这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `0.0.1` / code `1`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核诊断库；当前界面提供连接管理与多会话远程桌面（VNC）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 因签名 Profile 的 ACL 为空而暂时保持未声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
 
 本轮已把测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）纳入调试范围：`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['2in1', 'phone']`。本轮加入网络测试后重建的 unsigned HAP 内 `module.json` 与 `pack.info` 均同时含 `2in1` 与 `phone`，`requestPermissions` 仅含 `ohos.permission.INTERNET`；此前的纯诊断包没有权限声明。
 
@@ -114,11 +114,11 @@ PASS input observed: 261108 pixels changed, bbox (107,0)-(1847,864)
 
 - **多连接管理**：主界面列出保存的连接（名称、`host:port`），可「使用」「删除」；表单填写名称/地址/端口/密码后可「保存连接」。列表存在应用沙箱 `filesDir/connections.json`，只含名称、地址、端口和 `savePassword` 标志，**不含密码**。
 - **密码保存**：勾选「保存密码」时，密码写入系统密钥库（`@ohos.security.asset`，`asset.add` / `asset.query` / `asset.remove`，别名 `tianguan:<host>:<port>`，可访问性 `DEVICE_FIRST_UNLOCKED`），不写入 `connections.json`、不写日志、不回显。若系统密钥库不可用，保存会失败并在状态栏提示，此时连接仍可用但密码不落盘。选择已保存的连接且勾选保存密码时，会自动从密钥库取回密码填入输入框。
-- **远程画面页**：连接启动后为该会话打开独立子窗口 `remote-<sessionId>`，页面 `pages/Remote` 承载远程画面、鼠标键盘、光标与剪贴板；同一会话再次「打开」只激活已有窗口。子窗口创建失败时降级到主窗口内打开同一页面并提示。详见「多会话与窗口（2026-10-21）」。
+- **远程画面页**：连接启动后为该会话启动独立 `RemoteAbility` 实例（`multiton`），页面 `pages/Remote` 承载远程画面、鼠标键盘、光标与剪贴板；同一会话再次「打开」只激活已有窗口，不新建实例。打开失败直接结束该会话并提示，不再降级到主窗口。详见「多会话与窗口（2026-10-21，2026-10-23 改为多实例）」。
 
-冒烟状态（早于多会话改造）：签名包已安装并启动到手机 PLA-AL10（进程存活、无应用错误日志），但连接管理与子窗口的交互尚未人工点验；PC 当晚关机，尚未部署。
+冒烟状态（早于多会话改造）：签名包已安装并启动到手机 PLA-AL10（进程存活、无应用错误日志），但连接管理与远程窗口的交互尚未人工点验；PC 当晚关机，尚未部署。
 
-边界：`connections.json` 明文保存地址与名称（不含密码）；子窗口尺寸不持久记忆；同一会话同时只有一个远程窗口（再次打开是激活），多个会话各自独立窗口。
+边界：`connections.json` 明文保存地址与名称（不含密码）；窗口尺寸不持久记忆；同一会话同时只有一个远程窗口（再次打开是激活），多个会话各自独立实例。
 
 ### 指纹确认与连接界面（2026-10-20）
 
@@ -244,9 +244,9 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 
 当前使用的 `UIAbilityContext.filesDir` 属于 module-level context，模块名为 `entry`，因此沙箱路径包含 `haps/entry`，不能省略为短路径。参见[官方 Stage 应用上下文说明](https://raw.githubusercontent.com/openharmony/docs/master/zh-cn/application-dev/application-models/application-context-stage.md)和[官方应用文件访问说明](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/ide-device-file-explorer)。若 `libtianguan_diag.so` 静态 import 失败，应用尚未进入诊断，不会生成诊断文件；应查看启动及模块加载日志。文件不存在不能视为 PASS。该历史纯诊断轮次未连接设备；网络测试的签名、安装与设备结果见上文「实测结果（2026-10-20，指纹确认实现前的旧测试模式）」的历史记录，该结果只证明连接、RA2_256 认证、首帧与键鼠发送，不证明服务端收到输入，也不代表生产安全策略或完整远程桌面能力。
 
-## 多会话与窗口（2026-10-21）
+## 多会话与窗口（2026-10-21，2026-10-23 改为多实例）
 
-本节描述 2026-10-21 多会话改造后的行为，接口以 [docs/napi-contract.md](../docs/napi-contract.md) 为准（含 `sessionId`、`pendingCloses`、`takeClipboardOrNull`、`requestFullFrame`、`copyCursor(sessionId, …)`）。
+本节描述当前多会话窗口模型，接口以 [docs/napi-contract.md](../docs/napi-contract.md) 为准（含 `sessionId`、`pendingCloses`、`takeClipboardOrNull`、`requestFullFrame`、`copyCursor(sessionId, …)`）。
 
 ### 原生侧：每个会话独立
 
@@ -254,24 +254,34 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - `generation` 每次重连加一；迟到的帧、迟到的输入和针对旧连接的身份确认都会被拒绝。会话状态以 JSON 返回，界面不解析英文错误串。
 - `closeSession(sessionId)` 非阻塞：立即摘除会话、停止读、清输入，线程回收交给后台；`pendingCloses()` 返回尚未回收完的会话数。
 
-### 子窗口：每会话一个
+### 独立 UIAbility 实例：每会话一个窗口
 
-- 每个会话一个独立子窗口，窗口名为 `remote-<sessionId>`，页面为 `pages/Remote`。同一会话再次点「打开」只会 `show()` 并把焦点转回已有窗口，不会创建第二个窗口；窗口关闭后再次打开才新建。
-- 创建顺序固定为 `resize` → `show` → `setUIContent` → 设焦点：先按主窗口 `0.92×0.9`（最小 320×240）调整尺寸，`show()` 之后加载页面，再 `setWindowFocusable(true)` 并 `window.shiftAppWindowFocus` 把键盘焦点转到子窗口。子窗口禁用标题栏拖动，避免在远程桌面里拖动时移动整个窗口。
-- 创建失败或加载页面失败时销毁半成品窗口；拿不到 `WindowStage` 时没有窗口可建。两种情况都降级到主窗口内打开同一页面，经路由参数传 `sessionId`，界面提示「窗口不可用，已在主窗口打开远程画面」。
+- 每个远程会话是一个独立的 `RemoteAbility` 实例（`module.json5` 中 `launchType: "multiton"`，页面 `pages/Remote`）。每次 `startAbility` 都新建实例、任务和顶层窗口，平台不会自动去重，去重由应用负责。
+- 窗口名由系统分配（`tianguanN`，递增且不复用），不能从 `sessionId` 推导。进程内用 AppStorage 维护双向注册表：`remote.window.<sessionId>` = 窗口名，`remote.session.<窗口名>` = `sessionId`；ability 在 `loadContent` 之前写入两条键。
+- 打开会话（列表「打开」、托盘点会话、新建会话）统一走 `openRemoteWindow(sessionId, 名称, context)`：先查注册表并 `window.findWindow(窗口名)`，窗口存在则 `show()`（主窗口在前台时再 `shiftAppWindowFocus`），返回 `activated`；否则 `startAbility` 启动新的 `RemoteAbility`，最多轮询约 2 秒等注册表出现并校验窗口可找到，返回 `opened`。同一会话的并发打开共享一次在飞请求，双击或「列表 + 托盘」同时触发不会开出两个实例。
+- 失败语义：拿不到可用的 ability context 返回 `no-stage`；启动或等待窗口失败返回 `failed` 并结束该会话。**任何失败都不再降级到主窗口内显示**（没有标题、也无法用关窗表示断开）。
+- 窗口标题为连接名（拿不到时用 `host:port`，再退到 `sessionId`）；窗口尺寸按屏幕 `0.92 × 0.9`（最小 320×240）调整，失败只记日志并保留系统默认尺寸。
+
+### Dock 与系统窗口选择器
+
+- Dock/任务栏里始终只有一个「天关」应用图标（系统按应用合并，没有公开 API 让每个窗口单独占一个 Dock 条目）。
+- 点击这个图标会弹出系统窗口选择器：主窗口和每个远程会话各一张带标题的卡片。点卡片直接激活对应窗口，不必先进主窗口再点「打开」；最小化的实例也仍可从这里激活。
+- 选择器只列 ability 主窗口。旧的 `remote-<sessionId>` 子窗口不会出现在其中，这正是本次从子窗口改为独立实例的原因。
 
 ### 会话身份：不猜
 
-- 页面只从两处取会话 id：本页所在窗口名 `remote-<sessionId>` 反解，或显式路由参数 `sessionId`（主窗口降级路径）。两处都没有或互相冲突时报错，显示「无法确定本页所属的会话」，**禁用全部输入与断开操作**，只留「返回连接列表」。
-- 子窗口路径在 `setUIContent` 之前把 `sessionId` 写入按窗口名派生的 AppStorage 键，页面用它与窗口名交叉校验；不一致同样拒绝挂载。没有 FIFO、最近窗口或「取注册表第一个会话」之类的兜底。
+- 页面只从两处取会话 id：本页所在窗口名经 AppStorage 键 `remote.session.<窗口名>` 解析（主通道，ability 在 `loadContent` 前写入），或显式路由参数 `sessionId`（兼容保留）。两处都没有时报错，显示「无法确定本页所属的会话」，**禁用全部输入**，只留关闭窗口的入口。
+- 两处都存在但互相冲突时同样拒绝挂载。没有 FIFO、最近窗口或「取注册表第一个会话」之类的兜底。
 
 ### 关窗与退出
 
-- 关闭远程窗口（页面里的「断开」）= 结束该会话：先结束该会话（`closeSession(sessionId)`），再销毁对应子窗口。
+- 关闭远程会话窗口（系统标题栏 X）= 断开该会话：`windowStageClose` 放行，页面 `aboutToDisappear` 做清理，`onWindowStageDestroy`/`onDestroy` 删除注册表键，`onDestroy` 调用 `closeSessionById(sessionId)`。只结束该实例，其它会话和主窗口不受影响。程序化关闭（删除连接、彻底退出）先用 AppStorage 标志排除，避免重复结束会话。
 - 关闭主窗口 = 转入后台，不退出、不断开会话：拦截主窗口的关闭事件并调用 `hideAbility()`（失败退回 `minimize()`）；托盘未启动时直接 `minimize()`。窗口隐藏后进程、托盘与会话继续运行，托盘或热启动用 `showAbility()` 恢复。
-- 只有「退出」才清理：非阻塞关闭所有会话 → 轮询 `pendingCloses()` 最多 3 秒 → 移除托盘 → `terminateSelf()`；超时仍强退并记录未回收数，可能留下未优雅关闭的会话线程。托盘自带的「退出」行由 `onPrepareToTerminate` 接管：首次请求取消并异步清理，5 秒内再次请求直接放行，避免退不掉。
+- 托盘菜单的「打开 <会话>」同样走 `openRemoteWindow`，已有窗口就激活；主窗口隐藏时源窗口不在前台，只 `show()` 不再强转焦点。托盘右键菜单送达时系统菜单仍持有焦点，主窗口可能在其后又被抬到前台，因此激活已有窗口会在 250 ms 后再补一次 `show()` + 焦点转移（日志 `remote-window activate` 后又出现 `remote-window reactivate`），保证会话窗口最终在最前。
+- **已知限制**：托盘菜单点击会让平台顺带启动一次 `EntryAbility`，其 `onNewWant` 会把主窗口显示出来。主窗口已隐藏时从托盘打开会话，会话窗口会正常出现在最前，但主窗口也会出现在它后面（不遮挡）。曾尝试抑制这次 `onNewWant` 并在 500 ms 后 `hideAbility()` 收回，但真机上会连远程会话窗口一起隐藏、后续 `show()` 也恢复不了（multiton4 回归），因此已回滚；会话可打开性优先。
+- 只有「退出」才清理：非阻塞关闭所有会话 → 轮询 `pendingCloses()` 最多 3 秒 → 写 AppStorage `remote.quit = true` → 等待约 400 ms → 移除托盘 → `terminateSelf()`。远程实例每 200 ms 检查该标志并各自 `terminateSelf()`（主 ability 的 `terminateSelf()` 只结束自己），因此不会留下其它 ability 实例。托盘自带的「退出」行由 `onPrepareToTerminate` 接管：首次请求取消并异步清理，5 秒内再次请求直接放行，避免退不掉。
 
-边界：当前只有页面里的「断开」会结束会话；若从系统标题栏直接关闭子窗口，代码路径只在窗口销毁事件里删除会话身份键，`aboutToDisappear` 并不结束会话，该会话可能变成列表/托盘可接管的孤儿。该路径的实际表现是否与产品约定一致，**需真机验证**。
+边界：Dock 无法为每个会话显示独立图标（平台按应用合并）；窗口选择器比「直接点 Dock 会话图标」多一次选卡片。注册表是进程内状态，进程重启后自然失效。窗口名由系统分配，重开同一会话会得到新窗口名。关窗即断会话是产品约定，已在真机验证（见文末「验证边界」）。
 
 ## 系统托盘（2026-10-21）
 
@@ -282,40 +292,57 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - 平台/运行期失败只降级、不影响会话：模块缺失或 capability 不支持时永久关闭托盘功能；图标/能力探测的瞬时失败不会锁死功能；菜单与悬停提示更新失败保留旧值，下次刷新重试；点击处理失败只记日志。菜单更新做 500 ms 合并，避免平台限流。
 - 悬停提示为「天关 · N 个会话」，无活跃会话时为「天关 · 未连接」。
 
-## 自动剪贴板（2026-10-21）
+## 自动剪贴板（2026-10-21，2026-10-23 改为事件驱动）
 
 - 双向自动同步，仅纯文本；`\r\n` 与 `\r` 统一归一化为 `\n`。每个会话有独立剪贴板版本，来自状态 JSON 的 `clipboard.version`。
-- 远端 → 本机：状态里的版本变化时按会话取一次（`takeClipboardOrNull(sessionId)`），把文本写入本机系统剪贴板；同一版本只取一次。
-- 本机 → 远端：本机剪贴板出现新的纯文本时，按会话调用 `setClipboard(sessionId, text)`，并记录每个会话已投递的本地版本。只有返回 `QUEUED`/`COALESCED` 才算投递成功；断连或当时未接受的会话在之后的轮询里补投，不要求重新复制。
-- 防回环：每次写本机剪贴板**之前**先在 `ClipboardLoopGuard` 记账，剪贴板 `update` 事件与 500 ms 轮询读到这段文本时按「自己写的」跳过，不再回发；本机到远端与远端到本机两个方向共用一个 Promise 串行队列，避免交错。
-- 读取失败：`takeClipboardOrNull` 返回 `null` 表示读取失败，**不消费版本**，保留待处理项，下一轮重试；返回空串才表示「确实没有新内容」，可以消费版本。写本机剪贴板失败同样保留内容重试。
+- 远端 → 本机：状态里的版本变化时按会话取一次（`takeClipboardOrNull(sessionId)`），把文本写入本机系统剪贴板；同一版本只取一次。这条方向由状态轮询驱动，不需要读取权限。
+- 本机 → 远端（事件驱动，不再定时读剪贴板）：用 `systemPasteboard.on('update', onLocalUpdate)` 监听本机剪贴板变化，回调里只计数并发起一次**异步** `await getData()`；比较、广播与防回环都在 Promise 落地后执行。同一时刻只允许一个读取在途（`LocalReadGate`），在途期间到达的 `update` 合并成「还要再读一次」，不会堆叠。监听只在至少一个会话页可见时注册，最后一个可见页隐藏/销毁时用同一回调引用注销。模块启动/授权后的第一次成功读取只建立基线，不把剪贴板里的历史内容推给远端。
+- 兜底与重试：`on('update')` 注册抛错（API/ROM 不支持）时退回 500 ms **异步**兜底轮询（仍只用 `getData()` Promise，无 `getDataSync`）；正常路径为 `mode=event`。另有 1 s 的按需重试定时器，只在「本机文本还有会话没接受」或「远端文本还没写进本机」时存在，且**从不读剪贴板**，替代原来「下一轮轮询再试」的语义。
+- 投递语义：本机文本按会话调用 `setClipboard(sessionId, text)`，并记录每个会话已投递的本地版本；只有返回 `QUEUED`/`COALESCED` 才算投递成功，断连或当时未接受的会话由上述按需重试补投，不要求重新复制。
+- 防回环：每次写本机剪贴板**之前**先在 `ClipboardLoopGuard` 记账，`update` 事件（或兜底轮询）读到这段文本时按「自己写的」跳过，不再回发；本机到远端与远端到本机两个方向共用一个 Promise 串行队列，避免交错。
+- 读取失败：`takeClipboardOrNull` 返回 `null` 表示读取失败，**不消费版本**，保留待处理项，按需重试；返回空串才表示「确实没有新内容」，可以消费版本。写本机剪贴板失败同样保留内容重试。
 - 超过 1 MiB 的文本按 UTF-8 码点边界截断到 1 MiB 以内，并记录截断计数；原生侧对服务端文本同样限长，超出时在状态 JSON 标 `clipboardTruncated: true`。
-- 后台限制：应用在后台时读取系统剪贴板受系统权限限制，「本机 → 远端」会暂停；回到前台后下一轮轮询自动续上。「远端 → 本机」的写入不受此限制。
+- 读取权限：本机 → 远端读取系统剪贴板需要 `ohos.permission.READ_PASTEBOARD`（system_basic / user_grant）。**当前 `module.json5` 因 ACL 为空保持移除该声明**：声明了该受限权限、而签名 Profile 的 ACL（`acls.allowed-acls`）未允许的 HAP 会在**安装阶段**被系统拒绝（`install failed ... grant request permissions failed`，错误码 9568289）。ACL 审批通过后需**恢复 `module.json5` 中被注释掉的声明块并重新签名**（`abilities` 加上 `RemoteAbility`）；代码侧申请/门控已就绪：`clipboardRequestReadPermission()` 在打开远程会话时调用，先 `checkAccessToken` 判断，未授权则 `requestPermissionsFromUser` 申请一次（每进程最多一次），未授权时读取路径完全停用（不注册 `update`、不启动兜底轮询、不调用 `getData`），日志可见一次性 `TianguanClip perm=0 ... gate=` 说明。「远端 → 本机」写本机剪贴板不需要该权限，不受影响。
+- 后台限制：应用在后台时读取系统剪贴板受系统权限限制，「本机 → 远端」会暂停；回到前台、会话页重新可见后重新注册事件监听并按需补读，不再依赖固定轮询。「远端 → 本机」的写入不受此限制。
 - 远端复制的内容只写入本机剪贴板，不会自动转发给其它会话；只有用户在本机真实复制的新文本才会广播给各会话。
+- 设备实测（SLM-W32 / API 26 / 调试签名）：事件驱动版（加权限门控之前）日志为 `mode=event` 且 `updateEvents` 递增，确认 `on('update')` 在该 ROM 正常投递；异步读取仍被 ACL 拒绝（`bytes=0`、约 100 ms 的 IPC），但它已离开 UI 线程、且没有事件就不读，用户确认此前的周期性卡顿消失。加入权限门控后的当前版本在未授权时直接 `mode=off`、不注册监听也不读取（本轮最终包实测）；授权弹窗/允许后回到 `mode=event` 的本机 → 远端同步路径尚未真机验证（等 ACL）。
 
-## 输入与显示（2026-10-21）
+## 输入与显示（2026-10-21，2026-10-22/23 呈现改为 XComponent + GL）
 
 本节是远程画面与输入链路的当前实现说明，面向使用者与后续接手者。更早的 JPEG 整帧快照、在主窗口内打开远程页与按 `keyText` 映射的写法已不代表现状，上文对应小节已就地订正。
 
 ### 画面
 
-- 原生端按会话把「自上次成功交付以来累积的变化」合并成一个包围盒，经 `takeFrame(sessionId, buffer, afterVersion, forceFull)` **在同一把锁里**原子返回「矩形 + 像素」，避免先要矩形再要像素造成的错位与条纹。像素格式固定 `BGRA_8888`，`stride = w * 4`；没有新内容时返回 `NONE`。
-- 交付基线：`afterVersion` 必须等于上一次成功交付的版本（原生记录的 `takenVersion`，且 `pixEpoch` 一致），否则原生返回整帧而不是局部块。基线只在像素 `memcpy` 成功后推进；`NONE` 与 `ERROR:BUFFER_TOO_SMALL` 都不推进。界面把 `takeFrame` 返回的 `version` 记为下一轮的 `afterVersion`。
-- 整帧请求：空闲桌面不会主动推全帧，Canvas 就绪、窗口由隐藏转可见、画面尺寸变化或 `generation` 变化后，界面调用 `requestFullFrame(sessionId)` 请求一次非增量整屏更新，同时把本地 `forceFull` 置真。
-- 动态分辨率：服务端可以中途改变分辨率。状态 JSON 的 `width`/`height` 一变，界面就丢弃旧 `PixelMap` 与在途渲染，按新尺寸重建帧缓冲并强制全帧；`generation` 变化（重连）同理，避免把新画面贴进旧布局。
-- 界面维护一份整屏 `PixelMap` 镜像：拿到矩形后用 `writePixels` 只贴变化区，再把整幅镜像 `drawImage` 到 Canvas。分块重绘实验过，实测比整幅 blit 更差，已回退为整幅重绘。同一时刻只允许一个渲染在途，旧代次帧会被丢弃且不推进版本。
-- 前台每 30 ms 轮询 `sessionStatus(sessionId)`（JSON）；页面或子窗口不可见时降为 1 s 只读状态，停止取帧并释放按键/按钮。像素字节序是 BGRA 而不是 RGBA，按 RGBA 解释会红蓝互换。
+- 默认呈现路径：`XComponent(SURFACE)` + 原生 EGL/GLES 渲染线程（`USE_GL_RENDER = true`，每会话一条，`app/native/render.cxx`）。`attachRenderSurface(sessionId, surfaceId, startSuspended)` 把 surface 绑定到该会话的原生渲染器，surface 重建/销毁或页面释放时 `detachRenderSurface(sessionId)`；窗口隐藏时 `suspendRenderSurface(sessionId, true)` 停住渲染线程，恢复可见时置 false 并请求一次全帧。GL 模式下 ArkTS **不调用** `takeFrame`，原生渲染线程是唯一帧消费者，避免两条路径同时分配纹理。
+- 原生取帧与上传：渲染线程经 `takeFrameStruct` 读该会话的 BGRA 镜像（与 `takeFrame` 同一把 pix 锁、同一交付基线与 `takenVersion`/`pixEpoch` 语义，但不序列化 JSON），只把自上次成功交付以来的变化矩形拷入 staging。首帧、整帧或分辨率变化时用 `glTexImage2D` 重建整幅纹理，否则 `glTexSubImage2D` 只上传变化矩形；全程一张纹理。BGRA 字节按 `GL_RGBA` 上传，fragment shader 用 `vec4(texel.bgr, 1.0)` 还原颜色。contain 缩放与黑边每帧按 `eglQuerySurface` 的实际尺寸重算；`eglSwapInterval(1)` 跟随 vsync，没有新版本时 4 ms 轮询且不 swap。
+- 状态轮询：GL 模式前台每 250 ms 轮询 `sessionStatus(sessionId)`（JSON），驱动状态文本、指纹确认面板、光标形状/版本与剪贴板版本；Canvas 模式保持 30 ms。输入映射与本地光标位置改用 `renderStats()` 的 `texWidth/texHeight`（实际呈现的纹理尺寸），远端分辨率变化时立即对齐，不等状态轮询。页面/窗口不可见时降为 1 s 只读状态，释放按键/按钮并 park 原生渲染器。
+
+- 交付基线（原生取帧共用）：`afterVersion` 必须等于上一次成功交付的版本（原生记录的 `takenVersion`，且 `pixEpoch` 一致），否则返回整帧而不是局部块。基线只在像素 `memcpy` 成功后推进；`NONE` 与 `ERROR:BUFFER_TOO_SMALL` 都不推进。
+- 整帧请求：空闲桌面不会主动推全帧；首帧、窗口由隐藏转可见、远端画面尺寸变化或 `generation` 变化后请求一次非增量整屏更新。**本机窗口缩放不请求服务端全帧**：GL 模式下由原生按新 surface 尺寸重算 contain 缩放与黑边；Canvas 模式下 `onAreaChange` 只更新视图尺寸并重绘当前镜像。本机窗口尺寸不改变远端分辨率。
+- 动态分辨率：服务端可中途改变分辨率。GL 模式下原生发现镜像尺寸变化即重建整幅纹理并强制全帧；ArkTS 从 `renderStats()` 同步新的 `texWidth/texHeight`。Canvas 模式下界面丢弃旧 `PixelMap` 与在途渲染，按新尺寸重建帧缓冲并强制全帧。`generation` 变化（重连）同理。
+- Canvas 路径（保留开关，默认关闭）：`USE_GL_RENDER = false` 恢复旧的 Canvas + 整屏 `PixelMap` 镜像 + 每帧 `drawImage` 管线。**已知 GPU 缓存问题**：该路径每帧让 RenderService 缓存一份纹理和一份 Vulkan buffer（1920×1200 时各约 8.79 MB），达到约 4 GB 应用 GPU 配额后进程被 SIGKILL，严重时会触发内核 OOM；这正是迁移到 GL 的原因。该路径只用于对比/回退，两条路径不得同时挂载。Canvas 细节：原生按会话把累计变化合并成包围盒，经 `takeFrame(sessionId, buffer, afterVersion, forceFull)` 在同一把锁里原子返回「矩形 + 像素」，像素格式 `BGRA_8888`、`stride = w * 4`；界面 `writePixels` 贴变化区到整屏镜像后再整幅 `drawImage`（分块重绘实测更差，已回退），同一时刻只允许一个渲染在途，旧代次帧丢弃且不推进版本。
+- 像素字节序是 BGRA 而不是 RGBA，按 RGBA 解释会红蓝互换。
 
 ### 光标
 
 - 光标形状按会话取：`copyCursor(sessionId, buffer)` 把该会话当前光标图像以 `RGBA_8888` 拷入 `buffer`；状态 JSON 的 `cursor.version` 不变就不重复取，版本递增时再取一次。
 - 客户端声明支持本地光标（`supportsLocalCursor` / `supportsCursorPosition`），光标由客户端按物理指针位置绘制，移动鼠标不产生画面更新，也不需要网络往返。
+- 位置输入驱动：`onMouse` / `onTouch` 更新 `viewPointerX/Y` 后立即按当前缩放与黑边偏移重算本地光标位置，不再等状态轮询；轮询只在光标形状或视图尺寸变化后作为兜底重算。重算先四舍五入再比较，位置没变不写 `@State`；指针落在黑边内或光标隐藏时不动。
 - 服务端首次会下发 `0x0` 空光标（TigerVNC 的 `emptyCursor`），语义是「这次服务端自己把光标画进了画面」：客户端此时隐藏自己的光标图层；客户端发过指针事件后，服务端改发真实形状，客户端再按热点与视图缩放比绘制。
 
 ### 鼠标
 
-- 指针事件按队列发送：界面只入队，由会话线程写 socket（会话线程可能正卡在阻塞读上，直接写会丢掉抬起事件）。纯移动事件合并为最新位置。
+- 指针事件按队列发送：界面只入队，由会话线程写 socket（会话线程可能正卡在阻塞读上，直接写会丢掉抬起事件）。
+- 合并规则：只有「队尾也是指针移动、且掩码相同」时才用最新坐标覆盖队尾。掩码不带滚轮位（8/16）的移动都算移动，所以按住左键拖拽（掩码 `1`）时也合并；按下、抬起、滚轮和按键永远入队，掩码变化就是边界，边界事件的坐标与顺序不会被后续移动覆盖。队列超过 4096 时 `trimInputQueue` 只丢最旧的「非边界移动」，保留最新位置与所有按下/抬起/滚轮事件。
+- 输入插队：每个 framebuffer update 的每个矩形解码后都会调用一次 `drainSessionInput`，大更新期间指针/键盘事件按矩形边界发出，不必等整段更新结束；发送只走输入方向、每条 RFB 消息整条写出，不打断协议解析。空闲时 socket `poll` 超时由 5 ms 降为 1 ms。
 - 按键掩码：左键 `1`、中键 `2`、右键 `4`；滚轮用按钮 4/5，掩码 `8`/`16`，经 `onAxisEvent` + `getVerticalAxisValue()` 取值后按「按下 + 抬起」成对发送。
+
+### 性能打点（perf）
+
+- 原生每秒聚合一次，在 `sessionStatus` JSON 末尾新增 `perf` 对象（只追加、不改既有字段）：`windowMs`、`frames`（该秒提交的 framebuffer update 数）、`delivered`（该秒成功交付的帧数），以及 `decode` / `convert` / `pixWait` / `commit` / `takeFrame` 五组 `{n, mean, p50, max}`。耗时单位是微秒；`decode` 是解码 flush 到转换/拷贝前，`convert` 是把接收矩形转成 BGRA 镜像像素（格式可直接复用时是逐像素 4 字节拷贝并置 alpha=255，否则是 RGB→BGRA 转换），`pixWait` 是提交前等像素锁的时间，`commit` 是持锁写入整屏镜像并推进版本的时间，`takeFrame` 是每次取帧调用（含返回 `NONE` 的调用）。每组最多保留 512 个样本，不逐帧刷日志。
+- 像素格式：`perf` 之后另有只追加的 `pf` 对象，报告 framebuffer 实际协商到的格式 `{bpp, depth, redMax, greenMax, blueMax, bigEndian, redShift, greenShift, blueShift}`（来自 `framebuffer->getPF()`；首个 framebuffer 建立前全为 0）。当其为 32bpp、小端、`redMax/greenMax/blueMax=255`、`redShift/greenShift/blueShift=16/8/0`（即内存里的 BGRX）时，原生直接把每行拷进 BGRA 镜像并跳过 `rgbFromBuffer` 与逐像素通道重排；**alpha 写 255，不依赖渲染端忽略 alpha**：服务端的 X 填充字节不是 alpha 值（Xvnc 实测为 0），即使 PixelMap 声明 `BGRA_8888` + `OPAQUE`，也不把「ArkUI/Canvas 会忽略 alpha」当作前提，拷贝时逐个像素 `| 0xFF000000`。其它格式仍走原转换路径，只把每帧新建的 `row`/`converted` 改为复用缓冲。
+- ArkTS 侧用单调时钟测 `takeFrame` 同步段、`writePixels` await、`drawImage` 调用段与轮询间隔，并计数 `applying` 跳过次数和实际绘制帧数；每 2 秒用 `hilog` info 打一行 `TianguanPerf ...`，格式为 `poll/take/write/draw=均值/最大值`（毫秒），并附带 `cursor={blank,w,h,visible,left,top}`（服务端光标语义与本地光标图层是否可见）、`ptr={x,y}`（最近一次物理指针的窗口坐标）、`lastMeta={x,y,w,h,full}`（最近一次应用的更新矩形）与 `full=N/M`（本窗口整帧次数/应用帧数），用于区分「远端没发帧」「本地光标没画」这类问题。计时与这些字段不改变渲染行为（没有为测量新增 `await` 或同步点），也不新增 UI 元素。
+- 日志级别：周期性的 `TianguanPoll`（ArkTS 轮询分段）与 `TianguanRender`（原生每秒 fps/上传耗时）已从 WARN 降为 **debug**，`TianguanClip` 的 2 s 汇总同样为 debug；正常使用不再周期性刷 warn。一次性诊断（如首帧 `TianguanDiag first-frame pf ...`、渲染线程失败、重连）与真正的错误仍为 WARN/ERROR。
 
 ### 键盘
 
@@ -325,10 +352,32 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
   - 数字 `KEYCODE_0..9`（`2000..2009`）→ `0x30 + 偏移`；
   - 标点查表：空格/减号/等号/方括号/反斜杠/分号/引号/逗号/句点/斜杠/反引号。
 - Shift 组合：目标服务端不按修饰键状态处理（单独发 Shift 按下再发 `a`，远端仍是小写），因此由客户端维护 Shift 状态，按下时直接把字符换成上档 keysym（`A`、`!`、`@` 等），并保证同一物理键的按下与抬起使用同一个 keysym。
+- **按键抬起修复（systemKeyCode 配对）**：原生输入队列原先用 `sendKeyPress(0, 0, keysym)` 登记按下，而 `CConnection::sendKeyRelease()` 按 **systemKeyCode** 查 `downKeys[]`，按下记在 `0`、抬起查 keysym 必然 miss，所有抬起被静默丢弃——字母按下即出字符看似正常，但 Ctrl/Shift/Alt 会永远停在按下状态。现在 `drainSessionInput()` 统一用 keysym 作 systemKeyCode 登记（`sendKeyPress(keysym, 0, keysym)`），`sendKeyRelease(keysym)` 与 `releaseSessionInput()` 都能命中同一键；`keyCode` 仍为 0，线上仍是标准 RFB KeyEvent 格式。host key-wire 断言（Shift+a 共 4 条事件、重复 release 无写入）与本地 Xvnc + xev 实测（按下后 300 ms 的 release 送达，修复前要等断连兜底才松键）均已通过；真机会话窗口内键盘输入也已验证。
 
 ### 已知限制
 
-- 子窗口里的键盘事件是否真能到达远程会话**需真机验证**：本轮已把焦点转到子窗口（`setWindowFocusable(true)` + `window.shiftAppWindowFocus`），并保留页面根组件的 `onKeyEvent`，但尚无真机证据；上一版子窗口方案曾出现「焦点正常、一个键都收不到」。
+- 独立实例窗口中的键盘/鼠标已真机验证（见下节「验证边界」）；滚轮只走过代码路径，未做可视化真机验收。
 - 中文输入法（IME 组合输入）未处理，键盘按物理按键逐个转发；Unicode 直接输入、粘贴与部分快捷键组合未验证。
-- 多会话、独立子窗口、系统托盘与自动剪贴板均未完成真机验收；托盘点击/菜单、剪贴板双端互通、关窗与退出的实际表现需在 PC 与手机上逐项验证。
-- 子窗口尺寸不持久记忆，每次按主窗口比例重新计算。
+- 本机 → 远端自动剪贴板受 `READ_PASTEBOARD` 的 ACL 限制（声明已暂时移除，授权路径代码就绪但未真机走通）。
+- 窗口尺寸不持久记忆，每次按屏幕比例重新计算。
+
+## 验证边界（2026-10-23 收尾）
+
+设备为 SLM-W32（HarmonyOS 7.0.0.111 / API 26，调试签名，`192.168.50.183:43833`）。以下按“真机验证过”和“未做/受限”分开，避免把构建通过当成功能通过。
+
+### 已真机验证
+
+- **多实例窗口**：每会话独立 `RemoteAbility`（multiton）；同一会话再次「打开」只激活已有窗口，不新建；关掉一个会话窗口只断该会话并 `terminateSelf()`，其它会话继续出帧。
+- **Dock 与系统窗口选择器**：Dock 始终只有一个「天关」图标；点击后弹出选择器，主窗口和每个会话各一张卡片，点卡片直接激活对应窗口（含最小化实例）。
+- **托盘**：左键打开/激活主窗口；「打开 <会话>」能把会话窗口带到最前（含主窗口在前台的情况）；系统托盘的「退出」能完成会话回收并清理所有实例与窗口。
+- **键鼠**：会话窗口内键盘输入可在远端 XFCE 终端执行（`echo` 等）；鼠标点击能获得焦点并把输入送到远端；按键抬起经 systemKeyCode 配对修复后不再卡住修饰键。
+- **远端 → 本机剪贴板**：远端终端复制后本机剪贴板被写入（日志 `clipboard 远端->本地 同步 N 字节`，本机输入法出现 `local_data_notify`）。
+- **GL 呈现与显存**：真实 62 会话连续 24 分钟以上、3 分钟采样内应用 GPU 24.4–33.5 MB 波动（增长恒为 3 MB，无随帧数线性增长），1 个 GPU context；`RENDER_MEMORY_OVER_ERROR`/`KillProcessByPid` 计数为 0，进程存活；受控 60 fps 内容下 fps 62.4–69.4、swapFail=0；颜色与 Canvas 对照最大差 0.7/255，contain 布局/黑边与 Canvas 对齐；两会话同时渲染正常。
+- **无周期卡顿**：事件驱动改造完成后实测 `TianguanClip` 为 `mode=event`、`updateEvents` 递增，用户确认此前的周期性卡顿消失；当前版本在未授权时直接停用读取（`mode=off`，不注册监听），授权后的 `mode=event` 路径等 ACL 到位后再复测。
+
+### 未做 / 受限
+
+- **本机 → 远端剪贴板**：等 AGC 的 `READ_PASTEBOARD` ACL 审批；当前声明保持移除，读取完全停用，授权弹窗/允许后的自动同步未真机走通。
+- **主窗口隐藏态从托盘打开会话**：会话窗口正常出现且在最先，但平台会顺带拉起主窗口并显示在会话窗口后面（不遮挡，属外观限制）。曾尝试抑制/收回，真机上会导致会话窗口不可见，已回滚（详见「多会话与窗口」）。
+- **滚轮**：仅代码路径保留，未做可视化真机验收。
+- **IME / Unicode 直接输入 / RDP / X509**：未实现或未验证。

@@ -1,51 +1,100 @@
 /**
- * Remote desktop page — one instance per session, hosted either in its own
- * sub-window (window name "remote-<sessionId>", the normal path) or inside the
- * main window (router fallback when sub-window creation failed; the session id
- * then arrives through router params).
+ * Remote desktop page — one instance per session, hosted in its own independent
+ * UIAbility window (RemoteAbility, launchType "multiton"; the system-assigned
+ * window name is tianguanN).
  *
- * The session this page drives is NEVER guessed. It comes from one of exactly
- * two sources: router params (main-window fallback) or this page's OWN window
- * name, read from its UIContext and mapped back by sessionIdForWindowName().
- * When neither yields an id the page fails closed: the error is shown and every
- * input path stays unmounted. There is no "last window", FIFO or "first
- * registry session" fallback.
+ * The session this page drives is NEVER guessed. The page reads its own window
+ * name from its UIContext and resolves it through the AppStorage binding
+ * RemoteAbility wrote before loadContent(): remote.session.<windowName> =
+ * sessionId. Router params are still accepted for compatibility (legacy launch
+ * paths), but a value conflicting with that binding fails closed. When neither
+ * yields an id the page fails closed: the error is shown and every input path
+ * stays unmounted. There is no "last window", FIFO or "first registry session"
+ * fallback.
  *
  * The page is pure picture: no title row, no disconnect button and no padding,
- * so the Canvas fills the whole window. The connection name belongs to the
- * window title (set by RemoteWindows), and the disconnect path is closing that
+ * so the picture fills the whole window. The connection name belongs to the
+ * window title (set by RemoteAbility), and the disconnect path is closing that
  * window — never an action inside this page.
+ *
+ * Presentation (USE_GL_RENDER = true): an XComponent(SURFACE) whose surface is
+ * attached, per session, to the native EGL/GLES renderer (app/native/render.cxx
+ * — attachRenderSurface/detachRenderSurface). The render thread IS the frame
+ * consumer: it pulls the BGRA mirror through takeFrameStruct, uploads changed
+ * rectangles into one fixed texture and presents with eglSwapBuffers at the
+ * surface's vsync. That path replaced the Canvas + per-frame drawImage
+ * pipeline, which made RenderService cache a texture plus a Vulkan buffer per
+ * picture version until the 4096 MB application GPU quota killed the process
+ * (see .work/glspike/REPORT.md). ArkTS therefore never calls takeFrame in this
+ * mode; it only handles status, the trust panel, the clipboard edge, input and
+ * the local cursor overlay. Setting USE_GL_RENDER = false restores the Canvas
+ * path unchanged (both paths must never be mounted at the same time).
  *
  * Everything talks to the native layer through diag/SessionApi.ets with THIS
  * session's id; the status is parsed as JSON per docs/napi-contract.md (never
- * the legacy "key=value" text). The 30 ms poll drives frames (takeFrame with
- * afterVersion/forceFull), the local cursor, the status text, the
- * trust-required panel and the clipboard edge (clipboard.version ->
- * clipboard/TianguanClipboard). The poll slows to 1 s (status only) while the
- * page is hidden.
+ * the legacy "key=value" text). The 250 ms poll (30 ms on the Canvas path)
+ * drives the status text, the trust-required panel and the clipboard edge
+ * (clipboard.version -> clipboard/TianguanClipboard); frames no longer depend
+ * on it in the GL mode. The local cursor follows pointer events directly; the
+ * poll only re-places it after a shape or size change. Two 2 s hilog summaries
+ * report the render statistics ("TianguanPerf", info) and the poll stage
+ * timings ("TianguanPoll", debug: sessionStatus / applyStatus /
+ * pollRenderStats). The poll slows to 1 s
+ * (status only) while the page is hidden, and the native renderer is parked
+ * for that time.
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { image } from '@kit.ImageKit';
+import { systemDateTime } from '@kit.BasicServicesKit';
 import { KeyCode } from '@ohos.multimodalInput.keyCode';
 import pointer from '@ohos.multimodalInput.pointer';
 import { window } from '@kit.ArkUI';
 import {
   copyCursor, parseFrameMeta, reconnectSession, releaseSessionInput, requestFullFrame,
   sendKey, sendPointer, sessionStatus, takeFrameRaw,
+  attachRenderSurface, detachRenderSurface, renderStats, suspendRenderSurface,
   SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
 import { findSession, markWindowOpen } from '../model/SessionRegistry';
 import { trustFingerprint } from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
-  clipboardUnregisterSession } from '../clipboard/TianguanClipboard';
-import { sessionIdForWindowName, sessionKeyForWindow } from '../windows/RemoteWindows';
+  clipboardUnregisterSession, clipboardSetSessionVisible,
+  clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
+import { sessionKeyForWindow } from '../windows/RemoteWindows';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
+// Presentation switch: true = XComponent(SURFACE) + native EGL renderer (the
+// default), false = the previous Canvas + per-frame drawImage path (kept for
+// comparison and rollback; it leaks one RenderService texture per frame on
+// this HarmonyOS build). Only one path is ever mounted.
+const USE_GL_RENDER: boolean = true;
+// Status poll while visible. The GL path needs no frame polling (the native
+// renderer pulls frames itself), so it only watches status/cursor/clipboard;
+// the Canvas path keeps its historical 30 ms frame cadence.
+const POLL_INTERVAL_MS: number = USE_GL_RENDER ? 250 : 30;
 
 interface RemoteRouterParams {
   sessionId?: string;
+}
+
+/**
+ * XComponentController subclass: surface lifetime events arrive as method
+ * overrides (since API 12), not as component attributes. The page installs
+ * plain callbacks so the controller stays decoupled from the struct.
+ */
+class RemoteSurfaceController extends XComponentController {
+  onSurfaceReady: (surfaceId: string) => void = () => {};
+  onSurfaceGone: (surfaceId: string) => void = () => {};
+
+  onSurfaceCreated(surfaceId: string): void {
+    this.onSurfaceReady(surfaceId);
+  }
+
+  onSurfaceDestroyed(surfaceId: string): void {
+    this.onSurfaceGone(surfaceId);
+  }
 }
 
 @Entry
@@ -67,13 +116,20 @@ struct Remote {
   @State private cursorTop: number = -1;
   @State private cursorDrawW: number = 0;
   @State private cursorDrawH: number = 0;
+  // Latest cursor shape/hotspot from the server. The position is recomputed from
+  // these on every pointer event; it is not persisted in @State because only
+  // the rendered rectangle needs to trigger a UI update.
+  private cursorShapeW: number = 0;
+  private cursorShapeH: number = 0;
+  private cursorHotX: number = 0;
+  private cursorHotY: number = 0;
+  private cursorUsable: boolean = false;
   @State private fingerprint: string = '';
   @State private needsTrust: boolean = false;
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private canvasReady: boolean = false;
   private sessionId: string = '';
-  private inSubWindow: boolean = false;
   private framePixels: image.PixelMap | undefined = undefined;
   private frameReady: boolean = false;
   private regionBuffer: ArrayBuffer = new ArrayBuffer(0);
@@ -81,6 +137,11 @@ struct Remote {
   @State private frameHeight: number = 0;
   private viewWidth: number = 0;
   private viewHeight: number = 0;
+  // Last size reported by onAreaChange. A pure window move also fires the
+  // callback; only a changed width/height loses the Canvas and needs a full
+  // frame.
+  private lastAreaWidth: number = -1;
+  private lastAreaHeight: number = -1;
   private lastVersion: number = -1;
   private forceFull: boolean = true;
   private lastGeneration: number = -1;
@@ -104,7 +165,8 @@ struct Remote {
   private tornDown: boolean = false;
   private pageVisible: boolean = true;
   private lastState: string = '';
-  // Single in-flight render: the 30 ms poll must never start overlapping draws.
+  // Single in-flight render: the Canvas 30 ms poll must never start
+  // overlapping draws.
   private applying: boolean = false;
   // Bumped whenever the local mirror is invalidated; a render that started
   // under an older epoch must not commit its version or draw.
@@ -122,8 +184,85 @@ struct Remote {
   // True once a real MouseEvent arrived: the mouse path then owns input and the
   // synthetic touch events (one per click on PC) are ignored.
   private hasMouse: boolean = false;
+  // --- Rendering timings -------------------------------------------------
+  // Rolling accumulators (microseconds / counts). A summary is logged every
+  // 2 s; nothing is allocated per frame and no timing call changes behaviour.
+  private perfWindowStart: number = 0;
+  private perfPollLast: number = 0;
+  private perfPollSum: number = 0;
+  private perfPollCount: number = 0;
+  private perfPollMax: number = 0;
+  private perfTakeSum: number = 0;
+  private perfTakeCount: number = 0;
+  private perfTakeMax: number = 0;
+  private perfWriteSum: number = 0;
+  private perfWriteCount: number = 0;
+  private perfWriteMax: number = 0;
+  private perfDrawSum: number = 0;
+  private perfDrawCount: number = 0;
+  private perfDrawMax: number = 0;
+  // Whole pollOnce() call and its three stages: sessionStatus (sync NAPI +
+  // JSON parse), applyStatus (ArkUI @State writes) and pollRenderStats (sync
+  // NAPI read). Logged as the debug-level "TianguanPoll" line every 2 s; the
+  // poll cadence itself is unchanged (250 ms on the GL path, 30 ms on Canvas).
+  private perfOnceSum: number = 0;
+  private perfOnceCount: number = 0;
+  private perfOnceMax: number = 0;
+  private perfStatusSum: number = 0;
+  private perfStatusCount: number = 0;
+  private perfStatusMax: number = 0;
+  private perfApplySum: number = 0;
+  private perfApplyCount: number = 0;
+  private perfApplyMax: number = 0;
+  private perfRenderSum: number = 0;
+  private perfRenderCount: number = 0;
+  private perfRenderMax: number = 0;
+  private perfApplyingSkips: number = 0;
+  private perfAppliedFrames: number = 0;
+  private perfFullFrames: number = 0;
+  // Last values logged by the 2 s summary: whether the server-drawn cursor is
+  // blank (0x0 shape means the server painted the pointer into the picture),
+  // the latest cursor shape size, and the last applied update rectangle. These
+  // are log-only mirrors; they never feed back into rendering or input.
+  private lastCursorBlank: boolean = true;
+  private lastCursorW: number = 0;
+  private lastCursorH: number = 0;
+  private lastMetaX: number = -1;
+  private lastMetaY: number = -1;
+  private lastMetaW: number = 0;
+  private lastMetaH: number = 0;
+  private lastMetaFull: boolean = false;
+  // --- Native GL presenter (USE_GL_RENDER) --------------------------------
+  private glController: RemoteSurfaceController = new RemoteSurfaceController();
+  // Surface currently attached to the native renderer ('' = none). Attaching
+  // twice to the same surface would restart the render thread needlessly.
+  private glAttachedSurfaceId: string = '';
+  // Last surface id this page saw, kept so a failed renderer can be re-tried
+  // even when no new surface event arrives (the surface still exists).
+  private glLastSurfaceId: string = '';
+  // Bounded re-attach attempts after a renderer failure; reset as soon as
+  // the renderer is running again.
+  private glReattachCount: number = 0;
+  // Latest renderer snapshot, for the 2 s summary line and first-frame gating.
+  private renderState: string = '';
+  private renderFps: number = 0;
+  private renderFrames: number = 0;
+  private renderUploads: number = 0;
+  private renderSkips: number = 0;
+  private renderSwapFailures: number = 0;
+  private renderTexW: number = 0;
+  private renderTexH: number = 0;
+  private lastRenderError: string = '';
 
   aboutToAppear(): void {
+    this.glController.onSurfaceReady = (surfaceId: string): void => {
+      this.attachRendererSurface(surfaceId);
+    };
+    this.glController.onSurfaceGone = (surfaceId: string): void => {
+      if (this.glAttachedSurfaceId === surfaceId) {
+        this.detachRendererSurface('surface-destroyed');
+      }
+    };
     this.bootstrap();
   }
 
@@ -146,14 +285,20 @@ struct Remote {
     this.sessionId = resolvedId;
     if (this.sessionId.length === 0) {
       this.resolutionFailed = true;
-      this.statusText = '无法确定本页所属的会话（缺少 router 参数，且本窗口名不是远程窗口）';
+      this.statusText = '无法确定本页所属的会话（窗口身份未登记）';
       hilog.error(DOMAIN, TAG, 'remote 页面无法确定会话归属，已禁用输入');
       return;
     }
-    hilog.info(DOMAIN, TAG, 'remote 页面启动 session=%{public}s sub=%{public}s',
-      this.sessionId, String(this.inSubWindow));
+    hilog.info(DOMAIN, TAG, 'remote 页面启动 session=%{public}s window=%{public}s',
+      this.sessionId, this.ownWindowName);
     markWindowOpen(this.sessionId, true);
     clipboardRegisterSession(this.sessionId);
+    // onPageShow may have run (or not) before the session id was known; keep the
+    // clipboard visibility in sync with the page's real visibility either way.
+    clipboardSetSessionVisible(this.sessionId, this.pageVisible);
+    // READ_PASTEBOARD is user_grant: ask once per process with this page's host
+    // context. Until it is granted the clipboard module does not read at all.
+    this.requestClipboardReadPermission();
     this.attachWindowEvents();
     // Mount the Canvas now; onReady() can fire (and frames can start flowing)
     // even before the first connection status arrives.
@@ -161,11 +306,30 @@ struct Remote {
     this.startPolling();
   }
 
+  /**
+   * Runtime READ_PASTEBOARD request (one dialog per process; the clipboard
+   * module ignores repeated calls). Without a host context the request is
+   * skipped and the clipboard module stays gated — it never reads without the
+   * permission.
+   */
+  private requestClipboardReadPermission(): void {
+    try {
+      const context = this.getUIContext().getHostContext();
+      if (context === undefined) {
+        hilog.warn(DOMAIN, TAG, 'remote 页面拿不到 host context，跳过剪贴板读取授权申请');
+        return;
+      }
+      clipboardRequestReadPermission(context);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG,
+        'remote 页面申请剪贴板读取权限失败：%{public}s', String(error));
+    }
+  }
+
   aboutToDisappear(): void {
     // Losing the view is NOT itself a user close: the session keeps running
-    // (the main list and the tray own its lifetime). In a sub-window the user
-    // closing the window reaches RemoteWindows' WINDOW_DESTROYED handler,
-    // which is what ends the session; this page never closes it here.
+    // until RemoteAbility.onDestroy decides otherwise (window X = disconnect).
+    // This page never closes it here.
     this.disposed = true;
     this.teardown();
   }
@@ -178,6 +342,7 @@ struct Remote {
     this.stopFrameTimer();
     this.stopIdleTimer();
     this.detachWindowEvents();
+    this.detachRendererSurface('teardown');
     this.dropFramePixels();
     this.releaseCursorPixelMap();
     if (this.sessionId.length === 0) {
@@ -191,10 +356,11 @@ struct Remote {
 
   // -------------------------------------------------------------------------
   // Session id resolution. Exactly two evidence sources, in order:
-  //   1) router params — the main-window fallback opened by Index;
-  //   2) this page's own window name — the sub-window created as
-  //      windowNameForSession(sessionId).
-  // Anything else is a guess and is deliberately absent (F01).
+  //   1) this page's own window name -> the AppStorage binding written by
+  //      RemoteAbility before loadContent();
+  //   2) router params — kept for compatibility with legacy launch paths.
+  // A value that conflicts with the window binding is an identity conflict, not
+  // something to pick from. Anything else is a guess and deliberately absent.
   // -------------------------------------------------------------------------
 
   private async resolveSessionId(): Promise<string> {
@@ -212,35 +378,36 @@ struct Remote {
       hilog.warn(DOMAIN, TAG, 'remote 读取本窗口名失败：%{public}s', String(error));
     }
     this.ownWindowName = windowName;
-    const windowSession = windowName.length > 0 ? sessionIdForWindowName(windowName) : '';
-    if (windowSession.length > 0) {
-      this.inSubWindow = true;
+    // 1) The ability published this window's session BEFORE loadContent().
+    let windowSession = '';
+    if (windowName.length > 0) {
+      const mapped = AppStorage.get<string>(sessionKeyForWindow(windowName));
+      if (mapped !== undefined && mapped.length > 0) {
+        windowSession = mapped;
+      }
     }
-    // 1) Router params — the main-window fallback path opened by Index.
+    // 2) Router params (legacy paths). They must AGREE with the window binding
+    // when both exist; otherwise the page cannot know which identity is real.
+    let routedSession = '';
     try {
       const params = this.getUIContext().getRouter().getParams() as RemoteRouterParams | undefined;
       if (params !== undefined && params !== null &&
           typeof params.sessionId === 'string' && params.sessionId.length > 0) {
-        return params.sessionId;
+        routedSession = params.sessionId;
       }
     } catch (error) {
-      // No router context — the sub-window path below still applies.
+      // No router context — the window binding above still applies.
     }
-    // 2) The sub-window's own name carries its session id by construction.
-    // Cross-check the binding key written before the page was loaded: a
-    // conflicting key means the window identity is inconsistent, so refuse to
-    // attach instead of silently picking one of the two.
+    if (windowSession.length > 0 && routedSession.length > 0 && windowSession !== routedSession) {
+      hilog.error(DOMAIN, TAG, 'remote 窗口身份冲突 window=%{public}s bound=%{public}s routed=%{public}s',
+        windowName, windowSession, routedSession);
+      return '';
+    }
     if (windowSession.length > 0) {
-      const mapped = AppStorage.get<string>(sessionKeyForWindow(windowName));
-      if (mapped !== undefined && mapped.length > 0 && mapped !== windowSession) {
-        hilog.error(DOMAIN, TAG, 'remote 窗口身份冲突 window=%{public}s key=%{public}s',
-          windowName, mapped);
-        return '';
-      }
       return windowSession;
     }
     // Neither source answers: fail closed. No FIFO/registry fallback.
-    return '';
+    return routedSession;
   }
 
   private setHostCursorVisible(visible: boolean): void {
@@ -260,8 +427,8 @@ struct Remote {
   private attachWindowEvents(): void {
     const name = this.ownWindowName;
     if (name.length === 0) {
-      // No named window (main-window path on hosts that do not expose a name):
-      // the page lifecycle below still covers hide/show and teardown.
+      // No named window on a host that does not expose one: the page lifecycle
+      // below still covers hide/show and teardown.
       return;
     }
     try {
@@ -306,21 +473,135 @@ struct Remote {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Native GL presenter lifecycle (USE_GL_RENDER). The XComponent's surface
+  // events drive attach/detach; the page only adds the session binding and
+  // parks the render thread while its window is hidden.
+  // -------------------------------------------------------------------------
+
+  private attachRendererSurface(surfaceId: string): void {
+    if (!USE_GL_RENDER || this.disposed || surfaceId.length === 0) {
+      return;
+    }
+    // The inner Stack (and with it the XComponent) only mounts once the
+    // session is resolved, so sessionId is set by the time this runs.
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    if (this.glAttachedSurfaceId === surfaceId) {
+      return;
+    }
+    this.glLastSurfaceId = surfaceId;
+    const previous = this.glAttachedSurfaceId;
+    this.glAttachedSurfaceId = surfaceId;
+    // A surface created while the window is hidden starts parked, so the
+    // renderer never presents into an invisible surface.
+    const result = attachRenderSurface(this.sessionId, surfaceId, !this.pageVisible);
+    hilog.info(DOMAIN, TAG, 'attachRenderSurface session=%{public}s surface=%{public}s' +
+      ' (was %{public}s) result=%{public}s', this.sessionId, surfaceId, previous, result);
+    if (result !== 'OK:ATTACHED') {
+      // Keep the id only when the native side accepted it, so a later surface
+      // event can retry.
+      this.glAttachedSurfaceId = previous;
+    }
+  }
+
+  private detachRendererSurface(reason: string): void {
+    if (!USE_GL_RENDER || this.sessionId.length === 0) {
+      return;
+    }
+    if (this.glAttachedSurfaceId.length === 0) {
+      return;
+    }
+    this.glAttachedSurfaceId = '';
+    // Native side stops the thread and joins it on a reaper, so this returns
+    // immediately even if a swap is still in flight.
+    const result = detachRenderSurface(this.sessionId);
+    hilog.info(DOMAIN, TAG, 'detachRenderSurface reason=%{public}s session=%{public}s' +
+      ' result=%{public}s', reason, this.sessionId, result);
+  }
+
+  /** Reads the native renderer's snapshot; also gates the first-frame UI. */
+  private pollRenderStats(): void {
+    if (!USE_GL_RENDER || this.sessionId.length === 0) {
+      return;
+    }
+    const stats = renderStats(this.sessionId);
+    if (stats === undefined) {
+      return;
+    }
+    this.renderState = stats.state;
+    this.renderFps = stats.fps;
+    this.renderFrames = stats.frames;
+    this.renderUploads = stats.uploads;
+    this.renderSkips = stats.skips;
+    this.renderSwapFailures = stats.swapFailures;
+    this.renderTexW = stats.texWidth;
+    this.renderTexH = stats.texHeight;
+    if (stats.frames > 0 && !this.canvasShown) {
+      this.canvasShown = true;
+    }
+    // Input mapping and cursor placement must follow the PRESENTED geometry
+    // (the texture), not the lagging status poll: on a remote resolution
+    // change this keeps clicks and the cursor correct immediately.
+    if (stats.texWidth > 0 && stats.texHeight > 0 &&
+        (stats.texWidth !== this.frameWidth || stats.texHeight !== this.frameHeight)) {
+      this.frameWidth = stats.texWidth;
+      this.frameHeight = stats.texHeight;
+    }
+    if (stats.state === 'running' && stats.frames > 0) {
+      this.glReattachCount = 0;
+    }
+    if (stats.state === 'failed' && stats.error.length > 0 &&
+        stats.error !== this.lastRenderError) {
+      this.lastRenderError = stats.error;
+      hilog.warn(DOMAIN, TAG, '原生渲染线程失败 session=%{public}s error=%{public}s',
+        this.sessionId, stats.error);
+    }
+    // A failed renderer must not leave a permanent black screen: the surface
+    // usually still exists, so retry the attach with the last known id (a
+    // bounded number of times — a genuinely dead surface reports
+    // ALREADY/INVALID and stops here). "session closed" is final; the
+    // window/session is going away.
+    if (stats.state === 'failed' && stats.error !== 'session closed' &&
+        this.glLastSurfaceId.length > 0 && this.glAttachedSurfaceId.length > 0 &&
+        this.glReattachCount < 5) {
+      this.glReattachCount += 1;
+      hilog.warn(DOMAIN, TAG, '渲染失败后重连 attempt=%{public}d/%{public}d session=%{public}s',
+        this.glReattachCount, 5, this.sessionId);
+      this.glAttachedSurfaceId = '';
+      this.attachRendererSurface(this.glLastSurfaceId);
+    }
+  }
+
   private setPageVisible(visible: boolean): void {
     this.pageVisible = visible;
     if (this.disposed || this.sessionId.length === 0) {
       return;
     }
+    // The pasteboard read permission only exists for a visible window, so the
+    // clipboard 'update' listener follows this page's visibility.
+    clipboardSetSessionVisible(this.sessionId, visible);
     if (visible) {
+      // A hidden window may have had its surface destroyed; onSurfaceCreated
+      // re-attaches in that case. Parked renderers resume here.
+      if (USE_GL_RENDER) {
+        suspendRenderSurface(this.sessionId, false);
+      }
       this.startFrameTimer();
       // Content that changed while hidden was never fetched: repaint from a
       // complete frame right away instead of waiting for a diff.
       this.requestFull();
-      this.applyPending();
+      if (!USE_GL_RENDER) {
+        this.applyPending();
+      }
     } else {
       // Nobody can see the frames, so stop fetching them; the 1 s status poll
       // keeps reconnects/trust prompts advancing.
       this.releaseAllInputs('page-hidden');
+      if (USE_GL_RENDER) {
+        suspendRenderSurface(this.sessionId, true);
+      }
       this.stopFrameTimer();
       this.startIdleTimer();
     }
@@ -343,7 +624,7 @@ struct Remote {
     if (this.disposed || this.sessionId.length === 0) {
       return;
     }
-    this.timer = setInterval((): void => { this.poll(); }, 30);
+    this.timer = setInterval((): void => { this.poll(); }, POLL_INTERVAL_MS);
   }
 
   private stopFrameTimer(): void {
@@ -455,6 +736,9 @@ struct Remote {
     const previous = this.cursorPm;
     this.cursorPm = undefined;
     this.cursorLeft = -1;
+    this.cursorUsable = false;
+    this.cursorShapeW = 0;
+    this.cursorShapeH = 0;
     if (previous !== undefined) {
       this.releasePixelMap(previous);
     }
@@ -504,7 +788,12 @@ struct Remote {
   // at a time: overlapping applies share regionBuffer/framePixels and could
   // commit versions that were never drawn.
   private async applyPending(): Promise<void> {
-    if (this.applying || this.disposed || !this.pageVisible) {
+    if (this.applying) {
+      // A render is in flight and this poll had to be dropped.
+      this.perfApplyingSkips += 1;
+      return;
+    }
+    if (this.disposed || !this.pageVisible) {
       return;
     }
     if (!this.canvasReady || this.viewWidth <= 0 || this.frameWidth <= 0) {
@@ -526,8 +815,16 @@ struct Remote {
         this.regionBuffer = new ArrayBuffer(needed);
       }
       // One call returns both pixels and rectangle, so a frame arriving in
-      // between cannot mix sizes and tear the picture.
+      // between cannot mix sizes and tear the picture. The synchronous segment
+      // is timed for the rolling perf summary.
+      const takeStart = Remote.nowUs();
       const raw = takeFrameRaw(this.sessionId, this.regionBuffer, this.lastVersion, this.forceFull);
+      const takeUs = Remote.nowUs() - takeStart;
+      this.perfTakeSum += takeUs;
+      this.perfTakeCount += 1;
+      if (takeUs > this.perfTakeMax) {
+        this.perfTakeMax = takeUs;
+      }
       if (raw === 'NONE') {
         return;
       }
@@ -568,7 +865,14 @@ struct Remote {
         stride: meta.w * 4,
         region: { size: { width: meta.w, height: meta.h }, x: meta.x, y: meta.y }
       };
+      const writeStart = Remote.nowUs();
       await pixels.writePixels(area);
+      const writeUs = Remote.nowUs() - writeStart;
+      this.perfWriteSum += writeUs;
+      this.perfWriteCount += 1;
+      if (writeUs > this.perfWriteMax) {
+        this.perfWriteMax = writeUs;
+      }
       // The version may only advance once the pixels really landed AND were
       // drawn from the same mirror generation. A reconnect during the await
       // bumps both the epoch and the generation; either mismatch means the
@@ -577,12 +881,23 @@ struct Remote {
           !Remote.sameGeneration(meta.generation, this.lastGeneration)) {
         return;
       }
-      const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
-      const offsetX = (this.viewWidth - this.frameWidth * scale) / 2;
-      const offsetY = (this.viewHeight - this.frameHeight * scale) / 2;
-      const dw = Math.round(this.frameWidth * scale);
-      const dh = Math.round(this.frameHeight * scale);
-      this.ctx.drawImage(pixels, Math.round(offsetX), Math.round(offsetY), dw, dh);
+      const drawStart = Remote.nowUs();
+      this.drawFrame(pixels);
+      const drawUs = Remote.nowUs() - drawStart;
+      this.perfDrawSum += drawUs;
+      this.perfDrawCount += 1;
+      if (drawUs > this.perfDrawMax) {
+        this.perfDrawMax = drawUs;
+      }
+      this.perfAppliedFrames += 1;
+      this.lastMetaX = meta.x;
+      this.lastMetaY = meta.y;
+      this.lastMetaW = meta.w;
+      this.lastMetaH = meta.h;
+      this.lastMetaFull = meta.full === true;
+      if (this.lastMetaFull) {
+        this.perfFullFrames += 1;
+      }
       this.lastVersion = meta.version;
       this.forceFull = false;
       if (!this.canvasShown) {
@@ -597,6 +912,43 @@ struct Remote {
       this.applying = false;
       this.releaseStalePixelMaps();
     }
+  }
+
+  /**
+   * Blits the whole mirror into the Canvas at the current view scale, centred
+   * with letterboxing. The mirror is always a complete remote frame, so a local
+   * window resize only needs this redraw — the remote resolution did not change
+   * and there is nothing new to ask the server for.
+   */
+  private drawFrame(pixels: image.PixelMap): void {
+    if (this.viewWidth <= 0 || this.viewHeight <= 0 ||
+        this.frameWidth <= 0 || this.frameHeight <= 0) {
+      return;
+    }
+    const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
+    const offsetX = (this.viewWidth - this.frameWidth * scale) / 2;
+    const offsetY = (this.viewHeight - this.frameHeight * scale) / 2;
+    const dw = Math.round(this.frameWidth * scale);
+    const dh = Math.round(this.frameHeight * scale);
+    this.ctx.drawImage(pixels, Math.round(offsetX), Math.round(offsetY), dw, dh);
+  }
+
+  /**
+   * Repaints the existing mirror after the Canvas size changed. The old content
+   * is cleared first so a changed aspect ratio cannot leave stale pixels in the
+   * new letterbox area; when there is no drawable mirror yet the first-frame
+   * path (ensureFrameBuffer + requestFull) owns the screen.
+   */
+  private redrawAfterResize(): void {
+    const pixels = this.framePixels;
+    if (!this.canvasShown || !this.frameReady || pixels === undefined || this.disposed) {
+      return;
+    }
+    if (this.viewWidth <= 0 || this.viewHeight <= 0) {
+      return;
+    }
+    this.ctx.clearRect(0, 0, this.viewWidth, this.viewHeight);
+    this.drawFrame(pixels);
   }
 
   // Cursor is drawn locally, so moving the mouse needs no framebuffer update.
@@ -628,28 +980,89 @@ struct Remote {
     }
   }
 
-  // The local cursor follows the physical pointer: no server round trip.
-  private placeCursor(cw: number, ch: number, hotX: number, hotY: number): void {
-    if (this.viewWidth <= 0 || this.frameWidth <= 0 || cw <= 0 || ch <= 0) {
+  // Monotonic, sub-millisecond clock. Date.now() only has ms resolution, which
+  // is too coarse for takeFrame/drawImage segments. getUptime(..., true) is
+  // NANOSECONDS, so /1000 yields microseconds (a /1e6 here would yield
+  // milliseconds and make every 2 s window test effectively 2000 s long).
+  // Timing must never change the render path, so a failed call falls back to
+  // the wall clock instead of propagating into applyPending().
+  private static nowUs(): number {
+    try {
+      return systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE, true) / 1000;
+    } catch (error) {
+      return Date.now() * 1000;
+    }
+  }
+
+  // Computes `[left, top, width, height]` for the local cursor, or an empty
+  // array when the pointer is outside the picture. Pure so the poll fallback
+  // and the per-event path place the cursor identically.
+  private static cursorRect(cw: number, ch: number, hotX: number, hotY: number,
+                            viewW: number, viewH: number,
+                            frameW: number, frameH: number,
+                            px: number, py: number): number[] {
+    if (cw <= 0 || ch <= 0 || viewW <= 0 || viewH <= 0 || frameW <= 0 || frameH <= 0 ||
+        px < 0 || py < 0) {
+      return [];
+    }
+    const scale = Math.min(viewW / frameW, viewH / frameH);
+    const contentW = frameW * scale;
+    const contentH = frameH * scale;
+    const offsetX = (viewW - contentW) / 2;
+    const offsetY = (viewH - contentH) / 2;
+    if (px < offsetX || py < offsetY || px > offsetX + contentW || py > offsetY + contentH) {
+      return [];
+    }
+    return [
+      Math.round(px - hotX * scale),
+      Math.round(py - hotY * scale),
+      Math.max(1, Math.round(cw * scale)),
+      Math.max(1, Math.round(ch * scale))
+    ];
+  }
+
+  // The local cursor follows the physical pointer: no server round trip. Called
+  // on every pointer event (instant) and from the poll as a fallback for shape
+  // or size changes.
+  private placeCursor(): void {
+    if (!this.cursorUsable || this.cursorPm === undefined || !this.canvasShown ||
+        this.disposed) {
       return;
     }
-    if (this.viewPointerX < 0 || this.viewPointerY < 0) {
+    const rect = Remote.cursorRect(this.cursorShapeW, this.cursorShapeH,
+      this.cursorHotX, this.cursorHotY,
+      this.viewWidth, this.viewHeight, this.frameWidth, this.frameHeight,
+      this.viewPointerX, this.viewPointerY);
+    if (rect.length === 0) {
+      // Pointer in the letterbox margin or not on the picture: leave the cursor
+      // where it was instead of moving it into the black border.
       return;
     }
-    const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
-    this.cursorDrawW = Math.max(1, Math.round(cw * scale));
-    this.cursorDrawH = Math.max(1, Math.round(ch * scale));
-    this.cursorLeft = Math.round(this.viewPointerX - hotX * scale);
-    this.cursorTop = Math.round(this.viewPointerY - hotY * scale);
+    // @State writes re-render the Image layer; skip writes whose rounded value
+    // did not change.
+    if (this.cursorLeft !== rect[0]) {
+      this.cursorLeft = rect[0];
+    }
+    if (this.cursorTop !== rect[1]) {
+      this.cursorTop = rect[1];
+    }
+    if (this.cursorDrawW !== rect[2]) {
+      this.cursorDrawW = rect[2];
+    }
+    if (this.cursorDrawH !== rect[3]) {
+      this.cursorDrawH = rect[3];
+    }
   }
 
   private applyStatus(status: SessionStatus): void {
     const width = status.width === undefined ? 0 : status.width;
     const height = status.height === undefined ? 0 : status.height;
-    if (width > 0 && height > 0 &&
+    if (!USE_GL_RENDER && width > 0 && height > 0 &&
         (width !== this.frameWidth || height !== this.frameHeight)) {
-      // The mirror no longer matches: invalidate the in-flight render, drop the
-      // old PixelMap (~9 MB at 1920x1200) and rebuild it for the new size.
+      // Canvas path: the local mirror must be rebuilt for the new size. The
+      // GL path takes its geometry from the PRESENTED texture instead
+      // (pollRenderStats), so the status poll never drags it back to a stale
+      // resolution for one cycle.
       this.invalidateRender();
       this.frameWidth = width;
       this.frameHeight = height;
@@ -697,15 +1110,26 @@ struct Remote {
       cursorVersion = cursor.version;
       cursorBlank = cursor.blank === true;
     }
+    // Log-only snapshot of what the server last told us about the cursor.
+    this.lastCursorBlank = cursorBlank;
+    this.lastCursorW = cw;
+    this.lastCursorH = ch;
     if (cursorBlank) {
       // The server told us it drew the pointer into the picture itself.
       this.releaseCursorPixelMap();
     } else if (cw > 0 && ch > 0 && cursorVersion !== this.lastCursorVersion && this.canvasShown) {
       this.lastCursorVersion = cursorVersion;
+      this.cursorShapeW = cw;
+      this.cursorShapeH = ch;
+      this.cursorHotX = hotX;
+      this.cursorHotY = hotY;
+      this.cursorUsable = true;
       this.updateCursorShape(cw, ch);
     }
     if (this.canvasShown && !cursorBlank) {
-      this.placeCursor(cw, ch, hotX, hotY);
+      // Fallback for shape/size changes only; pointer events reposition the
+      // cursor immediately, without waiting for the next poll.
+      this.placeCursor();
     }
     // State machine -> status text.
     if (status.state === SESSION_STATE_TRUST_REQUIRED) {
@@ -719,7 +1143,11 @@ struct Remote {
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
         this.statusText = '已连接（实时刷新）';
-        this.applyPending();
+        if (!USE_GL_RENDER) {
+          // GL mode: the native render thread consumes frames itself; the
+          // Canvas path polls them here.
+          this.applyPending();
+        }
         return;
       case 'reconnecting': {
         const retry = status.retryInMs === undefined ? 0 : status.retryInMs;
@@ -742,10 +1170,39 @@ struct Remote {
   }
 
   private poll(): void {
+    const pollStart = Remote.nowUs();
+    if (this.perfPollLast > 0) {
+      const intervalUs = pollStart - this.perfPollLast;
+      this.perfPollSum += intervalUs;
+      this.perfPollCount += 1;
+      if (intervalUs > this.perfPollMax) {
+        this.perfPollMax = intervalUs;
+      }
+    }
+    this.perfPollLast = pollStart;
+    const onceStart = Remote.nowUs();
+    this.pollOnce();
+    const onceUs = Remote.nowUs() - onceStart;
+    this.perfOnceSum += onceUs;
+    this.perfOnceCount += 1;
+    if (onceUs > this.perfOnceMax) {
+      this.perfOnceMax = onceUs;
+    }
+    this.maybeLogPerf();
+  }
+
+  private pollOnce(): void {
     if (this.sessionId.length === 0 || this.disposed) {
       return;
     }
+    const statusStart = Remote.nowUs();
     const status = sessionStatus(this.sessionId);
+    const statusUs = Remote.nowUs() - statusStart;
+    this.perfStatusSum += statusUs;
+    this.perfStatusCount += 1;
+    if (statusUs > this.perfStatusMax) {
+      this.perfStatusMax = statusUs;
+    }
     if (status === undefined) {
       this.badStatusCount += 1;
       if (this.badStatusCount >= 10 && this.badStatusCount % 50 === 10) {
@@ -757,7 +1214,133 @@ struct Remote {
       return;
     }
     this.badStatusCount = 0;
+    const applyStart = Remote.nowUs();
     this.applyStatus(status);
+    const applyUs = Remote.nowUs() - applyStart;
+    this.perfApplySum += applyUs;
+    this.perfApplyCount += 1;
+    if (applyUs > this.perfApplyMax) {
+      this.perfApplyMax = applyUs;
+    }
+    if (USE_GL_RENDER) {
+      const renderStart = Remote.nowUs();
+      this.pollRenderStats();
+      const renderUs = Remote.nowUs() - renderStart;
+      this.perfRenderSum += renderUs;
+      this.perfRenderCount += 1;
+      if (renderUs > this.perfRenderMax) {
+        this.perfRenderMax = renderUs;
+      }
+    }
+  }
+
+  // "avg/max" in milliseconds for one accumulator.
+  private static perfAvgMax(sumUs: number, count: number, maxUs: number): string {
+    if (count === 0) {
+      return '0.00/0.00';
+    }
+    return (sumUs / count / 1000).toFixed(2) + '/' + (maxUs / 1000).toFixed(2);
+  }
+
+  // Plain average in milliseconds (the TianguanPoll line prints avg and max as
+  // separate fields).
+  private static perfAvg(sumUs: number, count: number): string {
+    if (count === 0) {
+      return '0.00';
+    }
+    return (sumUs / count / 1000).toFixed(2);
+  }
+
+  private static perfMs(micros: number): string {
+    return (micros / 1000).toFixed(2);
+  }
+
+  // One info line every 2 s with the rendering segments. Timing never changes
+  // the rendering path (no added await or synchronization point).
+  private maybeLogPerf(): void {
+    const now = Remote.nowUs();
+    if (this.perfWindowStart <= 0) {
+      this.perfWindowStart = now;
+      return;
+    }
+    const elapsedMs = (now - this.perfWindowStart) / 1000;
+    if (elapsedMs < 2000) {
+      return;
+    }
+    const line = 'TianguanPerf ' + elapsedMs.toFixed(0) + 'ms' +
+      ' session=' + this.sessionId +
+      ' poll=' + Remote.perfAvgMax(this.perfPollSum, this.perfPollCount, this.perfPollMax) +
+      ' take=' + Remote.perfAvgMax(this.perfTakeSum, this.perfTakeCount, this.perfTakeMax) +
+      ' write=' + Remote.perfAvgMax(this.perfWriteSum, this.perfWriteCount, this.perfWriteMax) +
+      ' draw=' + Remote.perfAvgMax(this.perfDrawSum, this.perfDrawCount, this.perfDrawMax) +
+      ' takeN=' + this.perfTakeCount +
+      ' applied=' + this.perfAppliedFrames +
+      ' applyingSkip=' + this.perfApplyingSkips +
+      ' cursor={blank:' + (this.lastCursorBlank ? 1 : 0) +
+      ',w:' + this.lastCursorW +
+      ',h:' + this.lastCursorH +
+      ',visible:' + (this.cursorPm !== undefined && this.cursorLeft >= -64 ? 1 : 0) +
+      ',left:' + this.cursorLeft +
+      ',top:' + this.cursorTop + '}' +
+      ' ptr={' + this.viewPointerX + ',' + this.viewPointerY + '}' +
+      ' lastMeta={x:' + this.lastMetaX + ',y:' + this.lastMetaY +
+      ',w:' + this.lastMetaW + ',h:' + this.lastMetaH +
+      ',full:' + (this.lastMetaFull ? 1 : 0) + '}' +
+      ' full=' + this.perfFullFrames + '/' + this.perfAppliedFrames +
+      (USE_GL_RENDER ?
+        ' render={state:' + this.renderState +
+        ',fps:' + this.renderFps.toFixed(1) +
+        ',frames:' + this.renderFrames +
+        ',uploads:' + this.renderUploads +
+        ',skips:' + this.renderSkips +
+        ',swapFail:' + this.renderSwapFailures +
+        ',tex:' + this.renderTexW + 'x' + this.renderTexH +
+        (this.lastRenderError.length > 0 ? ',error:' + this.lastRenderError : '') + '}' : '');
+    // Debug level: this is a periodic (2 s) timing summary, not an error. The
+    // default log level stays quiet; raise it only when diagnosing a stall.
+    // Segments are sessionStatus (sync NAPI + JSON parse), applyStatus (ArkUI
+    // state writes) and pollRenderStats (sync NAPI read); n is the number of
+    // polls in the window.
+    const pollLine = 'TianguanPoll n=' + this.perfOnceCount +
+      ' avg=' + Remote.perfAvg(this.perfOnceSum, this.perfOnceCount) +
+      'ms max=' + Remote.perfMs(this.perfOnceMax) +
+      'ms session=' + this.sessionId +
+      ' status=' + Remote.perfAvgMax(this.perfStatusSum, this.perfStatusCount,
+        this.perfStatusMax) +
+      ' apply=' + Remote.perfAvgMax(this.perfApplySum, this.perfApplyCount,
+        this.perfApplyMax) +
+      ' render=' + Remote.perfAvgMax(this.perfRenderSum, this.perfRenderCount,
+        this.perfRenderMax);
+    hilog.debug(DOMAIN, TAG, '%{public}s', pollLine);
+    hilog.info(DOMAIN, TAG, '%{public}s', line);
+    this.perfWindowStart = now;
+    this.perfPollSum = 0;
+    this.perfPollCount = 0;
+    this.perfPollMax = 0;
+    this.perfTakeSum = 0;
+    this.perfTakeCount = 0;
+    this.perfTakeMax = 0;
+    this.perfWriteSum = 0;
+    this.perfWriteCount = 0;
+    this.perfWriteMax = 0;
+    this.perfDrawSum = 0;
+    this.perfDrawCount = 0;
+    this.perfDrawMax = 0;
+    this.perfOnceSum = 0;
+    this.perfOnceCount = 0;
+    this.perfOnceMax = 0;
+    this.perfStatusSum = 0;
+    this.perfStatusCount = 0;
+    this.perfStatusMax = 0;
+    this.perfApplySum = 0;
+    this.perfApplyCount = 0;
+    this.perfApplyMax = 0;
+    this.perfRenderSum = 0;
+    this.perfRenderCount = 0;
+    this.perfRenderMax = 0;
+    this.perfApplyingSkips = 0;
+    this.perfAppliedFrames = 0;
+    this.perfFullFrames = 0;
   }
 
   // RFB button bits: 1 left, 2 middle, 4 right (8/16 are the wheel notches).
@@ -1060,22 +1643,21 @@ struct Remote {
 
   /**
    * The only action left when this page could not attribute itself to a
-   * session: a sub-window is destroyed (there is no list behind it), the
-   * main-window fallback pops back to the list. Destroying the sub-window is
-   * also its disconnect path (RemoteWindows' WINDOW_DESTROYED handler), which
-   * is correct here: the window belongs to a session this page could not use.
+   * session. The page always lives in its own ability window, so there is no
+   * list to go back to: try to close this window. Closing it also drops the
+   * unknown instance; if the platform refuses a programmatic main-window close,
+   * the title-bar X remains the normal path (RemoteAbility.onDestroy ends the
+   * session it knows, if any).
    */
   private async leavePage(): Promise<void> {
     this.teardown();
-    if (this.inSubWindow) {
+    if (this.ownWindowName.length > 0) {
       try {
-        const name = this.ownWindowName;
-        if (name.length > 0) {
-          await window.findWindow(name).destroyWindow();
-          return;
-        }
+        await window.findWindow(this.ownWindowName).destroyWindow();
+        return;
       } catch (error) {
-        hilog.warn(DOMAIN, TAG, '关闭无法归属的远程窗口失败：%{public}s', String(error));
+        hilog.warn(DOMAIN, TAG, '关闭无法归属的远程窗口失败（请用标题栏关闭）：%{public}s',
+          String(error));
       }
     }
     try {
@@ -1112,13 +1694,37 @@ struct Remote {
         Stack({ alignContent: Alignment.BottomEnd }) {
           Column() {
             Stack({ alignContent: Alignment.TopStart }) {
-              Canvas(this.ctx)
-                .width('100%')
-                .height('100%')
-                .draggable(false)
-                .onReady(() => {
-                  this.canvasReady = true;
-                })
+              if (USE_GL_RENDER) {
+                // The native EGL renderer owns this surface (frames, layout,
+                // vsync); the controller subclass reports surface lifetime.
+                // The XComponent itself stays transparent to hit testing so
+                // every pointer/touch/wheel event reaches this Column exactly
+                // as it did with the Canvas.
+                XComponent({ type: XComponentType.SURFACE, controller: this.glController })
+                  .onLoad((): void => {
+                    // Surface creation is reported through the controller;
+                    // onLoad only covers runtimes that report the id here.
+                    try {
+                      this.attachRendererSurface(this.glController.getXComponentSurfaceId());
+                    } catch (error) {
+                      hilog.warn(DOMAIN, TAG, '读取 surfaceId 失败：%{public}s', String(error));
+                    }
+                  })
+                  .onDestroy((): void => {
+                    this.detachRendererSurface('component-destroyed');
+                  })
+                  .width('100%')
+                  .height('100%')
+                  .hitTestBehavior(HitTestMode.None)
+              } else {
+                Canvas(this.ctx)
+                  .width('100%')
+                  .height('100%')
+                  .draggable(false)
+                  .onReady(() => {
+                    this.canvasReady = true;
+                  })
+              }
               if (this.cursorPm !== undefined && this.cursorLeft >= -64) {
                 Image(this.cursorPm)
                   .width(this.cursorDrawW)
@@ -1141,12 +1747,24 @@ struct Remote {
           .defaultFocus(true)
           .tabIndex(0)
           .onAreaChange((oldValue: Area, newValue: Area) => {
-            this.viewWidth = Number(newValue.width);
-            this.viewHeight = Number(newValue.height);
-            // Canvas content is lost on resize: ask for one complete frame.
-            // forceFull alone cannot wake an idle server, so request it for
-            // real (non-incremental) once the size is known.
-            this.requestFull();
+            const width = Number(newValue.width);
+            const height = Number(newValue.height);
+            this.viewWidth = width;
+            this.viewHeight = height;
+            // A pure window move also fires onAreaChange; a real size change
+            // only changes how the existing mirror is scaled. Resizing this
+            // window does NOT change the remote resolution, so the complete
+            // picture is already here: repaint it at the new scale instead of
+            // asking the server for a redundant full frame. Full-frame requests
+            // remain on the first frame, generation changes, desktop-size
+            // changes and page re-show (those need new pixels).
+            const resized = width !== this.lastAreaWidth || height !== this.lastAreaHeight;
+            this.lastAreaWidth = width;
+            this.lastAreaHeight = height;
+            if (resized) {
+              this.redrawAfterResize();
+            }
+            this.placeCursor();
           })
           // Keys are handled on the page root only: key events bubble, so two
           // handlers forwarded every key twice and broke Shift combinations.
@@ -1168,6 +1786,8 @@ struct Remote {
               this.lastTouchY = event.touches[0].y;
               this.viewPointerX = this.lastTouchX;
               this.viewPointerY = this.lastTouchY;
+              // Move the local cursor now, not on the next poll.
+              this.placeCursor();
             }
             if (event.type === TouchType.Down) {
               this.requestViewFocus();
@@ -1182,6 +1802,9 @@ struct Remote {
             this.hasMouse = true;
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
+            // The local cursor follows every pointer event; the poll only acts
+            // as the fallback for server-side shape/size changes.
+            this.placeCursor();
             if (event.action === MouseAction.Press) {
               // Focus normally follows touch, not mouse clicks, so grab it here;
               // otherwise key events never reach onKeyEvent.

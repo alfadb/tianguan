@@ -16,6 +16,7 @@
 #include <rdr/MemOutStream.h>
 #include <os/Thread.h>
 #include <os/Mutex.h>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -40,6 +41,9 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#if defined(__MUSL__)
+#include <hilog/log.h>
+#endif
 
 namespace {
 std::string readSmallFile(const std::string& path, size_t limit, bool trim) {
@@ -884,8 +888,142 @@ struct QueuedInput {
   int a;
   int b;
   int c;
+  // Pointer only: true when this event changes the button mask (press or
+  // release, including a wheel notch). Boundary events are never coalesced or
+  // trimmed, so their coordinates and their place in the order are preserved.
+  bool boundary;
   std::string text;
 };
+
+// --- Frame-pipeline timings (low overhead, per-second summary) -------------
+// Every series keeps at most kPerfMaxSamples samples of the CURRENT second; at
+// 30-60 fps a pipeline stage is far below that bound. Only the aggregate of the
+// last completed second is exposed in the status JSON, so nothing here allocates
+// or logs per frame. All values are microseconds.
+const size_t kPerfMaxSamples = 512;
+
+enum PerfMetric { PerfDecode = 0, PerfConvert, PerfPixWait, PerfCommit };
+
+struct PerfSeries {
+  PerfSeries() : count(0), sum(0), max(0) {}
+  void add(double micros) {
+    if (count < kPerfMaxSamples) samples[count++] = micros;
+    sum += micros;
+    if (micros > max) max = micros;
+  }
+  void reset() {
+    count = 0;
+    sum = 0;
+    max = 0;
+  }
+  double samples[kPerfMaxSamples];
+  size_t count;
+  double sum;
+  double max;
+};
+
+struct PerfSummary {
+  PerfSummary() : n(0), mean(0), p50(0), max(0) {}
+  size_t n;
+  double mean;
+  double p50;
+  double max;
+};
+
+inline PerfSummary summarizeSeries(const PerfSeries& series) {
+  PerfSummary out;
+  out.n = series.count;
+  if (series.count == 0) return out;
+  out.mean = series.sum / static_cast<double>(series.count);
+  out.max = series.max;
+  double sorted[kPerfMaxSamples];
+  std::memcpy(sorted, series.samples, sizeof(double) * series.count);
+  std::sort(sorted, sorted + series.count);
+  out.p50 = sorted[series.count / 2];
+  return out;
+}
+
+struct PerfSnapshot {
+  PerfSnapshot() : frames(0), delivered(0) {}
+  PerfSummary decode, convert, pixWait, commit, takeFrame;
+  unsigned long long frames;    // framebuffer updates published this window
+  unsigned long long delivered; // successful takeFrame handoffs this window
+};
+
+// One mutex for all timing state. It is never held while taking any other
+// session lock, and taking it while holding state.pix is fine because no path
+// holds perf and then waits for pix.
+struct PerfStats {
+  PerfStats()
+    : windowStart(std::chrono::steady_clock::now()), frames(0), delivered(0) {}
+
+  void note(PerfMetric metric, double micros) {
+    std::lock_guard<std::mutex> lock(mutex);
+    rotateLocked(std::chrono::steady_clock::now());
+    switch (metric) {
+      case PerfDecode: decode.add(micros); break;
+      case PerfConvert: convert.add(micros); break;
+      case PerfPixWait: pixWait.add(micros); break;
+      case PerfCommit: commit.add(micros); break;
+    }
+  }
+  void noteFrame() {
+    std::lock_guard<std::mutex> lock(mutex);
+    rotateLocked(std::chrono::steady_clock::now());
+    frames++;
+  }
+  void noteTakeFrame(double micros, bool wasDelivered) {
+    std::lock_guard<std::mutex> lock(mutex);
+    rotateLocked(std::chrono::steady_clock::now());
+    takeFrame.add(micros);
+    if (wasDelivered) delivered++;
+  }
+  PerfSnapshot snapshot() {
+    std::lock_guard<std::mutex> lock(mutex);
+    rotateLocked(std::chrono::steady_clock::now());
+    PerfSnapshot out;
+    out.decode = lastDecode;
+    out.convert = lastConvert;
+    out.pixWait = lastPixWait;
+    out.commit = lastCommit;
+    out.takeFrame = lastTakeFrame;
+    out.frames = lastFrames;
+    out.delivered = lastDelivered;
+    return out;
+  }
+
+private:
+  void rotateLocked(std::chrono::steady_clock::time_point now) {
+    if (now - windowStart < std::chrono::seconds(1)) return;
+    lastDecode = summarizeSeries(decode);
+    lastConvert = summarizeSeries(convert);
+    lastPixWait = summarizeSeries(pixWait);
+    lastCommit = summarizeSeries(commit);
+    lastTakeFrame = summarizeSeries(takeFrame);
+    lastFrames = frames;
+    lastDelivered = delivered;
+    decode.reset();
+    convert.reset();
+    pixWait.reset();
+    commit.reset();
+    takeFrame.reset();
+    frames = 0;
+    delivered = 0;
+    windowStart = now;
+  }
+
+  std::mutex mutex;
+  std::chrono::steady_clock::time_point windowStart;
+  PerfSeries decode, convert, pixWait, commit, takeFrame;
+  unsigned long long frames, delivered;
+  PerfSummary lastDecode, lastConvert, lastPixWait, lastCommit, lastTakeFrame;
+  unsigned long long lastFrames, lastDelivered;
+};
+
+inline double microsSince(std::chrono::steady_clock::time_point start) {
+  return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count()) / 1000.0;
+}
 
 std::string jsonEscape(const std::string& text) {
   std::string out;
@@ -919,6 +1057,68 @@ std::string sanitizeLine(const std::string& text) {
     out.push_back((text[i] == '\n' || text[i] == '\r') ? ' ' : text[i]);
   return out;
 }
+
+// The framebuffer is created with exactly the pixel format the server announced
+// in ServerInit, but PixelFormat keeps the component layout protected. A thin
+// probe makes the negotiated shifts/maxes readable for the status JSON and for
+// deciding whether a received rectangle can be copied straight into the BGRA
+// mirror. It uses the public PixelFormat copy constructor and reads only this
+// object's inherited members.
+struct PixelFormatProbe : public rfb::PixelFormat {
+  explicit PixelFormatProbe(const rfb::PixelFormat& pf) : rfb::PixelFormat(pf) {}
+  int redMaxValue() const { return redMax; }
+  int greenMaxValue() const { return greenMax; }
+  int blueMaxValue() const { return blueMax; }
+  int redShiftValue() const { return redShift; }
+  int greenShiftValue() const { return greenShift; }
+  int blueShiftValue() const { return blueShift; }
+  bool bigEndianValue() const { return bigEndian; }
+};
+
+// One-shot record of the negotiated format and the first bytes of the first
+// frame of a connection (or of the first frame after a desktop resize). WARN so
+// the default device log level shows it. It is emitted once per connection /
+// resolution change, never per frame. Host builds (the CLI tests) print to
+// stderr instead of hilog.
+std::string firstFrameLine(const rfb::PixelFormat& pf, bool directBgrx, int x,
+                           int y, int w, int h, bool full, const uint8_t* pixels,
+                           size_t pixelCount) {
+  char px[8 * 9 + 1];
+  size_t used = 0;
+  px[0] = '\0';
+  const size_t shown = pixelCount < 8 ? pixelCount : 8;
+  for (size_t i = 0; i < shown; ++i) {
+    const int written =
+        std::snprintf(px + used, sizeof(px) - used, "%s%02x%02x%02x%02x",
+                      i == 0 ? "" : " ", pixels[i * 4 + 0],
+                      pixels[i * 4 + 1], pixels[i * 4 + 2], pixels[i * 4 + 3]);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(px) - used) {
+      used = sizeof(px) - 1;
+      break;
+    }
+    used += static_cast<size_t>(written);
+  }
+  const PixelFormatProbe probe(pf);
+  char line[512];
+  std::snprintf(line, sizeof(line),
+                "first-frame pf bpp=%d depth=%d shifts=%d/%d/%d max=%d/%d/%d "
+                "bigEndian=%d direct=%d rect=%d,%d,%d,%d full=%d px8=%s",
+                pf.bpp, pf.depth, probe.redShiftValue(), probe.greenShiftValue(),
+                probe.blueShiftValue(), probe.redMaxValue(),
+                probe.greenMaxValue(), probe.blueMaxValue(),
+                probe.bigEndianValue() ? 1 : 0, directBgrx ? 1 : 0, x, y, w, h,
+                full ? 1 : 0, px);
+  return std::string(line);
+}
+
+void emitDiagWarn(const std::string& line) {
+#if defined(__MUSL__)
+  OH_LOG_Print(LOG_APP, LOG_WARN, 0, "TianguanDiag", "%{public}s", line.c_str());
+#else
+  std::fprintf(stderr, "W TianguanDiag %s\n", line.c_str());
+#endif
+}
+
 // One session. The session thread is the only writer of the framebuffer mirror,
 // region and cursor buffers. Every other thread takes the matching mutex for a
 // short snapshot. Each lock protects one independent piece of state so status,
@@ -933,7 +1133,10 @@ struct SessionState {
       updAny(false), updX0(0), updY0(0), updX1(0), updY1(0),
       pendAny(false),
       pendX0(0), pendY0(0), pendX1(0), pendY1(0), regionFull(false),
-      mirrorComplete(false), wantFull(true), cursorW(0), cursorH(0), cursorHotX(0),
+      mirrorComplete(false), wantFull(true),
+      pfBpp(0), pfDepth(0), pfRedMax(0), pfGreenMax(0), pfBlueMax(0),
+      pfRedShift(0), pfGreenShift(0), pfBlueShift(0), pfBigEndian(false),
+      cursorW(0), cursorH(0), cursorHotX(0),
       cursorHotY(0), cursorVersion(0), cursorBlank(false), cursorX(0), cursorY(0),
       clipVersion(0), clipTruncated(false), appliedRelease(0), pointerMask(0),
       lastPointerX(0), lastPointerY(0) {}
@@ -996,6 +1199,12 @@ struct SessionState {
   bool regionFull;                // pix: pending region is the whole screen
   bool mirrorComplete;            // pix: at least one full frame was applied
   bool wantFull;                  // pix
+  // Pixel format the current framebuffer was created with (from the server's
+  // ServerInit). Reported additively by statusJson(); all zero before the first
+  // framebuffer exists.
+  int pfBpp, pfDepth, pfRedMax, pfGreenMax, pfBlueMax;  // pix
+  int pfRedShift, pfGreenShift, pfBlueShift;            // pix
+  bool pfBigEndian;                                     // pix
   std::vector<uint8_t> full;      // pix, BGRA, fbWidth * fbHeight * 4
   std::vector<uint8_t> region;    // pix, BGRA, rectW * rectH * 4
   std::vector<uint8_t> cursor;    // pix, RGBA cursor image
@@ -1011,7 +1220,10 @@ struct SessionState {
   // so the thread can release exactly the keys it actually pressed.
   unsigned appliedRelease;
   std::set<int> pressedKeys;
-  int pointerMask;
+  // Atomic because sendPointer() reads it as an advisory "button state already
+  // sent" when classifying a new event; correctness only needs it to be a
+  // recent value, never an exact one.
+  std::atomic<int> pointerMask;
   int lastPointerX, lastPointerY;
 
   // shutdown() from closeSession wakes a read that is blocked waiting for the
@@ -1046,6 +1258,27 @@ struct SocketSlotGuard {
   ~SocketSlotGuard() { slot.detach(); }
   SessionState::SocketSlot& slot;
 };
+
+// Caller holds state.pix. Records what the framebuffer was actually created
+// with, so statusJson() can report the negotiated format without touching the
+// client's server object.
+void capturePixelFormatLocked(SessionState& state, const rfb::PixelFormat& pf) {
+  const PixelFormatProbe probe(pf);
+  state.pfBpp = pf.bpp;
+  state.pfDepth = pf.depth;
+  state.pfRedMax = probe.redMaxValue();
+  state.pfGreenMax = probe.greenMaxValue();
+  state.pfBlueMax = probe.blueMaxValue();
+  state.pfRedShift = probe.redShiftValue();
+  state.pfGreenShift = probe.greenShiftValue();
+  state.pfBlueShift = probe.blueShiftValue();
+  state.pfBigEndian = probe.bigEndianValue();
+}
+
+class LiveClient;
+// Defined with the session loop below. Declared here because dataRect() drains
+// queued input between the rectangles of one framebuffer update.
+void drainSessionInput(SessionState& state, LiveClient& client);
 
 std::string pinFromPrompt(const char* title, const char* text) {
   std::string line;
@@ -1083,7 +1316,8 @@ void setPhase(SessionState& state, int phase, const std::string& error,
 class LiveClient : public rfb::CConnection {
 public:
   LiveClient(const std::shared_ptr<SessionState>& state, int generation)
-    : state(state), generation(generation), width(0), height(0) {
+    : state(state), generation(generation), width(0), height(0),
+      diagPending(true) {
     {
       // Copy the credentials once so the session thread never re-reads them
       // while closeSession() is wiping the stored copy.
@@ -1194,7 +1428,9 @@ public:
       state->frameGeneration = generation;
       state->takenVersion = state->version; // old pixels are gone
       state->takenEpoch = state->pixEpoch;
+      capturePixelFormatLocked(*state, getFramebuffer()->getPF());
     }
+    diagPending = true; // one format/first-frame line per connection
     setPhase(*state, PhaseConnected, "", "none", 0);
   }
   // Called by TigerVNC when the server changes the framebuffer geometry
@@ -1236,13 +1472,22 @@ public:
       state->pixEpoch++;
       state->takenVersion = state->version;
       state->takenEpoch = state->pixEpoch;
+      capturePixelFormatLocked(*state, getFramebuffer()->getPF());
     }
+    diagPending = true; // one format/first-frame line per resolution change
     // An idle desktop will not volunteer the new geometry as pixels: ask for
     // one non-incremental update once the session loop gets back to its poll.
     state->needFullRequest = true;
   }
   bool dataRect(const rfb::Rect& rect, int encoding) override {
     const bool result = rfb::CConnection::dataRect(rect, encoding);
+    // One framebuffer update can carry many rectangles. Drain the queued input
+    // between them, so a large update cannot hold a pointer move or a click
+    // back until every rectangle was decoded. This runs on the session thread
+    // (the only socket owner), each queued input is written as one complete RFB
+    // message, and the in-stream is already positioned at the next rectangle
+    // boundary when dataRect() returns.
+    if (result && isCurrent()) drainSessionInput(*state, *this);
     if (result && rect.area() > 0 && isCurrent()) {
       std::lock_guard<std::mutex> lock(state->pix);
       // Layer 1 only: this is decoded but not yet committed to the mirror.
@@ -1263,6 +1508,9 @@ public:
     return result;
   }
   void framebufferUpdateEnd() override {
+    // Decode stage: everything from the decode flush to the start of the RGB
+    // conversion. The flush is where real DecodeManager workers are joined.
+    const auto decodeStart = std::chrono::steady_clock::now();
     CConnection::framebufferUpdateEnd(); // Flush real DecodeManager workers.
     if (!isCurrent() || width <= 0 || height <= 0) {
       // A superseded connection's in-flight rects must not leak into the next
@@ -1326,23 +1574,77 @@ public:
     const size_t rowBytes = static_cast<size_t>(stride) * (pf.bpp / 8);
     const int rw = target.width();
     const int rh = target.height();
-    // Convert outside the pixel lock so a status/takeFrame caller is never
-    // blocked by the RGB conversion of a large rectangle.
-    std::vector<uint8_t> row(static_cast<size_t>(rw) * 3);
-    std::vector<uint8_t> converted(static_cast<size_t>(rw) * rh * 4);
-    for (int y = 0; y < rh; ++y) {
-      pf.rgbFromBuffer(row.data(), base + static_cast<size_t>(y) * rowBytes, rw);
-      uint8_t* dst = &converted[static_cast<size_t>(y) * rw * 4];
-      for (int x = 0; x < rw; ++x) {
-        // HarmonyOS writePixels takes BGRA_8888.
-        dst[x * 4 + 0] = row[static_cast<size_t>(x) * 3 + 2];
-        dst[x * 4 + 1] = row[static_cast<size_t>(x) * 3 + 1];
-        dst[x * 4 + 2] = row[static_cast<size_t>(x) * 3 + 0];
-        dst[x * 4 + 3] = 255;
+    state->perf.note(PerfDecode, microsSince(decodeStart));
+    // Convert/copy outside the pixel lock so a status/takeFrame caller is never
+    // blocked by a large rectangle. The scratch buffers are LiveClient members:
+    // a frame no longer allocates and value-initialises two fresh vectors.
+    const auto convertStart = std::chrono::steady_clock::now();
+    const PixelFormatProbe layout(pf);
+    // 32bpp little-endian BGRX has exactly the byte layout of the BGRA_8888
+    // mirror (B,G,R,X -> B,G,R,A), so in that case the rectangle is a straight
+    // 4-byte-per-pixel copy with the alpha byte forced to 255. The server's X
+    // padding byte is not an alpha value (Xvnc sends 0), and ArkUI/Canvas is
+    // not proven to ignore alpha even for an OPAQUE PixelMap, so the copy must
+    // not inherit it. depth may be anything as long as the three channels are
+    // full 8-bit values.
+    const bool directBgrx =
+        pf.bpp == 32 && pf.trueColour && pf.isLittleEndian() &&
+        layout.redShiftValue() == 16 && layout.greenShiftValue() == 8 &&
+        layout.blueShiftValue() == 0 &&
+        layout.redMaxValue() == 255 && layout.greenMaxValue() == 255 &&
+        layout.blueMaxValue() == 255;
+    const size_t rectBytes = static_cast<size_t>(rw) * rh * 4;
+    if (convertBuf.size() != rectBytes) convertBuf.resize(rectBytes);
+    if (directBgrx) {
+      for (int y = 0; y < rh; ++y) {
+        const uint8_t* srcRow = base + static_cast<size_t>(y) * rowBytes;
+        uint8_t* dstRow = &convertBuf[static_cast<size_t>(y) * rw * 4];
+        for (int x = 0; x < rw; ++x) {
+          // Load/OR/store through memcpy keeps the access 4-byte-wide without
+          // aliasing a uint8_t buffer as uint32_t; -O3 turns this into vector
+          // loads/stores. Measured 1920x1200 (-O3): ~0.9 ms, vs ~1.9 ms for
+          // memcpy followed by a byte-stride alpha pass.
+          uint32_t pixel;
+          std::memcpy(&pixel, srcRow + static_cast<size_t>(x) * 4, 4);
+          pixel |= 0xff000000u;
+          std::memcpy(dstRow + static_cast<size_t>(x) * 4, &pixel, 4);
+        }
+      }
+    } else {
+      if (convertRow.size() < static_cast<size_t>(rw) * 3)
+        convertRow.resize(static_cast<size_t>(rw) * 3);
+      for (int y = 0; y < rh; ++y) {
+        pf.rgbFromBuffer(convertRow.data(),
+                         base + static_cast<size_t>(y) * rowBytes, rw);
+        uint8_t* dst = &convertBuf[static_cast<size_t>(y) * rw * 4];
+        for (int x = 0; x < rw; ++x) {
+          // HarmonyOS writePixels takes BGRA_8888.
+          dst[x * 4 + 0] = convertRow[static_cast<size_t>(x) * 3 + 2];
+          dst[x * 4 + 1] = convertRow[static_cast<size_t>(x) * 3 + 1];
+          dst[x * 4 + 2] = convertRow[static_cast<size_t>(x) * 3 + 0];
+          dst[x * 4 + 3] = 255;
+        }
       }
     }
+    state->perf.note(PerfConvert, microsSince(convertStart));
+    // One-shot diagnostics: read the first bytes of the received rectangle
+    // before the commit swaps convertBuf into state->region. Only the frame
+    // that is actually published is reported, so the line describes pixels the
+    // UI could have seen.
+    std::string diagLine;
+    if (diagPending) {
+      diagLine = firstFrameLine(pf, directBgrx, x0, y0, rw, rh, full,
+                                convertBuf.data(),
+                                static_cast<size_t>(rw) * rh);
+    }
+    bool committed = false;
+    double pixWaitUs = 0.0;
+    double commitUs = 0.0;
     {
+      const auto lockStart = std::chrono::steady_clock::now();
       std::lock_guard<std::mutex> lock(state->pix);
+      pixWaitUs = microsSince(lockStart);
+      const auto commitStart = std::chrono::steady_clock::now();
       // Commit-time check: the conversion ran without the lock, so the UI may
       // have started a reconnect (generation bumped) in the meantime. An old
       // connection must not publish pixels or a version into the new mirror.
@@ -1350,10 +1652,10 @@ public:
       if (state->fbWidth != width || state->fbHeight != height) return;
       for (int y = 0; y < rh; ++y) {
         uint8_t* dstRow = &state->full[(static_cast<size_t>(y0 + y) * state->fbWidth + x0) * 4];
-        std::memcpy(dstRow, &converted[static_cast<size_t>(y) * rw * 4],
+        std::memcpy(dstRow, &convertBuf[static_cast<size_t>(y) * rw * 4],
                     static_cast<size_t>(rw) * 4);
       }
-      state->region.swap(converted); // legacy takeRegion()/copyRegion()
+      state->region.swap(convertBuf); // legacy takeRegion()/copyRegion()
       state->rectX = x0;
       state->rectY = y0;
       state->rectW = rw;
@@ -1381,6 +1683,15 @@ public:
       }
       state->version++;
       state->frameGeneration = generation;
+      committed = true;
+      commitUs = microsSince(commitStart);
+    }
+    state->perf.note(PerfPixWait, pixWaitUs);
+    state->perf.note(PerfCommit, commitUs);
+    if (committed) state->perf.noteFrame();
+    if (committed && !diagLine.empty()) {
+      diagPending = false;
+      emitDiagWarn(diagLine);
     }
   }
 
@@ -1453,6 +1764,15 @@ private:
   int generation;
   int width;
   int height;
+  // Session-thread only. Reused scratch for the framebufferUpdateEnd() copy so a
+  // per-update rectangle never allocates or zero-fills a new buffer. After the
+  // commit swaps convertBuf into state->region, it holds the previous region
+  // buffer, which the next update resizes and reuses.
+  std::vector<uint8_t> convertRow;
+  std::vector<uint8_t> convertBuf;
+  // Session-thread only. True until the first published frame of this
+  // connection/resolution change has been logged once (WARN).
+  bool diagPending;
   std::string secret;
   std::string expectedPin;
 };
@@ -1669,7 +1989,10 @@ void drainSessionInput(SessionState& state, LiveClient& client) {
       state.lastPointerY = it->b;
     } else if (it->kind == QueuedInput::KeyKind) {
       if (it->b != 0) {
-        client.sendKeyPress(0, 0, static_cast<uint32_t>(it->a));
+        // CConnection::sendKeyRelease() looks the press up by system key code,
+        // so register it under the keysym as well; a press under 0 would make
+        // every release miss downKeys[] and be dropped (stuck Ctrl/Shift/Alt).
+        client.sendKeyPress(it->a, 0, static_cast<uint32_t>(it->a));
         state.pressedKeys.insert(it->a);
       } else {
         client.sendKeyRelease(it->a);
@@ -1773,7 +2096,7 @@ void sessionMain(std::shared_ptr<SessionState> state) {
             pending.revents = 0;
             // Short timeout: queued input must reach the server promptly even
             // when the desktop is idle and sends nothing.
-            if (::poll(&pending, 1, 5) < 0 && errno != EINTR)
+            if (::poll(&pending, 1, 1) < 0 && errno != EINTR)
               throw std::runtime_error("socket poll failed");
           }
         }
@@ -2036,6 +2359,46 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   return state;
 }
 
+std::string perfSeriesJson(const PerfSummary& summary) {
+  char numbers[128];
+  std::snprintf(numbers, sizeof(numbers),
+                "{\"n\":%zu,\"mean\":%.3f,\"p50\":%.3f,\"max\":%.3f}",
+                summary.n, summary.mean, summary.p50, summary.max);
+  return numbers;
+}
+
+// Additive status field: the summary of the last completed one-second window.
+// Timings are microseconds; frames/delivered are counts in that window.
+std::string perfJson(const PerfSnapshot& snapshot) {
+  std::string out = "{\"windowMs\":1000,\"frames\":" +
+                    std::to_string(snapshot.frames) +
+                    ",\"delivered\":" + std::to_string(snapshot.delivered);
+  out += ",\"decode\":" + perfSeriesJson(snapshot.decode);
+  out += ",\"convert\":" + perfSeriesJson(snapshot.convert);
+  out += ",\"pixWait\":" + perfSeriesJson(snapshot.pixWait);
+  out += ",\"commit\":" + perfSeriesJson(snapshot.commit);
+  out += ",\"takeFrame\":" + perfSeriesJson(snapshot.takeFrame) + "}";
+  return out;
+}
+
+// Additive status field: the pixel format the framebuffer was created with,
+// i.e. what the server actually negotiated. All zero before a framebuffer
+// exists. Written next to the perf object; existing fields keep their order.
+std::string pixelFormatJson(int bpp, int depth, int redMax, int greenMax,
+                            int blueMax, bool bigEndian, int redShift,
+                            int greenShift, int blueShift) {
+  std::string out = "{\"bpp\":" + std::to_string(bpp);
+  out += ",\"depth\":" + std::to_string(depth);
+  out += ",\"redMax\":" + std::to_string(redMax);
+  out += ",\"greenMax\":" + std::to_string(greenMax);
+  out += ",\"blueMax\":" + std::to_string(blueMax);
+  out += ",\"bigEndian\":" + std::string(bigEndian ? "true" : "false");
+  out += ",\"redShift\":" + std::to_string(redShift);
+  out += ",\"greenShift\":" + std::to_string(greenShift);
+  out += ",\"blueShift\":" + std::to_string(blueShift) + "}";
+  return out;
+}
+
 std::string statusJson(const std::shared_ptr<SessionState>& state) {
   int phase = PhaseFailed;
   int retryInMs = 0;
@@ -2052,6 +2415,9 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   int cursorW = 0, cursorH = 0, cursorHotX = 0, cursorHotY = 0, cursorVersion = 0;
   int cursorX = 0, cursorY = 0;
   bool cursorBlank = true;
+  int pfBpp = 0, pfDepth = 0, pfRedMax = 0, pfGreenMax = 0, pfBlueMax = 0;
+  int pfRedShift = 0, pfGreenShift = 0, pfBlueShift = 0;
+  bool pfBigEndian = false;
   {
     std::lock_guard<std::mutex> lock(state->pix);
     width = state->fbWidth;
@@ -2065,6 +2431,15 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
     cursorBlank = state->cursorBlank;
     cursorX = state->cursorX;
     cursorY = state->cursorY;
+    pfBpp = state->pfBpp;
+    pfDepth = state->pfDepth;
+    pfRedMax = state->pfRedMax;
+    pfGreenMax = state->pfGreenMax;
+    pfBlueMax = state->pfBlueMax;
+    pfRedShift = state->pfRedShift;
+    pfGreenShift = state->pfGreenShift;
+    pfBlueShift = state->pfBlueShift;
+    pfBigEndian = state->pfBigEndian;
   }
   int clipVersion = 0;
   bool clipTruncated = false;
@@ -2093,7 +2468,13 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   out += "},\"retryInMs\":" + std::to_string(retryInMs);
   out += ",\"fingerprint\":\"" + jsonEscape(fingerprint) + "\"";
   out += ",\"pixelBytes\":" +
-         std::to_string(static_cast<long long>(width) * height * 4) + "}";
+         std::to_string(static_cast<long long>(width) * height * 4);
+  // Appended last so every existing field keeps its position and meaning: the
+  // perf and pf objects are additive only.
+  out += ",\"perf\":" + perfJson(state->perf.snapshot());
+  out += ",\"pf\":" + pixelFormatJson(pfBpp, pfDepth, pfRedMax, pfGreenMax,
+                                     pfBlueMax, pfBigEndian, pfRedShift,
+                                     pfGreenShift, pfBlueShift) + "}";
   return out;
 }
 
@@ -2146,12 +2527,14 @@ std::string legacyStatusText() {
 }
 
 void trimInputQueue(SessionState& state) {
-  // Only motion may be dropped: losing a press or a release would leave the
-  // remote mouse/keyboard stuck. A newer motion event always follows.
+  // Only repeat motion may be dropped: losing a press, a release or a wheel
+  // notch would leave the remote mouse in the wrong state, and a newer motion
+  // event always follows. Boundary events (mask changes) and the newest motion
+  // of a run are therefore never trimmed.
   if (state.inputs.size() <= kMaxQueuedInputs) return;
   for (std::deque<QueuedInput>::iterator it = state.inputs.begin();
        it != state.inputs.end(); ++it) {
-    if (it->kind == QueuedInput::PointerKind && it->c == 0) {
+    if (it->kind == QueuedInput::PointerKind && !it->boundary) {
       state.inputs.erase(it);
       return;
     }
@@ -2268,7 +2651,9 @@ std::string tianguan::sessionStatus(const std::string& sessionId) {
            "\"errorCode\":\"none\",\"width\":0,\"height\":0,\"generation\":0,"
            "\"version\":0,\"cursor\":{\"w\":0,\"h\":0,\"hotX\":0,\"hotY\":0,"
            "\"blank\":true,\"version\":0},\"clipboard\":{\"version\":0},"
-           "\"retryInMs\":0,\"fingerprint\":\"\",\"pixelBytes\":0}";
+           "\"retryInMs\":0,\"fingerprint\":\"\",\"pixelBytes\":0,"
+           "\"perf\":" + perfJson(PerfSnapshot()) +
+           ",\"pf\":" + pixelFormatJson(0, 0, 0, 0, 0, false, 0, 0, 0) + "}";
   }
   return statusJson(state);
 }
@@ -2296,20 +2681,50 @@ std::string tianguan::reconnectSession(const std::string& sessionId) {
   return "OK";
 }
 
-std::string tianguan::takeFrame(const std::string& sessionId, void* dst,
-                                size_t capacity, int afterVersion, bool forceFull) {
+// Times one takeFrame() call (including calls that return NONE). Declared
+// before the pixel lock_guard so its destructor runs after that lock is
+// released.
+struct TakeFrameTimer {
+  explicit TakeFrameTimer(SessionState& state)
+      : state(state), start(std::chrono::steady_clock::now()), delivered(false) {}
+  ~TakeFrameTimer() {
+    state.perf.noteTakeFrame(microsSince(start), delivered);
+  }
+  void markDelivered() { delivered = true; }
+  SessionState& state;
+  std::chrono::steady_clock::time_point start;
+  bool delivered;
+};
+
+// Core of both takeFrame() (JSON, ArkTS) and takeFrameStruct() (struct, the
+// native GL renderer): one delivery implementation, one baseline. The timer
+// covers every call, including the ones that return NONE.
+tianguan::FrameGrabStatus tianguan::takeFrameStruct(const std::string& sessionId, void* dst,
+                                                    size_t capacity, int afterVersion,
+                                                    bool forceFull, FrameGrab& out,
+                                                    FrameGrabTiming* timing) {
   const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
-  if (!state) return "INVALID_SESSION";
+  if (!state) return FrameGrabInvalidSession;
+  TakeFrameTimer perfTimer(*state);
+  const std::chrono::steady_clock::time_point lockWaitStart =
+      std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(state->pix);
+  if (timing != nullptr) {
+    timing->lockWaitUs = static_cast<long long>(microsSince(lockWaitStart));
+    timing->copyUs = 0;
+  }
   const int width = state->fbWidth;
   const int height = state->fbHeight;
   const int current = state->version;
-  if (width <= 0 || height <= 0 || current <= 0) return "NONE";
+  out.fbWidth = width;
+  out.fbHeight = height;
+  out.generation = state->frameGeneration;
+  if (width <= 0 || height <= 0 || current <= 0) return FrameGrabNone;
   // NONE means "the caller already has the newest version".
-  if (!forceFull && afterVersion == current) return "NONE";
+  if (!forceFull && afterVersion == current) return FrameGrabNone;
   // A mirror produced by a superseded connection is never handed out: the
   // session thread may still be tearing the old connection down.
-  if (state->frameGeneration != state->generation.load()) return "NONE";
+  if (state->frameGeneration != state->generation.load()) return FrameGrabNone;
   // The only safe partial handoff is from a known baseline: afterVersion must
   // be the version this session actually delivered last, on the current mirror
   // geometry. Anything else (missed handoff, reconnect, resize, first call)
@@ -2321,51 +2736,88 @@ std::string tianguan::takeFrame(const std::string& sessionId, void* dst,
   if (full) {
     // Without at least one complete frame applied, the mirror can still have
     // unfilled areas; a full copy would show black. Ask the caller to retry.
-    if (!state->mirrorComplete) return "NONE";
+    if (!state->mirrorComplete) return FrameGrabNone;
     const size_t need = static_cast<size_t>(width) * height * 4;
-    if (state->full.size() < need) return "NONE";
-    if (dst == nullptr || capacity < need) return "ERROR:BUFFER_TOO_SMALL";
+    if (state->full.size() < need) return FrameGrabNone;
+    if (dst == nullptr || capacity < need) return FrameGrabTooSmall;
+    const std::chrono::steady_clock::time_point copyStart =
+        std::chrono::steady_clock::now();
     std::memcpy(dst, state->full.data(), need);
+    if (timing != nullptr) timing->copyUs = static_cast<long long>(microsSince(copyStart));
     state->takenVersion = current;
     state->takenEpoch = state->pixEpoch;
     state->pendAny = false;
-    return "{\"x\":0,\"y\":0,\"w\":" + std::to_string(width) +
-           ",\"h\":" + std::to_string(height) +
-           ",\"version\":" + std::to_string(current) +
-           ",\"generation\":" + std::to_string(state->frameGeneration) +
-           ",\"full\":true}";
+    perfTimer.markDelivered();
+    out.delivered = true;
+    out.full = true;
+    out.x = 0;
+    out.y = 0;
+    out.w = width;
+    out.h = height;
+    out.version = current;
+    out.generation = state->frameGeneration;
+    return FrameGrabDelivered;
   }
   // Partial handoff: the delivery layer is the union of every committed change
   // since the last successful handoff, so it covers afterVersion+1..current.
-  if (!state->pendAny) return "NONE";
+  if (!state->pendAny) return FrameGrabNone;
   int x = std::max(0, state->pendX0);
   int y = std::max(0, state->pendY0);
   int x1 = std::min(width, state->pendX1);
   int y1 = std::min(height, state->pendY1);
-  if (x1 <= x || y1 <= y) return "NONE";
+  if (x1 <= x || y1 <= y) return FrameGrabNone;
   const int w = x1 - x;
   const int h = y1 - y;
   const size_t need = static_cast<size_t>(w) * h * 4;
-  if (dst == nullptr || capacity < need) return "ERROR:BUFFER_TOO_SMALL";
+  if (dst == nullptr || capacity < need) return FrameGrabTooSmall;
   // Copy the union straight out of the full BGRA mirror (row by row, because
   // the mirror stride is the whole screen).
-  uint8_t* out = static_cast<uint8_t*>(dst);
+  const std::chrono::steady_clock::time_point copyStart =
+      std::chrono::steady_clock::now();
+  uint8_t* outPtr = static_cast<uint8_t*>(dst);
   for (int row = 0; row < h; ++row) {
-    std::memcpy(out + static_cast<size_t>(row) * w * 4,
+    std::memcpy(outPtr + static_cast<size_t>(row) * w * 4,
                 state->full.data() +
                     (static_cast<size_t>(y + row) * width + x) * 4,
                 static_cast<size_t>(w) * 4);
   }
+  if (timing != nullptr) timing->copyUs = static_cast<long long>(microsSince(copyStart));
   // Only a successful copy consumes the delivery layer and moves the baseline.
   state->takenVersion = current;
   state->takenEpoch = state->pixEpoch;
   state->pendAny = false;
-  const bool fullAnswer = (x == 0 && y == 0 && w == width && h == height);
-  return "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) +
-         ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) +
-         ",\"version\":" + std::to_string(current) +
-         ",\"generation\":" + std::to_string(state->frameGeneration) +
-         ",\"full\":" + (fullAnswer ? "true" : "false") + "}";
+  perfTimer.markDelivered();
+  out.delivered = true;
+  out.full = (x == 0 && y == 0 && w == width && h == height);
+  out.x = x;
+  out.y = y;
+  out.w = w;
+  out.h = h;
+  out.version = current;
+  out.generation = state->frameGeneration;
+  return FrameGrabDelivered;
+}
+
+std::string tianguan::takeFrame(const std::string& sessionId, void* dst,
+                                size_t capacity, int afterVersion, bool forceFull) {
+  FrameGrab grab;
+  const FrameGrabStatus status =
+      takeFrameStruct(sessionId, dst, capacity, afterVersion, forceFull, grab);
+  switch (status) {
+    case FrameGrabInvalidSession:
+      return "INVALID_SESSION";
+    case FrameGrabNone:
+      return "NONE";
+    case FrameGrabTooSmall:
+      return "ERROR:BUFFER_TOO_SMALL";
+    case FrameGrabDelivered:
+      break;
+  }
+  return "{\"x\":" + std::to_string(grab.x) + ",\"y\":" + std::to_string(grab.y) +
+         ",\"w\":" + std::to_string(grab.w) + ",\"h\":" + std::to_string(grab.h) +
+         ",\"version\":" + std::to_string(grab.version) +
+         ",\"generation\":" + std::to_string(grab.generation) +
+         ",\"full\":" + (grab.full ? "true" : "false") + "}";
 }
 
 size_t tianguan::copyCursorFor(const std::string& sessionId, void* dst, size_t capacity) {
@@ -2385,20 +2837,42 @@ std::string tianguan::sendPointer(const std::string& sessionId, int x, int y, in
     if (!state->connected) return "NOT_CONNECTED";
   }
   std::lock_guard<std::mutex> lock(state->input);
-  // Coalesce motion like noVNC does: only the newest pointer position matters,
+  // Coalesce pointer motion like noVNC does: only the newest position matters,
   // and queuing every move made the remote pointer lag behind the real one.
-  if (mask == 0 && !state->inputs.empty() &&
+  // "Motion" is any pointer event without wheel bits (8/16), including a drag
+  // move that carries the held-button mask. Only the very tail may be merged,
+  // and only when it is itself motion with the SAME mask: a key/clipboard item
+  // in between would otherwise be reordered, and a press/release boundary must
+  // keep its own coordinates.
+  const bool wheel = (mask & 0x18) != 0;
+  const bool canMerge = !wheel && !state->inputs.empty() &&
       state->inputs.back().kind == QueuedInput::PointerKind &&
-      state->inputs.back().c == 0) {
+      state->inputs.back().c == mask && !state->inputs.back().boundary;
+  if (canMerge) {
     state->inputs.back().a = x;
     state->inputs.back().b = y;
     return "COALESCED";
+  }
+  // Boundary = the button/wheel state differs from the last pointer event that
+  // is still queued, or from the state already sent when the queue holds no
+  // pointer event. An empty queue plus a held button therefore classifies the
+  // next same-mask move as motion, while a release (mask back to 0) stays a
+  // boundary. A stale pointerMask can only add an extra boundary, never merge
+  // one away, so the advisory read is safe.
+  int lastMask = state->pointerMask.load(std::memory_order_relaxed);
+  for (size_t i = state->inputs.size(); i > 0; --i) {
+    const QueuedInput& item = state->inputs[i - 1];
+    if (item.kind == QueuedInput::PointerKind) {
+      lastMask = item.c;
+      break;
+    }
   }
   QueuedInput item;
   item.kind = QueuedInput::PointerKind;
   item.a = x;
   item.b = y;
   item.c = mask;
+  item.boundary = wheel || mask != lastMask;
   state->inputs.push_back(item);
   trimInputQueue(*state);
   return "QUEUED";
@@ -2418,6 +2892,7 @@ std::string tianguan::sendKey(const std::string& sessionId, int keysym, int pres
   item.a = keysym;
   item.b = pressed;
   item.c = 0;
+  item.boundary = false;
   state->inputs.push_back(item);
   return "QUEUED";
 }
@@ -2460,6 +2935,7 @@ std::string tianguan::setClipboard(const std::string& sessionId, const std::stri
   item.a = 0;
   item.b = 0;
   item.c = 0;
+  item.boundary = false;
   item.text = filtered;
   std::lock_guard<std::mutex> lock(state->input);
   state->inputs.push_back(item);

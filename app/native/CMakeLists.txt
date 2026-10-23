@@ -8,8 +8,9 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../experiments/vnc-core"
   "${CMAKE_CURRENT_BINARY_DIR}/vnc-core" EXCLUDE_FROM_ALL)
 set_target_properties(tigervnc_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
-  add_library(tianguan_diag SHARED diagnostics.cxx napi_bridge.cxx)
-  target_link_libraries(tianguan_diag PRIVATE tigervnc_client ace_napi.z)
+  add_library(tianguan_diag SHARED diagnostics.cxx napi_bridge.cxx render.cxx)
+  target_link_libraries(tianguan_diag PRIVATE tigervnc_client ace_napi.z hilog_ndk.z
+    EGL GLESv3 native_window)
   target_link_options(tianguan_diag PRIVATE "-Wl,-z,defs")
 else()
   add_executable(tianguan_diag_host diagnostics.cxx host_main.cxx)

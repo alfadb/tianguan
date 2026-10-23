@@ -11,7 +11,18 @@
       // onPrepareToTerminate(): the system tray's mandatory 退出 row arrives
       // there; vetoing once lets the app disconnect all sessions and remove the
       // tray icon before terminateSelf(). normal / system_grant (install-time).
-      { name: 'ohos.permission.PREPARE_APP_TERMINATE' }
+      { name: 'ohos.permission.PREPARE_APP_TERMINATE' },
+      // ohos.permission.READ_PASTEBOARD is intentionally NOT declared here for
+      // now: it is a system_basic / user_grant restricted permission, and a HAP
+      // that declares it while the signing profile's ACL does not allow it is
+      // rejected at INSTALL time (9568289). The ACL is still empty, so the
+      // declaration only made builds uninstallable; the local -> remote
+      // clipboard read is unavailable anyway. Restore the block below together
+      // with the ACL (see README, 自动剪贴板):
+      //
+      //   { name: 'ohos.permission.READ_PASTEBOARD',
+      //     reason: '$string:module_desc',
+      //     usedScene: { abilities: ['EntryAbility','RemoteAbility'], when: 'inuse' } }
     ],
     deliveryWithInstall: true,
     installationFree: false,
@@ -27,6 +38,22 @@
         label: '$string:app_name',
         exported: true,
         skills: [{ entities: ['entity.system.home'], actions: ['ohos.want.action.home'] }]
+      },
+      {
+        // One independent instance per remote session. launchType "multiton"
+        // gives each startAbility its own task and top-level window, so the
+        // system window picker (clicked Dock icon) lists the main window and
+        // every session as directly activatable cards. Not exported: only this
+        // application's own main ability starts it.
+        name: 'RemoteAbility',
+        srcEntry: './ets/remote/RemoteAbility.ets',
+        description: '$string:app_name',
+        icon: '$media:app_icon',
+        startWindowIcon: '$media:app_icon',
+        startWindowBackground: '$color:start_window_background',
+        label: '$string:app_name',
+        exported: false,
+        launchType: 'multiton'
       }
     ]
   }

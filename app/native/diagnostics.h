@@ -34,6 +34,34 @@ std::string reconnectSession(const std::string& sessionId);
 // handoff, reconnect, resize, first call) makes this return the whole mirror.
 std::string takeFrame(const std::string& sessionId, void* dst, size_t capacity,
                       int afterVersion, bool forceFull);
+
+// Struct form of takeFrame() for in-process consumers (the native GL
+// renderer): identical lock, delivery semantics and baseline, but no JSON.
+// The status tells the caller which takeFrame() string the answer would be.
+struct FrameGrab {
+  bool delivered = false;  // pixels were copied into dst
+  bool full = false;       // the copy covers the whole mirror
+  int x = 0, y = 0, w = 0, h = 0;  // rectangle copied into dst (packed rows)
+  int version = 0;         // mirror version after this grab
+  int generation = 0;      // connection that produced that version
+  int fbWidth = 0, fbHeight = 0;   // current mirror geometry
+};
+enum FrameGrabStatus {
+  FrameGrabNone,            // "NONE"
+  FrameGrabDelivered,       // metadata above is valid
+  FrameGrabInvalidSession,  // "INVALID_SESSION"
+  FrameGrabTooSmall         // "ERROR:BUFFER_TOO_SMALL"
+};
+// Optional per-call timings for a timing consumer (the native renderer's
+// per-second summary). Filled only when the out pointer is non-null; the
+// measurement adds two clock reads and no synchronization.
+struct FrameGrabTiming {
+  long long lockWaitUs = 0;  // waiting for the pix mutex
+  long long copyUs = 0;      // copying the rectangle into dst (0 on no copy)
+};
+FrameGrabStatus takeFrameStruct(const std::string& sessionId, void* dst,
+                                size_t capacity, int afterVersion, bool forceFull,
+                                FrameGrab& out, FrameGrabTiming* timing = nullptr);
 // Copies that session's current cursor image (RGBA_8888) into dst and returns
 // the number of bytes written; 0 when the session has no cursor image.
 size_t copyCursorFor(const std::string& sessionId, void* dst, size_t capacity);
