@@ -15,6 +15,7 @@
  * runtime session registry and the UI refer to connections by this id.
  */
 import { common } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import asset from '@ohos.security.asset';
@@ -394,6 +395,10 @@ export async function removePassword(entry: ConnectionEntry): Promise<void> {
   try {
     await asset.remove(aliasQuery(entry));
   } catch (error) {
+    // No saved entry (asset NOT_FOUND, 24000002) is normal: nothing to delete.
+    if ((error as BusinessError).code === asset.ErrorCode.NOT_FOUND) {
+      return;
+    }
     hilog.error(DOMAIN, TAG, '删除密码失败：%{public}s', String(error));
   }
 }

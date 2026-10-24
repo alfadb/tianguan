@@ -198,6 +198,8 @@ struct ConnectionCard {
             Text(this.view.statusLabel)
               .fontSize(13)
               .fontColor(this.statusColor())
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
         }
         .justifyContent(FlexAlign.End)
@@ -275,6 +277,11 @@ struct Index {
   // Move-group overlay state.
   @State private moveTargetId: string = '';
   @State private moveGroupText: string = '';
+  // Password re-entry overlay (shown for auth-failed).
+  @State private pwdVisible: boolean = false;
+  @State private pwdConnectionId: string = '';
+  @State private pwdValue: string = '';
+  @State private pwdReason: string = '';
   private started: boolean = false;
   // In-flight connect per connection id: a second click while createSession /
   // openRemoteWindow is still running would create a second session AND a
@@ -287,6 +294,12 @@ struct Index {
   private listener: () => void = (): void => {};
   private hintTimer: number = -1;
   private viewMap: Map<string, ConnectionView> = new Map<string, ConnectionView>();
+  // Failed sessions already notified, so the 2 s poll does not pop the same
+  // hint/dialog again.
+  private notifiedFailures: Set<string> = new Set<string>();
+  // connectionId -> latest Chinese failure reason, kept after the failed session
+  // is closed so the row can still explain why.
+  private failureText: Map<string, string> = new Map<string, string>();
 
   aboutToAppear(): void {
     if (!this.started) {
@@ -297,6 +310,7 @@ struct Index {
       // (@ObjectLink), NOT through the ForEach key: keying on a registry
       // version rebuilt every card on every session tick.
       this.listener = (): void => {
+        this.trackFailures();
         this.syncViews();
       };
       addSessionsListener(this.listener);
@@ -320,6 +334,11 @@ struct Index {
   private statusOf(entry: ConnectionEntry): RowStatus {
     const sessions: RuntimeSession[] = sessionsForConnection(entry.id);
     if (sessions.length === 0) {
+      const failure = this.failureText.get(entry.id);
+      if (failure !== undefined) {
+        const label = failure.length > 0 ? '失败：' + failure : '失败';
+        return { kind: 'failed', label: label, count: 0, fingerprint: '' };
+      }
       return { kind: 'idle', label: '未连接', count: 0, fingerprint: '' };
     }
     let connected = 0;
@@ -660,17 +679,19 @@ struct Index {
 
   /** Primary action: reconnect when the row is in a recoverable state. */
   private primaryAction(entry: ConnectionEntry): void {
+    const sessions = sessionsForConnection(entry.id);
+    if (sessions.length === 0) {
+      // A row whose failed session was already closed (e.g. auth-failed) has
+      // nothing to reconnect; it must start a fresh attempt.
+      this.connect(entry, '');
+      return;
+    }
     if (this.isReconnectKind(this.statusOf(entry).kind)) {
       this.reconnectEntry(entry);
       return;
     }
-    const sessions = sessionsForConnection(entry.id);
-    if (sessions.length > 0) {
-      // Same session clicked again: activate its window instead of a new one.
-      this.activateSession(sessions[0].sessionId, sessions[0].name);
-      return;
-    }
-    this.connect(entry, '');
+    // Same session clicked again: activate its window instead of a new one.
+    this.activateSession(sessions[0].sessionId, sessions[0].name);
   }
 
   /** Reconnect every session of this connection that is failed/disconnected. */
@@ -791,6 +812,10 @@ struct Index {
   }
 
   private async connect(entry: ConnectionEntry, explicitPassword: string): Promise<void> {
+    // A new attempt clears the previous failure reason (the row must leave the
+    // "失败：…" state even when this attempt stops early).
+    this.failureText.delete(entry.id);
+    this.syncViews();
     if (!diagMultiSessionAvailable()) {
       this.showHint('原生多会话接口尚未就绪（等待原生层升级后重试）', true);
       return;
@@ -839,6 +864,14 @@ struct Index {
         this.showHint('创建会话失败（' + endpoint + '）', true);
         return;
       }
+      // The native side reports startup/argument failures as "ERROR:<原因>",
+      // not as an empty string: registering that as a session id would open a
+      // window for a session that never existed.
+      if (sessionId.indexOf('ERROR:') === 0) {
+        const reason = sessionId.substring(6).trim();
+        this.showHint('创建会话失败：' + (reason.length > 0 ? reason : '原生层未给出原因'), true);
+        return;
+      }
       // Register before opening the window: the page resolves its id through the
       // registry when the AppStorage keys cannot answer. lastConnectedAt is
       // stamped by the registry poll when the session reaches connected.
@@ -862,6 +895,133 @@ struct Index {
       // this entry's guard is cleared, so another entry's connect keeps its own.
       this.connectingEntryIds.delete(entry.id);
     }
+  }
+
+  /** Chinese short reason for a failed session. */
+  private reasonOf(session: RuntimeSession): string {
+    switch (session.errorCode) {
+      case 'auth-failed':
+        return '密码错误';
+      case 'fingerprint-mismatch':
+        return '服务端指纹与已信任值不一致，已拒绝连接';
+      case 'network':
+        return '网络连接中断';
+      case 'protocol':
+        return '协议不匹配或服务器拒绝';
+      default:
+        return '连接失败';
+    }
+  }
+
+  /** Short inline reason for the row label; '' means no specific reason. */
+  private shortReasonOf(session: RuntimeSession): string {
+    switch (session.errorCode) {
+      case 'auth-failed':
+        return '密码错误';
+      case 'fingerprint-mismatch':
+        return '指纹不一致';
+      case 'network':
+        return '网络中断';
+      case 'protocol':
+        return '协议不匹配';
+      default:
+        return '';
+    }
+  }
+
+  /**
+   * Called on every registry notification BEFORE syncViews: reacts once per
+   * failed session (not every 2 s poll), and clears the remembered reason as
+   * soon as a new attempt leaves the failed state.
+   */
+  private trackFailures(): void {
+    for (let i = 0; i < this.connections.length; i++) {
+      const entry = this.connections[i];
+      const sessions = sessionsForConnection(entry.id);
+      for (let j = 0; j < sessions.length; j++) {
+        const session = sessions[j];
+        if (session.state === 'failed') {
+          if (!this.notifiedFailures.has(session.sessionId)) {
+            this.notifiedFailures.add(session.sessionId);
+            this.onSessionFailed(entry, session);
+          }
+        } else {
+          this.notifiedFailures.delete(session.sessionId);
+          this.failureText.delete(entry.id);
+        }
+      }
+    }
+  }
+
+  private onSessionFailed(entry: ConnectionEntry, session: RuntimeSession): void {
+    const reason = this.reasonOf(session);
+    this.failureText.set(entry.id, this.shortReasonOf(session));
+    if (session.errorCode === 'auth-failed' && entry.noPassword !== true) {
+      // The auth failure happens before the connection exists, so the dead
+      // session and its (never filled) window can be closed safely first.
+      closeSessionById(session.sessionId);
+      closeRemoteWindow(session.sessionId).then((): void => {}).catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '关闭密码错误会话的远程窗口失败：%{public}s', String(error));
+      });
+      if (!this.pwdVisible || this.pwdConnectionId !== entry.id) {
+        const detail = session.errorText.length > 0 ? '（' + session.errorText + '）' : '';
+        this.pwdConnectionId = entry.id;
+        this.pwdReason = '密码错误，请重新输入密码' + detail;
+        this.pwdValue = '';
+        this.pwdVisible = true;
+        this.showHint('密码错误，请重新输入密码', true);
+      }
+    } else {
+      const detail = session.errorText.length > 0 ? '（' + session.errorText + '）' : '';
+      const hint = reason === '连接失败' ? '连接失败' + detail : '连接失败：' + reason + detail;
+      this.showHint(hint, true);
+    }
+    this.syncViews();
+  }
+
+  private cancelPassword(): void {
+    this.pwdVisible = false;
+    this.pwdValue = '';
+    this.pwdReason = '';
+    this.pwdConnectionId = '';
+  }
+
+  private submitPassword(): void {
+    const password = this.pwdValue;
+    if (password.length === 0) {
+      this.showHint('请输入密码后再连接', true);
+      return;
+    }
+    const entry = findConnection(this.pwdConnectionId);
+    if (entry === undefined) {
+      this.cancelPassword();
+      return;
+    }
+    const sessions = sessionsForConnection(entry.id);
+    for (let i = 0; i < sessions.length; i++) {
+      const sessionId = sessions[i].sessionId;
+      closeSessionById(sessionId);
+      closeRemoteWindow(sessionId).then((): void => {}).catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '关闭旧会话窗口失败：%{public}s', String(error));
+      });
+    }
+    this.failureText.delete(entry.id);
+    this.pwdVisible = false;
+    this.pwdValue = '';
+    this.pwdReason = '';
+    this.pwdConnectionId = '';
+    if (entry.savePassword === true) {
+      savePassword(entry, password).then((ok: boolean): void => {
+        if (!ok) {
+          hilog.warn(DOMAIN, TAG, '新密码写入密钥库失败');
+        }
+      }).catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '新密码保存异常：%{public}s', String(error));
+      });
+    }
+    // A fresh attempt with the new password, not reconnectById: the old
+    // session is gone and its old credential must not be reused.
+    this.connect(entry, password);
   }
 
   /** 确认并信任 (inline on a trust-required row). */
@@ -1027,6 +1187,45 @@ struct Index {
     .backgroundColor($r('app.color.card_background'))
   }
 
+  @Builder
+  private passwordOverlay() {
+    Column({ space: 12 }) {
+      Text('密码错误').fontSize(18).fontWeight(FontWeight.Bold)
+      Text(this.pwdReason)
+        .fontSize(13)
+        .fontColor($r('app.color.danger'))
+        .width('100%')
+      TextInput({ text: this.pwdValue, placeholder: '密码（不回显）' })
+        .height(40)
+        .type(InputType.Password)
+        .defaultFocus(true)
+        .onChange((value: string) => { this.pwdValue = value; })
+        .onSubmit((enterKey: EnterKeyType) => { this.submitPassword(); })
+      Row({ space: 12 }) {
+        Button('取消')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor($r('app.color.chip_background'))
+          .fontColor($r('app.color.text_primary'))
+          .onClick(() => { this.cancelPassword(); })
+        Button('连接')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor($r('app.color.brand'))
+          .fontColor(Color.White)
+          .onClick(() => { this.submitPassword(); })
+      }.width('100%')
+    }
+    .width('86%')
+    .padding(24)
+    .borderRadius(16)
+    .backgroundColor($r('app.color.card_background'))
+  }
+
   build() {
     Stack() {
       Column() {
@@ -1184,6 +1383,14 @@ struct Index {
           .backgroundColor('rgba(0,0,0,0.45)')
           .onClick(() => { this.moveTargetId = ''; })
         this.moveOverlay()
+      }
+      if (this.pwdVisible) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.45)')
+          .onClick(() => { this.cancelPassword(); })
+        this.passwordOverlay()
       }
     }
     .width('100%')

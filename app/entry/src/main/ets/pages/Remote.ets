@@ -1828,8 +1828,17 @@ struct Remote {
           // first frame is on its way.
           if (!this.canvasShown) {
             Column({ space: 12 }) {
-              LoadingProgress().width(36).height(36)
-              Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
+              if (this.lastState === 'failed' || this.statusText.indexOf('失败') === 0) {
+                // A failed session never delivers a first frame: show WHY
+                // instead of spinning on "等待首帧…" forever.
+                Text(this.statusText)
+                  .fontSize(16)
+                  .fontColor($r('app.color.danger'))
+                  .textAlign(TextAlign.Center)
+              } else {
+                LoadingProgress().width(36).height(36)
+                Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
+              }
             }
             .width('100%')
             .height('100%')
