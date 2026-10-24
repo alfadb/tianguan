@@ -6,7 +6,8 @@
  *  - right: connection cards (name, host:port, status, last-connected time,
  *    primary action + more menu 重连/新建会话/编辑/复制/移组/删除);
  *  - top: search (name + host:port) and 新建连接;
- *  - new/edit form overlay: 名称/地址/端口/分组/无需密码/密码/保存密码 + 保存 / 保存并连接;
+ *  - new/edit form overlay: 名称/协议(VNC|RDP)/地址/端口/[RDP 用户名/域]/分组/
+ *    无需密码(VNC)/密码/保存密码 + 保存 / 保存并连接;
  *  - per-connection live status from the SessionRegistry (未连接/连接中/已连接·N个/
  *    重连中/已断开/需要确认身份/失败), fingerprint confirm inline.
  *
@@ -24,7 +25,7 @@ import type { SessionOptions } from '../diag/SessionApi';
 import {
   findConnection, loadPassword, newConnectionId, readTrustedFingerprint,
   removeConnection, removePassword, savePassword, savedConnections,
-  trustFingerprint, upsertConnection, DEFAULT_PORT, UNGROUPED
+  trustFingerprint, upsertConnection, DEFAULT_PORT, defaultPortFor, UNGROUPED
 } from '../model/ConnectionStore';
 import type { ConnectionEntry } from '../model/ConnectionStore';
 import {
@@ -57,6 +58,8 @@ class ConnectionView {
   id: string;
   entry: ConnectionEntry;
   name: string;
+  /** 'vnc' | 'rdp' — shown as the label in front of the endpoint. */
+  protocol: string;
   endpoint: string;
   lastConnectedText: string;
   statusKind: string;
@@ -68,6 +71,7 @@ class ConnectionView {
     this.id = entry.id;
     this.entry = entry;
     this.name = entry.name;
+    this.protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
     this.endpoint = entry.host + ':' + entry.port;
     this.lastConnectedText = '';
     this.statusKind = 'idle';
@@ -104,6 +108,11 @@ struct ConnectionCard {
       return '重连';
     }
     return this.view.hasSessions ? '打开' : '连接';
+  }
+
+  /** "RDP  192.168.50.12:3389" — protocol label in front of the endpoint. */
+  private protocolEndpoint(): string {
+    return (this.view.protocol === 'rdp' ? 'RDP' : 'VNC') + '  ' + this.view.endpoint;
   }
 
   private statusColor(): Resource {
@@ -177,7 +186,7 @@ struct ConnectionCard {
             .fontColor($r('app.color.text_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.view.endpoint)
+          Text(this.protocolEndpoint())
             .fontSize(13)
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
@@ -269,6 +278,9 @@ struct Index {
   @State private editingId: string = '';
   @State private formName: string = '';
   @State private formHost: string = '';
+  @State private formProtocol: string = 'vnc';
+  @State private formUsername: string = '';
+  @State private formDomain: string = '';
   @State private formPort: string = DEFAULT_PORT;
   @State private formGroup: string = '';
   @State private formPassword: string = '';
@@ -449,6 +461,7 @@ struct Index {
     // Assign only real changes: @ObjectLink cards are notified per assignment,
     // so a plain 2 s registry tick must not dirty every card.
     const endpoint = this.endpointOf(entry);
+    const protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
     const lastConnectedText = this.formatTime(entry.lastConnectedAt);
     const status = this.statusOf(entry);
     const hasSessions = sessionsForConnection(entry.id).length > 0;
@@ -457,6 +470,9 @@ struct Index {
     }
     if (view.name !== entry.name) {
       view.name = entry.name;
+    }
+    if (view.protocol !== protocol) {
+      view.protocol = protocol;
     }
     if (view.endpoint !== endpoint) {
       view.endpoint = endpoint;
@@ -536,6 +552,9 @@ struct Index {
     this.editingId = '';
     this.formName = '';
     this.formHost = '';
+    this.formProtocol = 'vnc';
+    this.formUsername = '';
+    this.formDomain = '';
     this.formPort = DEFAULT_PORT;
     this.formGroup = this.selectedGroup === '__all__' || this.selectedGroup === UNGROUPED
       ? '' : this.selectedGroup;
@@ -549,6 +568,9 @@ struct Index {
     this.editingId = entry.id;
     this.formName = entry.name;
     this.formHost = entry.host;
+    this.formProtocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+    this.formUsername = entry.username;
+    this.formDomain = entry.domain;
     this.formPort = entry.port;
     this.formGroup = entry.group;
     this.formSavePassword = entry.savePassword;
@@ -570,12 +592,40 @@ struct Index {
     }
   }
 
+  /**
+   * Switches the form protocol. The port follows the new default only while it
+   * is empty or still the other protocol's default; a custom port the user
+   * typed is never overwritten.
+   */
+  private selectProtocol(protocol: string): void {
+    if (protocol === this.formProtocol) {
+      return;
+    }
+    const previous = this.formProtocol;
+    const port = this.formPort.trim();
+    if (port.length === 0 || port === defaultPortFor(previous)) {
+      this.formPort = defaultPortFor(protocol);
+    }
+    this.formProtocol = protocol;
+    if (protocol !== 'vnc') {
+      // RDP has no "server needs no password" semantics.
+      this.formNoPassword = false;
+    }
+  }
+
   private formEntry(): ConnectionEntry | undefined {
     if (this.formHost.trim().length === 0) {
       this.showHint('请填写服务器地址', true);
       return undefined;
     }
-    const port = this.formPort.trim().length > 0 ? this.formPort.trim() : DEFAULT_PORT;
+    const protocol = this.formProtocol === 'rdp' ? 'rdp' : 'vnc';
+    const username = protocol === 'rdp' ? this.formUsername.trim() : '';
+    const domain = protocol === 'rdp' ? this.formDomain.trim() : '';
+    if (protocol === 'rdp' && username.length === 0) {
+      this.showHint('请输入用户名', true);
+      return undefined;
+    }
+    const port = this.formPort.trim().length > 0 ? this.formPort.trim() : defaultPortFor(protocol);
     const portNumber = Number(port);
     if (!Number.isInteger(portNumber) || portNumber <= 0 || portNumber > 65535) {
       this.showHint('端口无效（1-65535）', true);
@@ -592,7 +642,10 @@ struct Index {
       group: this.formGroup.trim(),
       savePassword: this.formNoPassword ? false : this.formSavePassword,
       noPassword: this.formNoPassword,
-      lastConnectedAt: previous === undefined ? 0 : previous.lastConnectedAt
+      lastConnectedAt: previous === undefined ? 0 : previous.lastConnectedAt,
+      protocol: protocol,
+      username: username,
+      domain: domain
     };
     return entry;
   }
@@ -632,7 +685,10 @@ struct Index {
       group: entry.group,
       savePassword: false, // 复制配置默认不带密码
       noPassword: entry.noPassword,
-      lastConnectedAt: 0
+      lastConnectedAt: 0,
+      protocol: entry.protocol,
+      username: entry.username,
+      domain: entry.domain
     };
     upsertConnection(copy);
     this.connections = savedConnections();
@@ -845,19 +901,32 @@ struct Index {
         port: Number(entry.port),
         name: entry.name
       };
-      // Servers that publish only None (type 1) reject the encrypted-only
-      // default, so a "no password" connection offers None explicitly.
-      if (entry.noPassword === true) {
-        options.security = 'None';
-      }
       // password is optional in the contract: omit it entirely for servers that
       // need none instead of sending an empty credential.
       if (password.length > 0) {
         options.password = password;
       }
-      const pin = readTrustedFingerprint(endpoint);
-      if (pin.length > 0) {
-        options.expectedFingerprint = pin;
+      if (entry.protocol === 'rdp') {
+        // RDP shares the session state machine; only the endpoint options
+        // differ. security/expectedFingerprint are VNC-only (RFB security
+        // types and the RA2 trust store), so they are never set here.
+        options.protocol = 'rdp';
+        if (entry.username.length > 0) {
+          options.username = entry.username;
+        }
+        if (entry.domain.length > 0) {
+          options.domain = entry.domain;
+        }
+      } else {
+        // Servers that publish only None (type 1) reject the encrypted-only
+        // default, so a "no password" connection offers None explicitly.
+        if (entry.noPassword === true) {
+          options.security = 'None';
+        }
+        const pin = readTrustedFingerprint(endpoint);
+        if (pin.length > 0) {
+          options.expectedFingerprint = pin;
+        }
       }
       const sessionId = createSession(options);
       if (sessionId.length === 0) {
@@ -1080,6 +1149,28 @@ struct Index {
         .height(40)
         .onChange((value: string) => { this.formName = value; })
       Row({ space: 8 }) {
+        Button('VNC')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor(this.formProtocol === 'vnc'
+            ? $r('app.color.brand') : $r('app.color.chip_background'))
+          .fontColor(this.formProtocol === 'vnc'
+            ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => { this.selectProtocol('vnc'); })
+        Button('RDP')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor(this.formProtocol === 'rdp'
+            ? $r('app.color.brand') : $r('app.color.chip_background'))
+          .fontColor(this.formProtocol === 'rdp'
+            ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => { this.selectProtocol('rdp'); })
+      }.width('100%')
+      Row({ space: 8 }) {
         TextInput({ text: this.formHost, placeholder: '服务器地址' })
           .height(40)
           .layoutWeight(2)
@@ -1090,20 +1181,30 @@ struct Index {
           .layoutWeight(1)
           .onChange((value: string) => { this.formPort = value; })
       }.width('100%')
+      if (this.formProtocol === 'rdp') {
+        TextInput({ text: this.formUsername, placeholder: '用户名' })
+          .height(40)
+          .onChange((value: string) => { this.formUsername = value; })
+        TextInput({ text: this.formDomain, placeholder: '域（可留空）' })
+          .height(40)
+          .onChange((value: string) => { this.formDomain = value; })
+      }
       TextInput({ text: this.formGroup, placeholder: '分组（可留空）' })
         .height(40)
         .onChange((value: string) => { this.formGroup = value; })
-      Row({ space: 8 }) {
-        Checkbox()
-          .select(this.formNoPassword)
-          .onChange((checked: boolean) => {
-            this.formNoPassword = checked;
-            if (checked) {
-              this.formPassword = '';
-              this.formSavePassword = false;
-            }
-          })
-        Text('该服务器无需密码').fontSize(14)
+      if (this.formProtocol === 'vnc') {
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(this.formNoPassword)
+            .onChange((checked: boolean) => {
+              this.formNoPassword = checked;
+              if (checked) {
+                this.formPassword = '';
+                this.formSavePassword = false;
+              }
+            })
+          Text('该服务器无需密码').fontSize(14)
+        }
       }
       TextInput({ text: this.formPassword, placeholder: '密码（不回显）' })
         .height(40)

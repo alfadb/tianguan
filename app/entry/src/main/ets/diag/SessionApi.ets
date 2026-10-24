@@ -20,9 +20,15 @@ export interface SessionOptions {
   password?: string;
   expectedFingerprint?: string;
   name?: string;
+  // Backend selector: "rdp" for the FreeRDP client. Omitted means the default
+  // "vnc" (RFB), so VNC callers do not need to set it.
+  protocol?: string;
+  // RDP only: user name (the RDP backend requires one) and optional domain.
+  username?: string;
+  domain?: string;
   // Offered RFB security types, comma separated. Omit for the default
   // encrypted family (RA2_256,RA2); use "None" for a server that requires no
-  // authentication (it advertises type 1 only).
+  // authentication (it advertises type 1 only). VNC only.
   security?: string;
 }
 

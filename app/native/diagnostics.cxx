@@ -4,6 +4,11 @@
 // Keep upstream copyright/license files and the build-time OHOS Thread patch
 // with corresponding source when distributing the linked binary.
 #include "diagnostics.h"
+#if defined(TIANGUAN_WITH_RDP)
+// RDP backend bridge. Only the OHOS target builds FreeRDP; the host target
+// defines nothing, so this include (and every RDP reference below) is absent.
+#include "rdp_backend.h"
+#endif
 #include <rfb/CConnection.h>
 #include <rfb/CMsgWriter.h>
 #include <rfb/CSecurityRSAAES.h>
@@ -1125,11 +1130,11 @@ void emitDiagWarn(const std::string& line) {
 // frame taking and input never wait for the network.
 struct SessionState {
   SessionState()
-    : port(0), stop(false), forceReconnect(false), running(false), generation(1),
-      phase(PhaseConnecting), releaseEpoch(0), needFullRequest(false), retryInMs(0),
-      connected(false), errorCode("none"), fbWidth(0), fbHeight(0), version(0),
-      frameGeneration(0), takenVersion(0), pixEpoch(0), takenEpoch(0),
-      rectX(0), rectY(0), rectW(0), rectH(0),
+    : port(0), protocol("vnc"), stop(false), forceReconnect(false), running(false),
+      generation(1), phase(PhaseConnecting), releaseEpoch(0),
+      needFullRequest(false), retryInMs(0), connected(false), errorCode("none"),
+      fbWidth(0), fbHeight(0), version(0), frameGeneration(0), takenVersion(0),
+      pixEpoch(0), takenEpoch(0), rectX(0), rectY(0), rectW(0), rectH(0),
       updAny(false), updX0(0), updY0(0), updX1(0), updY1(0),
       pendAny(false),
       pendX0(0), pendY0(0), pendX1(0), pendY1(0), regionFull(false),
@@ -1145,6 +1150,14 @@ struct SessionState {
   std::string profileName;
   std::string host;
   int port;
+  // "vnc" (default) or "rdp". Set once by launchSession() before the session
+  // thread starts, so the session loop may read it without the meta lock.
+  std::string protocol;
+  // RDP credentials. Kept only so a reconnect can authenticate again; wiped by
+  // the reaper together with password, and never written to a log or a status
+  // string.
+  std::string username;
+  std::string domain;
   std::string expectedPin;
   // Kept only so a reconnect can authenticate again; wiped by closeSession and
   // never written to a log or a status string.
@@ -2021,7 +2034,9 @@ void drainSessionInput(SessionState& state, LiveClient& client) {
   client.getOutStream()->flush();
 }
 
-void sessionMain(std::shared_ptr<SessionState> state) {
+// VNC / RFB session loop. This is the original sessionMain() body, kept
+// verbatim; only the name changed so sessionMain() can dispatch on protocol.
+void runVncSession(std::shared_ptr<SessionState> state) {
   int lastApplied = 0;
   int backoffMs = 1000;
   while (!state->stop) {
@@ -2174,6 +2189,378 @@ void sessionMain(std::shared_ptr<SessionState> state) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// RDP bridge (only compiled into the OHOS target, TIANGUAN_WITH_RDP)
+//
+// rdp_backend.cxx owns the FreeRDP context and the connect/event loop. These
+// thin adapters translate its callbacks into SessionState writes using exactly
+// the invariants of the VNC path:
+//   * resizeFrame mirrors initDone()/resizeFramebuffer(): rebuild the mirror,
+//     clear both dirty layers and the consumer baseline, pixEpoch++, version++,
+//     wantFull=true, mirrorComplete=false;
+//   * commitFrame mirrors framebufferUpdateEnd(): copy every rectangle, then
+//     one version bump, frameGeneration=generation, pending union, region.
+// The VNC code itself is untouched, so its behavior cannot change.
+// ---------------------------------------------------------------------------
+#if defined(TIANGUAN_WITH_RDP)
+
+// The adapter passes RdpPhase values straight to setPhase(), so the two enums
+// must stay numerically identical.
+static_assert(static_cast<int>(PhaseConnecting) ==
+                  static_cast<int>(tianguan::RdpPhaseConnecting),
+              "RDP phase mapping changed");
+static_assert(static_cast<int>(PhaseConnected) ==
+                  static_cast<int>(tianguan::RdpPhaseConnected),
+              "RDP phase mapping changed");
+static_assert(static_cast<int>(PhaseDisconnected) ==
+                  static_cast<int>(tianguan::RdpPhaseDisconnected),
+              "RDP phase mapping changed");
+static_assert(static_cast<int>(PhaseFailed) ==
+                  static_cast<int>(tianguan::RdpPhaseFailed),
+              "RDP phase mapping changed");
+static_assert(static_cast<int>(PhaseTrustRequired) ==
+                  static_cast<int>(tianguan::RdpPhaseTrustRequired),
+              "RDP phase mapping changed");
+static_assert(static_cast<int>(PhaseReconnecting) ==
+                  static_cast<int>(tianguan::RdpPhaseReconnecting),
+              "RDP phase mapping changed");
+
+bool rdpHostStopRequested(void* user) {
+  return static_cast<SessionState*>(user)->stop.load();
+}
+
+int rdpHostGeneration(void* user) {
+  return static_cast<SessionState*>(user)->generation.load();
+}
+
+int rdpHostBeginAttempt(void* user, int* lastApplied) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  // Act on a pending manual reconnect now: reconnectSession() already bumped
+  // the generation, and leaving forceReconnect set would make the next backoff
+  // or waitForReconnect() exit spuriously. This is the RDP equivalent of the
+  // VNC loop consuming the flag in its loop body / sleep helpers.
+  state.forceReconnect = false;
+  return beginAttempt(state, *lastApplied);
+}
+
+void rdpHostSetPhase(void* user, int phase, const char* error,
+                     const char* errorCode, int retryInMs) {
+  setPhase(*static_cast<SessionState*>(user), phase,
+           error != nullptr ? error : "",
+           errorCode != nullptr ? errorCode : "none", retryInMs);
+}
+
+bool rdpHostSleepUnlessStopped(void* user, int milliseconds) {
+  return sleepUnlessStopped(*static_cast<SessionState*>(user), milliseconds);
+}
+
+void rdpHostWaitForReconnect(void* user) {
+  waitForReconnect(*static_cast<SessionState*>(user));
+}
+
+void rdpResizeFrame(void* user, int generation, int width, int height) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return;
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  state.fbWidth = width;
+  state.fbHeight = height;
+  state.full.assign(static_cast<size_t>(width) * height * 4, 0);
+  for (size_t i = 3; i < state.full.size(); i += 4) state.full[i] = 255;
+  state.region.clear();
+  // Both dirty layers and the consumer baseline belong to the old geometry;
+  // nothing from them may be positioned on the new mirror.
+  state.updAny = false;
+  state.pendAny = false;
+  state.rectX = 0;
+  state.rectY = 0;
+  state.rectW = 0;
+  state.rectH = 0;
+  state.regionFull = false;
+  state.mirrorComplete = false;
+  state.wantFull = true;
+  state.version++;
+  state.frameGeneration = generation;
+  state.pixEpoch++;
+  state.takenVersion = state.version;
+  state.takenEpoch = state.pixEpoch;
+  // RDP delivers a BGRA_8888 little-endian surface; report the same fields the
+  // VNC path fills from the negotiated RFB pixel format.
+  state.pfBpp = 32;
+  state.pfDepth = 24;
+  state.pfRedMax = 255;
+  state.pfGreenMax = 255;
+  state.pfBlueMax = 255;
+  state.pfRedShift = 16;
+  state.pfGreenShift = 8;
+  state.pfBlueShift = 0;
+  state.pfBigEndian = false;
+}
+
+void rdpCommitFrame(void* user, int generation, const tianguan::RdpRect* rects,
+                    size_t count, int width, int height) {
+  if (rects == nullptr || count == 0) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  if (state.fbWidth != width || state.fbHeight != height) return;
+  const size_t mirrorBytes = static_cast<size_t>(width) * height * 4;
+  if (state.full.size() < mirrorBytes) return;
+  // Same meaning as framebufferUpdateEnd(): while wantFull is set the update is
+  // treated as the whole desktop (a fresh view), whatever rectangles it carries.
+  const bool full = state.wantFull;
+  bool any = false;
+  int ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const tianguan::RdpRect& rect = rects[i];
+    if (rect.pixels == nullptr || rect.w <= 0 || rect.h <= 0 ||
+        rect.stride < rect.w * 4)
+      continue;
+    const int x = std::max(0, rect.x);
+    const int y = std::max(0, rect.y);
+    const int x1 = std::min(width, rect.x + rect.w);
+    const int y1 = std::min(height, rect.y + rect.h);
+    if (x1 <= x || y1 <= y) continue;
+    const int copyW = x1 - x;
+    const int copyH = y1 - y;
+    const uint8_t* src = rect.pixels +
+                         static_cast<size_t>(y - rect.y) * rect.stride +
+                         static_cast<size_t>(x - rect.x) * 4;
+    for (int row = 0; row < copyH; ++row) {
+      uint8_t* dstRow = &state.full[(static_cast<size_t>(y + row) * width + x) * 4];
+      const uint8_t* srcRow = src + static_cast<size_t>(row) * rect.stride;
+      for (int col = 0; col < copyW; ++col) {
+        // FreeRDP's BGRA32 primary buffer has the BGRA byte layout already; be
+        // explicit about alpha instead of trusting the X/A padding byte.
+        uint32_t pixel;
+        std::memcpy(&pixel, srcRow + static_cast<size_t>(col) * 4, 4);
+        pixel |= 0xff000000u;
+        std::memcpy(dstRow + static_cast<size_t>(col) * 4, &pixel, 4);
+      }
+    }
+    if (!any) {
+      ux0 = x;
+      uy0 = y;
+      ux1 = x1;
+      uy1 = y1;
+      any = true;
+    } else {
+      ux0 = std::min(ux0, x);
+      uy0 = std::min(uy0, y);
+      ux1 = std::max(ux1, x1);
+      uy1 = std::max(uy1, y1);
+    }
+  }
+  if (!any) return;
+  if (full) {
+    // framebufferUpdateEnd() uses the whole screen as the published rectangle
+    // when wantFull is set.
+    state.region = state.full;
+    state.rectX = 0;
+    state.rectY = 0;
+    state.rectW = width;
+    state.rectH = height;
+    state.regionFull = true;
+    state.mirrorComplete = true;
+    state.pendAny = true;
+    state.pendX0 = 0;
+    state.pendY0 = 0;
+    state.pendX1 = width;
+    state.pendY1 = height;
+    state.wantFull = false;
+  } else {
+    const int rw = ux1 - ux0;
+    const int rh = uy1 - uy0;
+    state.region.resize(static_cast<size_t>(rw) * rh * 4);
+    for (int row = 0; row < rh; ++row) {
+      std::memcpy(&state.region[static_cast<size_t>(row) * rw * 4],
+                  &state.full[(static_cast<size_t>(uy0 + row) * width + ux0) * 4],
+                  static_cast<size_t>(rw) * 4);
+    }
+    state.rectX = ux0;
+    state.rectY = uy0;
+    state.rectW = rw;
+    state.rectH = rh;
+    state.regionFull = false;
+    if (!state.pendAny) {
+      state.pendX0 = ux0;
+      state.pendY0 = uy0;
+      state.pendX1 = ux1;
+      state.pendY1 = uy1;
+      state.pendAny = true;
+    } else {
+      state.pendX0 = std::min(state.pendX0, ux0);
+      state.pendY0 = std::min(state.pendY0, uy0);
+      state.pendX1 = std::max(state.pendX1, ux1);
+      state.pendY1 = std::max(state.pendY1, uy1);
+    }
+  }
+  state.version++;
+  state.frameGeneration = generation;
+}
+
+void rdpSetCursor(void* user, int generation, int width, int height, int hotX,
+                  int hotY, const uint8_t* rgba) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  if (rgba == nullptr || width <= 0 || height <= 0 || width > 1024 ||
+      height > 1024) {
+    state.cursorBlank = true;
+    state.cursorW = 0;
+    state.cursorH = 0;
+    state.cursorVersion++;
+    return;
+  }
+  state.cursor.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
+  state.cursorBlank = false;
+  state.cursorW = width;
+  state.cursorH = height;
+  state.cursorHotX = std::max(0, std::min(hotX, width - 1));
+  state.cursorHotY = std::max(0, std::min(hotY, height - 1));
+  state.cursorVersion++;
+}
+
+void rdpSetCursorBlank(void* user, int generation) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  state.cursorBlank = true;
+  state.cursorW = 0;
+  state.cursorH = 0;
+  state.cursorVersion++;
+}
+
+void rdpSetCursorPos(void* user, int generation, int x, int y) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  state.cursorX = x;
+  state.cursorY = y;
+}
+
+unsigned rdpPrepareInput(void* user) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  // Same reset as a fresh VNC connection: drop pointer/key input from the
+  // previous connection, keep connection-independent clipboard text.
+  clearQueuedInputForReconnect(state);
+  return state.releaseEpoch.load();
+}
+
+void rdpDrainInput(void* user, const tianguan::RdpInputSink* sink,
+                   unsigned* appliedRelease) {
+  if (sink == nullptr || appliedRelease == nullptr) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::deque<QueuedInput> pending;
+  const unsigned targetRelease = state.releaseEpoch.load();
+  {
+    std::lock_guard<std::mutex> lock(state.input);
+    if (state.inputs.empty() && targetRelease == *appliedRelease) return;
+    pending.swap(state.inputs);
+  }
+  for (std::deque<QueuedInput>::const_iterator it = pending.begin();
+       it != pending.end(); ++it) {
+    if (it->kind == QueuedInput::PointerKind) {
+      if (sink->pointer != nullptr) sink->pointer(sink->ctx, it->a, it->b, it->c);
+    } else if (it->kind == QueuedInput::KeyKind) {
+      if (sink->key != nullptr) sink->key(sink->ctx, it->a, it->b);
+    } else {
+      // No cliprdr channel in this build: the backend counts and reports the
+      // drop, never logs the text.
+      if (sink->clipboard != nullptr) sink->clipboard(sink->ctx, it->text.c_str());
+    }
+  }
+  if (targetRelease != *appliedRelease) {
+    // releaseSessionInput(): release exactly what this attempt pressed.
+    if (sink->release != nullptr) sink->release(sink->ctx);
+    *appliedRelease = targetRelease;
+  }
+}
+
+void rdpConsumeFullRequest(void* user) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (!state.needFullRequest.exchange(false)) return;
+  std::lock_guard<std::mutex> lock(state.pix);
+  state.wantFull = true;
+}
+
+// RDP equivalent of the VNC session loop: copy the credentials once (under the
+// meta lock), build the bridge, run, then write the same terminal state the VNC
+// loop writes when it returns.
+void runRdpSession(const std::shared_ptr<SessionState>& state) {
+  tianguan::RdpOptions options;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    options.host = state->host;
+    options.port = state->port;
+    options.username = state->username;
+    options.domain = state->domain;
+    options.password = state->password;
+  }
+  // The copies live only for this call; wipe them when it returns (the reaper
+  // wipes the stored copies after the thread is joined).
+  WipeGuard usernameGuard{options.username};
+  WipeGuard domainGuard{options.domain};
+  WipeGuard passwordGuard{options.password};
+
+  tianguan::RdpHost bridge;
+  bridge.user = state.get();
+  bridge.stopRequested = rdpHostStopRequested;
+  bridge.generation = rdpHostGeneration;
+  bridge.beginAttempt = rdpHostBeginAttempt;
+  bridge.setPhase = rdpHostSetPhase;
+  bridge.sleepUnlessStopped = rdpHostSleepUnlessStopped;
+  bridge.waitForReconnect = rdpHostWaitForReconnect;
+  bridge.resizeFrame = rdpResizeFrame;
+  bridge.commitFrame = rdpCommitFrame;
+  bridge.setCursor = rdpSetCursor;
+  bridge.setCursorBlank = rdpSetCursorBlank;
+  bridge.setCursorPos = rdpSetCursorPos;
+  bridge.prepareInput = rdpPrepareInput;
+  bridge.drainInput = rdpDrainInput;
+  bridge.consumeFullRequest = rdpConsumeFullRequest;
+
+  tianguan::runRdpSession(bridge, options);
+
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    state->connected = false;
+    state->running = false;
+    state->retryInMs = 0;
+    if (state->phase != PhaseFailed && state->phase != PhaseTrustRequired)
+      state->phase = PhaseDisconnected;
+  }
+}
+
+#endif  // TIANGUAN_WITH_RDP
+
+// Entry point of one session thread. The VNC body lives in runVncSession() and
+// is unchanged; RDP sessions go to the FreeRDP backend.
+void sessionMain(std::shared_ptr<SessionState> state) {
+#if defined(TIANGUAN_WITH_RDP)
+  if (state->protocol == "rdp") {
+    runRdpSession(state);
+    return;
+  }
+#else
+  if (state->protocol == "rdp") {
+    // The host build deliberately does not link FreeRDP (the host OpenSSL is a
+    // shared system library and incompatible with the OHOS static prefix).
+    // Fail honestly instead of silently running the VNC loop against port 3389.
+    setPhase(*state, PhaseFailed, "RDP support is not compiled into this build",
+             "protocol", 0);
+    waitForReconnect(*state);
+    std::lock_guard<std::mutex> lock(state->meta);
+    state->connected = false;
+    state->running = false;
+    state->retryInMs = 0;
+    if (state->phase != PhaseFailed) state->phase = PhaseDisconnected;
+    return;
+  }
+#endif
+  runVncSession(state);
+}
+
 // The registry lock only guards map lookups/inserts/removes. Every caller takes
 // a shared_ptr copy and releases the lock before doing anything else, so no
 // network IO, authentication or join can run while it is held.
@@ -2259,9 +2646,12 @@ private:
 SessionRegistry g_sessions;
 
 struct SessionOptions {
-  SessionOptions() : port(0) {}
+  SessionOptions() : port(0), protocol("vnc") {}
   std::string host;
   int port;
+  std::string protocol;
+  std::string username;
+  std::string domain;
   std::string password;
   std::string expectedPin;
   std::string name;
@@ -2286,6 +2676,12 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
       return false;
     }
     options.port = port;
+    if (json.find("\"protocol\"") != std::string::npos)
+      options.protocol = jsonValue(json, "protocol");
+    if (json.find("\"username\"") != std::string::npos)
+      options.username = jsonValue(json, "username");
+    if (json.find("\"domain\"") != std::string::npos)
+      options.domain = jsonValue(json, "domain");
     if (json.find("\"password\"") != std::string::npos)
       options.password = jsonValue(json, "password");
     if (json.find("\"expectedFingerprint\"") != std::string::npos)
@@ -2302,6 +2698,19 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
   }
   if (options.host.empty() || options.host.size() > 253) {
     error = "invalid host";
+    return false;
+  }
+  if (options.protocol != "vnc" && options.protocol != "rdp") {
+    error = "unsupported protocol";
+    return false;
+  }
+  if (options.username.size() > 256 || options.domain.size() > 256) {
+    error = "credential too long";
+    return false;
+  }
+  if (options.username.find('\0') != std::string::npos ||
+      options.domain.find('\0') != std::string::npos) {
+    error = "credential contains NUL";
     return false;
   }
   if (options.password.size() > 512) {
@@ -2333,6 +2742,9 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   std::shared_ptr<SessionState> state(new SessionState);
   state->host = options.host;
   state->port = options.port;
+  state->protocol = options.protocol;
+  state->username = options.username;
+  state->domain = options.domain;
   state->password = options.password;
   state->expectedPin = options.expectedPin;
   state->profileName = options.name.empty() ? "session" : options.name;
@@ -2344,6 +2756,8 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   } catch (...) {
     error = "cannot start session thread";
     wipeString(state->password);
+    wipeString(state->username);
+    wipeString(state->domain);
     return std::shared_ptr<SessionState>();
   }
   const std::string id = g_sessions.insert(state, makeDefault);
@@ -2353,6 +2767,8 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
     state->sock.interrupt();
     if (state->thread.joinable()) state->thread.join();
     wipeString(state->password);
+    wipeString(state->username);
+    wipeString(state->domain);
     error = "already running";
     return std::shared_ptr<SessionState>();
   }
@@ -2562,8 +2978,10 @@ void reapClosedSession(std::shared_ptr<SessionState> state) {
     if (state->phase != PhaseFailed && state->phase != PhaseTrustRequired)
       state->phase = PhaseDisconnected;
   }
-  // Only after the join can no thread read the stored password any more.
+  // Only after the join can no thread read the stored credentials any more.
   wipeString(state->password);
+  wipeString(state->username);
+  wipeString(state->domain);
   g_pendingCloses.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -2578,6 +2996,8 @@ std::string tianguan::createSession(const std::string& optionsJson) {
   if (!parseSessionOptions(optionsJson, options, error))
     return "ERROR:" + (error.empty() ? std::string("invalid options") : error);
   WipeGuard passwordGuard{options.password};
+  WipeGuard usernameGuard{options.username};
+  WipeGuard domainGuard{options.domain};
   const std::shared_ptr<SessionState> state = launchSession(options, false, error);
   if (!state) return "ERROR:" + (error.empty() ? std::string("session failed") : error);
   return state->id;

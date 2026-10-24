@@ -24,13 +24,18 @@
 
 ```json
 { "host": "192.168.50.62", "port": 5901,
+  "protocol": "rdp",          // 可选，"vnc"（缺省）| "rdp"
+  "username": "…",            // 可选，仅 RDP
+  "domain": "…",              // 可选，仅 RDP，可空
   "password": "…",            // 可选，短生命周期，不落盘、不入日志
-  "expectedFingerprint": "…", // 可选，来自信任库
-  "security": "None",         // 可选，默认 "RA2_256,RA2"
+  "expectedFingerprint": "…", // 可选，来自信任库；仅 VNC
+  "security": "None",         // 可选，默认 "RA2_256,RA2"；仅 VNC
   "name": "测试机" }
 ```
 
-`security` 是向服务端声明的 RFB 安全类型（逗号分隔）。默认只声明加密的 `RA2_256,RA2`；**服务器若只公布 `None`(1)**，必须显式传 `"None"`，否则握手会以 `No matching security types` 失败。界面在「该服务器无需密码」勾选时传 `None`。
+`protocol` 选择原生后端：缺省或 `"vnc"` 走 RFB，`"rdp"` 走 FreeRDP。`username`/`domain` 只在 RDP 下有意义（`domain` 可空），用于 RDP 登录；VNC 忽略这两个字段。RDP **必须**带 `password`（没有「无需密码」语义）。`security`（RFB 安全类型）与 `expectedFingerprint`（RA2 指纹固定）是 VNC 专用，RDP 会话不要传——原生只在 VNC 路径读取它们。RDP 与 VNC 复用同一套会话状态（`connecting`/`connected`/`failed`/`reconnecting` 等）与 `errorCode`（`auth-failed`/`protocol`/`network`），因此界面的失败提示与密码重输流程对两种协议一致。
+
+`security` 是向服务端声明的 RFB 安全类型（逗号分隔）。默认只声明加密的 `RA2_256,RA2`；**服务器若只公布 `None`(1)**，必须显式传 `"None"`，否则握手会以 `No matching security types` 失败。界面在「该服务器无需密码」勾选时传 `None`。RDP 没有对应的「无需密码」选项，界面也不显示该勾选。
 
 ## 状态 JSON
 

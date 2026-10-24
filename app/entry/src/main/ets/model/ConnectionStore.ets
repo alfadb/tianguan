@@ -1,12 +1,14 @@
 /**
  * Saved-connection persistence: the connection list (filesDir/connections.json),
  * the fingerprint trust store (filesDir/vnc-pins.json) and passwords (asset
- * key store, alias "tianguan:<host>:<port>" — the same alias scheme the
- * previous single-session UI used, so already-saved passwords keep working).
+ * key store). VNC passwords keep the historical alias "tianguan:<host>:<port>"
+ * so already-saved passwords keep working; RDP passwords use the separate
+ * alias "tianguan:rdp:<host>:<port>" so the same host:port cannot clash.
  *
  * Migrated from pages/Index.ets for the connection-manager UI. The old
  * connections.json entries ({name,host,port,savePassword}) are migrated in
- * place on load: id/group/lastConnectedAt get defaults.
+ * place on load: id/group/lastConnectedAt get defaults; records without a
+ * protocol are VNC, username/domain default to "".
  *
  * id is OPAQUE: new connections get 'c' + time + random (newConnectionId()).
  * "host:port" is only a display value and the fingerprint/password alias key,
@@ -35,6 +37,9 @@ interface StoredConnection {
   savePassword?: boolean;
   noPassword?: boolean;
   lastConnectedAt?: number;
+  protocol?: string;
+  username?: string;
+  domain?: string;
 }
 
 /**
@@ -51,10 +56,22 @@ export interface ConnectionEntry {
   /** The server accepts connections without a password (VNC security type None). */
   noPassword: boolean;
   lastConnectedAt: number;
+  /** 'vnc' | 'rdp'. RDP is persistence/UI only until the native backend lands. */
+  protocol: string;
+  /** RDP logon user; '' for VNC. */
+  username: string;
+  /** RDP domain; '' when unset. */
+  domain: string;
 }
 
 export const DEFAULT_PORT: string = '5901';
+export const DEFAULT_RDP_PORT: string = '3389';
 export const UNGROUPED: string = '未分组';
+
+/** Port used for a protocol when the form leaves the port empty. */
+export function defaultPortFor(protocol: string): string {
+  return protocol === 'rdp' ? DEFAULT_RDP_PORT : DEFAULT_PORT;
+}
 
 let idSequence: number = 0;
 
@@ -106,6 +123,12 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
     const group = newFormat && typeof item.group === 'string' ? item.group : '';
     const lastConnectedAt = newFormat && typeof item.lastConnectedAt === 'number' &&
       item.lastConnectedAt >= 0 ? item.lastConnectedAt : 0;
+    // Records written before RDP support have no protocol: they are VNC. Any
+    // other value is treated as VNC too, so a corrupt field cannot create a
+    // protocol nothing understands.
+    const protocol = item.protocol === 'rdp' ? 'rdp' : 'vnc';
+    const username = typeof item.username === 'string' ? item.username : '';
+    const domain = typeof item.domain === 'string' ? item.domain : '';
     const entry: ConnectionEntry = {
       id: id,
       name: name,
@@ -114,7 +137,10 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
       group: group,
       savePassword: item.savePassword === true,
       noPassword: item.noPassword === true,
-      lastConnectedAt: lastConnectedAt
+      lastConnectedAt: lastConnectedAt,
+      protocol: protocol,
+      username: username,
+      domain: domain
     };
     result.push(entry);
   }
@@ -190,7 +216,8 @@ function loadConnections(): ConnectionEntry[] {
 function sameConnection(a: ConnectionEntry, b: ConnectionEntry): boolean {
   return a.id === b.id && a.name === b.name && a.host === b.host && a.port === b.port &&
     a.group === b.group && a.savePassword === b.savePassword &&
-    a.noPassword === b.noPassword && a.lastConnectedAt === b.lastConnectedAt;
+    a.noPassword === b.noPassword && a.lastConnectedAt === b.lastConnectedAt &&
+    a.protocol === b.protocol && a.username === b.username && a.domain === b.domain;
 }
 
 function connectionsRoundTripEqual(expected: ConnectionEntry[],
@@ -214,7 +241,7 @@ function persistConnections(): void {
     const reloaded = loadConnections();
     if (!connectionsRoundTripEqual(connections, reloaded)) {
       hilog.error(DOMAIN, TAG,
-        '连接列表保存后回读自检失败：内存 %{public}d 条，读回 %{public}d 条，group/lastConnectedAt 等字段可能丢失',
+        '连接列表保存后回读自检失败：内存 %{public}d 条，读回 %{public}d 条，group/lastConnectedAt/protocol 等字段可能丢失',
         connections.length, reloaded.length);
     }
   } catch (error) {
@@ -222,9 +249,9 @@ function persistConnections(): void {
   }
 }
 
-function normalizePort(port: string): string {
+function normalizePort(port: string, protocol: string): string {
   const trimmed = port.trim();
-  return trimmed.length > 0 ? trimmed : DEFAULT_PORT;
+  return trimmed.length > 0 ? trimmed : defaultPortFor(protocol);
 }
 
 /**
@@ -235,9 +262,15 @@ function normalizePort(port: string): string {
  */
 export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
   const host = entry.host.trim();
-  const port = normalizePort(entry.port);
+  const protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+  const port = normalizePort(entry.port, protocol);
   const id = typeof entry.id === 'string' && entry.id.length > 0 ? entry.id : newConnectionId();
   const noPassword = entry.noPassword === true;
+  // username/domain only mean something for RDP; a VNC record keeps them empty.
+  const username = protocol === 'rdp' && typeof entry.username === 'string' ?
+    entry.username.trim() : '';
+  const domain = protocol === 'rdp' && typeof entry.domain === 'string' ?
+    entry.domain.trim() : '';
   const normalized: ConnectionEntry = {
     id: id,
     name: entry.name.trim().length > 0 ? entry.name.trim() : host,
@@ -246,7 +279,10 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
     group: entry.group.trim(),
     savePassword: noPassword ? false : entry.savePassword,
     noPassword: noPassword,
-    lastConnectedAt: entry.lastConnectedAt
+    lastConnectedAt: entry.lastConnectedAt,
+    protocol: protocol,
+    username: username,
+    domain: domain
   };
   const kept: ConnectionEntry[] = [];
   let replaced = false;
@@ -345,9 +381,17 @@ function fromBytes(bytes: Uint8Array | undefined): string {
   return util.TextDecoder.create('utf-8').decodeWithStream(bytes);
 }
 
+function passwordAlias(entry: ConnectionEntry): string {
+  const hostPort = entry.host + ':' + entry.port;
+  // VNC deliberately keeps the legacy alias: passwords saved by older builds
+  // must still load. RDP gets its own namespace so a VNC and an RDP connection
+  // on the same host:port cannot overwrite each other's password.
+  return entry.protocol === 'rdp' ? 'tianguan:rdp:' + hostPort : 'tianguan:' + hostPort;
+}
+
 function aliasQuery(entry: ConnectionEntry): asset.AssetMap {
   const query: asset.AssetMap = new Map();
-  query.set(asset.Tag.ALIAS, toBytes('tianguan:' + entry.host + ':' + entry.port));
+  query.set(asset.Tag.ALIAS, toBytes(passwordAlias(entry)));
   return query;
 }
 
@@ -367,7 +411,7 @@ export async function savePassword(entry: ConnectionEntry, secret: string): Prom
       // No previous entry is the normal first-save case.
     }
     const map: asset.AssetMap = new Map();
-    map.set(asset.Tag.ALIAS, toBytes('tianguan:' + entry.host + ':' + entry.port));
+    map.set(asset.Tag.ALIAS, toBytes(passwordAlias(entry)));
     map.set(asset.Tag.SECRET, toBytes(secret));
     map.set(asset.Tag.ACCESSIBILITY, asset.Accessibility.DEVICE_FIRST_UNLOCKED);
     await asset.add(map);

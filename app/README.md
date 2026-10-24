@@ -1,6 +1,6 @@
 # 天关：原生内核诊断 HAP
 
-这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `0.0.1` / code `1`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核诊断库；当前界面提供连接管理与多会话远程桌面（VNC）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 因签名 Profile 的 ACL 为空而暂时保持未声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
+这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `0.0.1` / code `1`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核诊断库；当前界面提供连接管理与多会话远程桌面（VNC / RDP）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 因签名 Profile 的 ACL 为空而暂时保持未声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
 
 本轮已把测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）纳入调试范围：`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['2in1', 'phone']`。本轮加入网络测试后重建的 unsigned HAP 内 `module.json` 与 `pack.info` 均同时含 `2in1` 与 `phone`，`requestPermissions` 仅含 `ohos.permission.INTERNET`；此前的纯诊断包没有权限声明。
 
@@ -112,8 +112,9 @@ PASS input observed: 261108 pixels changed, bbox (107,0)-(1847,864)
 
 ### 连接管理与密码保存（2026-10-21）
 
-- **多连接管理**：主界面列出保存的连接（名称、`host:port`），可「使用」「删除」；表单填写名称/地址/端口/密码后可「保存连接」。列表存在应用沙箱 `filesDir/connections.json`，只含名称、地址、端口和 `savePassword` 标志，**不含密码**。
+- **多连接管理**：主界面列出保存的连接（名称、协议与 `host:port`），可「使用」「删除」；表单填写名称/地址/端口/密码后可「保存连接」。列表存在应用沙箱 `filesDir/connections.json`，只含名称、地址、端口、协议、RDP 用户名/域和 `savePassword` 标志，**不含密码**。
 - **密码保存**：勾选「保存密码」时，密码写入系统密钥库（`@ohos.security.asset`，`asset.add` / `asset.query` / `asset.remove`，别名 `tianguan:<host>:<port>`，可访问性 `DEVICE_FIRST_UNLOCKED`），不写入 `connections.json`、不写日志、不回显。若系统密钥库不可用，保存会失败并在状态栏提示，此时连接仍可用但密码不落盘。选择已保存的连接且勾选保存密码时，会自动从密钥库取回密码填入输入框。
+- **协议：VNC / RDP（2026-10-24）**：连接可保存为 VNC 或 RDP。RDP 条目额外记录用户名、域与密码：用户名必填、域可留空；密码与 VNC 一样只进系统密钥库，但使用独立别名 `tianguan:rdp:<host>:<port>`，与同地址的 VNC 连接互不覆盖（VNC 继续沿用旧别名 `tianguan:<host>:<port>`，已存密码不受影响）。VNC 默认端口 5901，RDP 默认端口 3389；切换协议时，端口只在为空或仍等于另一协议默认值时才跟随切换，用户手填的自定义端口不会被覆盖。**RDP 已接入原生 FreeRDP 后端**（画面 + 键鼠；剪贴板、音频、证书固定等未做）：点「连接」或「重连」会像 VNC 一样创建会话，不再弹「尚未接入」提示；详见「RDP 接入（2026-10-24）」。
 - **远程画面页**：连接启动后为该会话启动独立 `RemoteAbility` 实例（`multiton`），页面 `pages/Remote` 承载远程画面、鼠标键盘、光标与剪贴板；同一会话再次「打开」只激活已有窗口，不新建实例。打开失败直接结束该会话并提示，不再降级到主窗口。详见「多会话与窗口（2026-10-21，2026-10-23 改为多实例）」。
 - **连接失败提示（2026-10-24）**：连接失败时主窗口会提示中文原因（密码错误、服务端指纹与已信任值不一致、网络连接中断、协议不匹配或服务器拒绝等），失败行显示「失败：<原因>」。密码错误时关闭该失败会话及其空窗口，并弹出密码重输框；确认后若该连接勾选了「保存密码」，先把新密码写入系统密钥库，再用新密码重新连接（不复用旧会话）。指纹不一致、网络、协议等其它失败只给一条带原因的提示。
 
@@ -285,6 +286,15 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 
 边界：Dock 无法为每个会话显示独立图标（平台按应用合并）；窗口选择器比「直接点 Dock 会话图标」多一次选卡片。注册表是进程内状态，进程重启后自然失效。窗口名由系统分配，重开同一会话会得到新窗口名。关窗即断会话是产品约定，已在真机验证（见文末「验证边界」）。
 
+## RDP 接入（2026-10-24）
+
+- **ArkTS → 原生链路**：`connect()` 组装 `SessionOptions` 时按协议分流。RDP 条目带 `protocol: "rdp"`，并在非空时带 `username`/`domain`；密码仍从系统密钥库的 `tianguan:rdp:<host>:<port>` 别名读取（`loadPassword(entry)`）。VNC 条目不传 `protocol`（缺省即 VNC），`security`（None 语义）与 `expectedFingerprint`（`vnc-pins.json` 信任库）也只在 VNC 分支设置。字段定义见 `app/entry/src/main/ets/diag/SessionApi.ets` 的 `SessionOptions`，契约见 [docs/napi-contract.md](../docs/napi-contract.md)。原来的「RDP 连接尚未接入」拦截（`connect()` 与 `reconnectEntry()` 各一处）已删除。
+- **原生后端**：FreeRDP 3.9.0 静态链接（`libfreerdp3` / `libfreerdp-client3` / `libwinpr3`，加静态 OpenSSL 3.5.9 与 zlib），依赖由 `scripts/build-rdp-deps.sh ohos` 用 OHOS SDK 交叉编译并安装到 `.work/rdp-deps/ohos/prefix`（需要仓库内 `.work/freerdp-spike` 的固定 FreeRDP 3.9.0 源码检出）。`app/native/CMakeLists.txt` 只有在该前缀存在时才定义 `TIANGUAN_WITH_RDP`；缺少前缀时 RDP 会话以 `protocol` 错误明确失败，不会静默拿 RFB 去连 3389。
+- **体积**：静态链接把 `libtianguan_diag.so` 从约 1.8 MB（上一版 VNC-only 构建为 1,867,232 B）推到约 12 MB（当前 12,533,944 B），unsigned HAP 相应变大；这是为在设备上省掉额外共享库依赖付出的代价。
+- **复用度**：RDP 画面走 FreeRDP 的 GDI 位图/绘制订单路径，`EndPaint` 后把脏区提交进与 VNC 相同的帧镜像与 `version`/`generation` 规则，因此 Remote 页、原生 EGL 渲染器、多窗口、托盘与会话注册表都不按协议分支。状态机与 `errorCode` 也复用（`auth-failed`/`protocol`/`network`），主界面的失败原因提示与「密码错误」重输弹层对 RDP 同样生效。
+- **已知限制**（首版验收范围定为「画面 + 键鼠」）：无剪贴板通道（`CHANNEL_CLIPRDR=OFF`，远端复制内容被丢弃）；无 GFX / RemoteFX / 视频编码（`CHANNEL_RDPGFX=OFF`、`CHANNEL_VIDEO=OFF`、`WITH_FFMPEG=OFF`，只走 GDI 位图与绘制订单）；无音频（`CHANNEL_RDPSND=OFF`）；无 IME 组合输入与 Unicode 直接输入（键盘仍按物理按键逐个转发）；证书不做固定（RDP 服务端证书仅本次会话接受，不写入 `vnc-pins.json`、不弹确认，VNC 的指纹信任流程不适用于 RDP）；驱动/打印机/智能卡/摄像头/多显示器等重定向通道均未启用。
+- **验证状态（2026-10-24）**：已在真机（MateBook Fold SLM-W32，调试签名、`install -r` 覆盖安装）连接 192.168.50.12 与 192.168.50.18。两台均完成 TCP/TLS/NLA 登录、首帧真实桌面、鼠标点击（远端弹出 Windows 开始菜单、通知中心/日历面板）与键盘（Esc 关闭菜单）。设备侧 /proc/<pid>/net/tcp 可见到两台的 3389 连接为 ESTABLISHED。证据在 .work/device-runs/rdp-btnfix-20261024/（12）与 .work/device-runs/rdp18-final-20261024/（18）。已知现象：18 的画面更新在实测中滞后十几到几十秒，原因尚未定位。
+
 ## 系统托盘（2026-10-21）
 
 - 仅 `2in1`（PC）启用：先按 `deviceInfo.deviceType === '2in1'`、`canIUse('SystemCapability.PCService.StatusBarManager')` 和平台 capability 探测三重判断，再动态加载 `@kit.DeskTopExtensionKit` 的 `statusBarManager`（`@hms.pcService.statusBarManager`，无权限要求）。手机/平板或缺少该能力的系统静默降级，只记一条日志，不加载该 kit。
@@ -383,4 +393,5 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - **本机 → 远端剪贴板**：等 AGC 的 `READ_PASTEBOARD` ACL 审批；当前声明保持移除，读取完全停用，授权弹窗/允许后的自动同步未真机走通。
 - **主窗口隐藏态从托盘打开会话**：会话窗口正常出现且在最先，但平台会顺带拉起主窗口并显示在会话窗口后面（不遮挡，属外观限制）。曾尝试抑制/收回，真机上会导致会话窗口不可见，已回滚（详见「多会话与窗口」）。
 - **滚轮**：仅代码路径保留，未做可视化真机验收。
-- **IME / Unicode 直接输入 / RDP / X509**：未实现或未验证。
+- **RDP 真机连接**：已在 192.168.50.12 与 192.168.50.18 上验证连接、首帧、鼠标点击与键盘（详见「RDP 接入（2026-10-24）」的验证状态）；192.168.50.18 画面更新滞后十几到几十秒的原因尚未定位。RDP 的剪贴板、音频、证书固定、GFX、IME 等能力按该节已知限制未做。
+- **IME / Unicode 直接输入 / X509**：未实现或未验证。
