@@ -2465,8 +2465,8 @@ void rdpDrainInput(void* user, const tianguan::RdpInputSink* sink,
     } else if (it->kind == QueuedInput::KeyKind) {
       if (sink->key != nullptr) sink->key(sink->ctx, it->a, it->b);
     } else {
-      // No cliprdr channel in this build: the backend counts and reports the
-      // drop, never logs the text.
+      // cliprdr: the backend stores the text as its local clipboard and
+      // announces it to the server. It never logs the text itself.
       if (sink->clipboard != nullptr) sink->clipboard(sink->ctx, it->text.c_str());
     }
   }
@@ -2482,6 +2482,59 @@ void rdpConsumeFullRequest(void* user) {
   if (!state.needFullRequest.exchange(false)) return;
   std::lock_guard<std::mutex> lock(state.pix);
   state.wantFull = true;
+}
+
+// Drop a UTF-8 sequence that the 1 MiB cut split in half. The VNC clipboard
+// handler has the same rule; RDP text arrives as UTF-16 and can be cut at the
+// same bound once converted.
+void trimIncompleteUtf8ForRdp(std::string& text) {
+  size_t start = text.size();
+  while (start > 0 && (static_cast<unsigned char>(text[start - 1]) & 0xc0) == 0x80)
+    --start;
+  if (start == 0) return;
+  const unsigned char lead = static_cast<unsigned char>(text[start - 1]);
+  size_t needed = 0;
+  if ((lead & 0x80) == 0) return;
+  if ((lead & 0xe0) == 0xc0) needed = 1;
+  else if ((lead & 0xf0) == 0xe0) needed = 2;
+  else if ((lead & 0xf8) == 0xf0) needed = 3;
+  else {
+    text.resize(start - 1);
+    return;
+  }
+  if (text.size() - start < needed) text.resize(start - 1);
+}
+
+// Remote clipboard text received through cliprdr (remote copy -> local copy).
+// This writes clipText/clipVersion with the exact contract of the VNC path's
+// storeClipboard: NUL removed, CRLF folded to LF, 1 MiB cap, UTF-8 cut trimmed.
+// The generation is re-checked under the clip lock so a manual reconnect that
+// bumped it between the callback and the write cannot leak stale text into the
+// new connection's clipboard.
+void rdpSinkClipboard(void* user, int generation, const char* text,
+                      size_t length) {
+  if (text == nullptr) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (state.stop || state.generation.load() != generation) return;
+  bool truncated = false;
+  if (length > kClipboardLimit) {
+    length = kClipboardLimit;
+    truncated = true;
+  }
+  std::string normalized;
+  normalized.reserve(length);
+  for (size_t i = 0; i < length; ++i) {
+    const char c = text[i];
+    if (c == '\0') continue;
+    if (c == '\r' && i + 1 < length && text[i + 1] == '\n') continue;
+    normalized.push_back(c);
+  }
+  if (truncated) trimIncompleteUtf8ForRdp(normalized);
+  std::lock_guard<std::mutex> lock(state.clip);
+  if (state.stop || state.generation.load() != generation) return;
+  state.clipText.swap(normalized);
+  state.clipVersion++;
+  state.clipTruncated = truncated;
 }
 
 // RDP equivalent of the VNC session loop: copy the credentials once (under the
@@ -2519,6 +2572,7 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
   bridge.prepareInput = rdpPrepareInput;
   bridge.drainInput = rdpDrainInput;
   bridge.consumeFullRequest = rdpConsumeFullRequest;
+  bridge.sinkClipboard = rdpSinkClipboard;
 
   tianguan::runRdpSession(bridge, options);
 

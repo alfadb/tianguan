@@ -20,7 +20,10 @@
 // stop/generation so a superseded attempt can never touch the current mirror.
 #include "rdp_backend.h"
 
+#include <freerdp/channels/channels.h>
+#include <freerdp/channels/cliprdr.h>
 #include <freerdp/client.h>
+#include <freerdp/client/cliprdr.h>
 #include <freerdp/error.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/gdi/gdi.h>
@@ -32,18 +35,25 @@
 #include <freerdp/update.h>
 #include <winpr/crt.h>
 #include <winpr/input.h>
+#include <winpr/string.h>
 #include <winpr/synch.h>
+#include <winpr/user.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <new>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__MUSL__)
+#include <hilog/log.h>
+#endif
 
 namespace tianguan {
 namespace {
@@ -62,6 +72,26 @@ const int kInitialBackoffMs = 1000;
 const int kMaxBackoffMs = 4000;
 const size_t kMaxErrorChars = 240;
 const int kMaxCursorSide = 1024;
+// Same 1 MiB text bound as diagnostics.cxx's clipboard state (kClipboardLimit):
+// the ArkTS setClipboard() already refuses larger text, this is the backend's
+// own guard so a queued item can never exceed what the clip state accepts.
+const size_t kClipboardLimit = 1024 * 1024;
+// Refuse absurd CF_UNICODETEXT payloads before allocating a UTF-8 copy. Normal
+// text clipboard data is far below this; the cap only bounds a misbehaving or
+// hostile server.
+const UINT32 kMaxClipboardWireBytes = 4u * 1024u * 1024u;
+
+// Diagnostics line without any clipboard content: lengths and format ids only.
+// On device it goes through the same hilog tag the rest of the native layer
+// uses; the host build has no hilog and keeps the stderr fallback.
+void diagWarn(const std::string& line) {
+#if defined(__MUSL__)
+  OH_LOG_Print(LOG_APP, LOG_WARN, 0, "TianguanDiag", "%{public}s", line.c_str());
+#else
+  std::fprintf(stderr, "W TianguanDiag %s\n", line.c_str());
+  std::fflush(stderr);
+#endif
+}
 
 // One connection attempt. The head must be the FreeRDP client context: every
 // FreeRDP callback receives an rdpContext* that points at this struct (the
@@ -88,6 +118,289 @@ bool hostStopped(const RdpAttemptContext* attempt) {
 bool hostStale(const RdpAttemptContext* attempt) {
   return hostStopped(attempt) ||
          attempt->host->generation(attempt->host->user) != attempt->generation;
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard redirection (cliprdr, CF_UNICODETEXT only)
+//
+// The channel is a static addin; client-common loads it at pre-connect when
+// RedirectClipboard is TRUE and opens it during freerdp_connect(). The
+// CliprdrClientContext* is the addin's pInterface, retrievable through the
+// public channel manager API after the connect call returned. Its Client*
+// function pointers (assigned by the addin itself) send PDUs to the server;
+// the Server*/MonitorReady fields below are the callbacks the client owns.
+// Every callback runs on the session thread inside
+// freerdp_check_event_handles(), so no extra locking is needed around the
+// bridge state.
+// ---------------------------------------------------------------------------
+
+struct CliprdrBridge {
+  CliprdrClientContext* context = nullptr;
+  RdpAttemptContext* attempt = nullptr;
+  // Latest local clipboard text (UTF-8), already stripped/capped. It is what
+  // the next ServerFormatDataRequest answers with; it is never filled from the
+  // remote side, so a remote copy is not echoed back.
+  std::string localText;
+  // MonitorReady received: the channel now accepts client -> server PDUs.
+  bool ready = false;
+};
+
+// Drop a UTF-8 sequence that the 1 MiB cut split in half (same rule as the VNC
+// path's storeClipboard, which also has this helper).
+void trimIncompleteUtf8(std::string& text) {
+  size_t start = text.size();
+  while (start > 0 && (static_cast<unsigned char>(text[start - 1]) & 0xc0) == 0x80)
+    --start;
+  if (start == 0) return;
+  const unsigned char lead = static_cast<unsigned char>(text[start - 1]);
+  size_t needed = 0;
+  if ((lead & 0x80) == 0) return;
+  if ((lead & 0xe0) == 0xc0) needed = 1;
+  else if ((lead & 0xf0) == 0xe0) needed = 2;
+  else if ((lead & 0xf8) == 0xf0) needed = 3;
+  else {
+    text.resize(start - 1);
+    return;
+  }
+  if (text.size() - start < needed) text.resize(start - 1);
+}
+
+// Copy one outbound text item into the backend's local clipboard slot. The
+// queued text is NUL-terminated (setClipboard already removed embedded NULs)
+// and bounded by the same 1 MiB limit as the VNC clipboard state.
+void setLocalClipboardText(const char* text, std::string& out) {
+  out.clear();
+  if (text == nullptr) return;
+  size_t length = std::strlen(text);
+  bool truncated = false;
+  if (length > kClipboardLimit) {
+    length = kClipboardLimit;
+    truncated = true;
+  }
+  out.assign(text, length);
+  if (truncated) trimIncompleteUtf8(out);
+}
+
+UINT cliprdrSendCapabilities(CliprdrBridge& bridge) {
+  CliprdrClientContext* context = bridge.context;
+  if (context == nullptr || context->ClientCapabilities == nullptr)
+    return CHANNEL_RC_OK;
+  CLIPRDR_CAPABILITIES capabilities;
+  CLIPRDR_GENERAL_CAPABILITY_SET general;
+  std::memset(&general, 0, sizeof(general));
+  std::memset(&capabilities, 0, sizeof(capabilities));
+  capabilities.cCapabilitiesSets = 1;
+  capabilities.capabilitySets =
+      reinterpret_cast<CLIPRDR_CAPABILITY_SET*>(&general);
+  general.capabilitySetType = CB_CAPSTYPE_GENERAL;
+  general.capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN;
+  general.version = CB_CAPS_VERSION_2;
+  general.generalFlags = 0;  // no file clip, no long format names
+  return context->ClientCapabilities(context, &capabilities);
+}
+
+UINT cliprdrSendFormatList(CliprdrBridge& bridge) {
+  CliprdrClientContext* context = bridge.context;
+  if (context == nullptr || context->ClientFormatList == nullptr)
+    return CHANNEL_RC_OK;
+  CLIPRDR_FORMAT format;
+  CLIPRDR_FORMAT_LIST formatList;
+  std::memset(&format, 0, sizeof(format));
+  std::memset(&formatList, 0, sizeof(formatList));
+  format.formatId = CF_UNICODETEXT;
+  format.formatName = nullptr;
+  formatList.numFormats = 1;
+  formatList.formats = &format;
+  return context->ClientFormatList(context, &formatList);
+}
+
+UINT cliprdrSendLocalText(CliprdrBridge& bridge, UINT32 formatId) {
+  CliprdrClientContext* context = bridge.context;
+  if (context == nullptr || context->ClientFormatDataResponse == nullptr)
+    return CHANNEL_RC_OK;
+  CLIPRDR_FORMAT_DATA_RESPONSE response;
+  std::memset(&response, 0, sizeof(response));
+  response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+  WCHAR* wide = nullptr;
+  size_t width = 0;
+  if (formatId == CF_UNICODETEXT && !bridge.localText.empty())
+    wide = ConvertUtf8NToWCharAlloc(bridge.localText.c_str(),
+                                    bridge.localText.size(), &width);
+  if (wide == nullptr || width == 0) {
+    std::free(wide);
+    // Nothing to paste: an explicit failure response is what the reference
+    // clients send when the requested format is not available.
+    response.common.msgFlags = CB_RESPONSE_FAIL;
+    response.common.dataLen = 0;
+    response.requestedFormatData = nullptr;
+    const UINT error = context->ClientFormatDataResponse(context, &response);
+    if (error != CHANNEL_RC_OK)
+      diagWarn("cliprdr: empty CF_UNICODETEXT response failed [" +
+               std::to_string(error) + "]");
+    else if (formatId != CF_UNICODETEXT)
+      diagWarn("cliprdr: refused unsupported format id " +
+               std::to_string(formatId));
+    return CHANNEL_RC_OK;
+  }
+  // CF_UNICODETEXT is a NUL-terminated UTF-16LE string, so the trailing 0x0000
+  // is part of the payload.
+  const size_t bytes = (width + 1) * sizeof(WCHAR);
+  if (bytes > 0xffffffffu) {
+    std::free(wide);
+    diagWarn("cliprdr: local text exceeds the cliprdr payload limit");
+    return CHANNEL_RC_OK;
+  }
+  response.common.msgFlags = CB_RESPONSE_OK;
+  response.common.dataLen = static_cast<UINT32>(bytes);
+  response.requestedFormatData = reinterpret_cast<const BYTE*>(wide);
+  const UINT error = context->ClientFormatDataResponse(context, &response);
+  if (error != CHANNEL_RC_OK)
+    diagWarn("cliprdr: CF_UNICODETEXT response failed [" +
+             std::to_string(error) + "], " + std::to_string(bytes) + " bytes");
+  else
+    diagWarn("cliprdr: sent CF_UNICODETEXT (" + std::to_string(bytes) +
+             " bytes)");
+  std::free(wide);
+  return error;
+}
+
+UINT cliprdrMonitorReady(CliprdrClientContext* context,
+                         const CLIPRDR_MONITOR_READY* monitorReady) {
+  (void)monitorReady;
+  if (context == nullptr) return CHANNEL_RC_OK;
+  CliprdrBridge* bridge = static_cast<CliprdrBridge*>(context->custom);
+  if (bridge == nullptr) return CHANNEL_RC_OK;
+  bridge->ready = true;
+  UINT error = cliprdrSendCapabilities(*bridge);
+  if (error != CHANNEL_RC_OK) {
+    diagWarn("cliprdr: sending client capabilities failed [" +
+             std::to_string(error) + "]");
+    return error;
+  }
+  error = cliprdrSendFormatList(*bridge);
+  if (error != CHANNEL_RC_OK) {
+    diagWarn("cliprdr: sending CF_UNICODETEXT format list failed [" +
+             std::to_string(error) + "]");
+    return error;
+  }
+  diagWarn("cliprdr: monitor ready, advertised CF_UNICODETEXT (local bytes " +
+           std::to_string(bridge->localText.size()) + ")");
+  return CHANNEL_RC_OK;
+}
+
+UINT cliprdrServerFormatList(CliprdrClientContext* context,
+                             const CLIPRDR_FORMAT_LIST* formatList) {
+  if (context == nullptr || formatList == nullptr) return CHANNEL_RC_OK;
+  CliprdrBridge* bridge = static_cast<CliprdrBridge*>(context->custom);
+  if (bridge == nullptr) return CHANNEL_RC_OK;
+  // Acknowledge the list even when every format is ignored: the server waits
+  // for this response before it treats the clipboard as handed over.
+  if (context->ClientFormatListResponse != nullptr) {
+    CLIPRDR_FORMAT_LIST_RESPONSE response;
+    std::memset(&response, 0, sizeof(response));
+    response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    const UINT error = context->ClientFormatListResponse(context, &response);
+    if (error != CHANNEL_RC_OK)
+      diagWarn("cliprdr: format list response failed [" +
+               std::to_string(error) + "]");
+  }
+  bool hasText = false;
+  if (formatList->formats != nullptr) {
+    for (UINT32 i = 0; i < formatList->numFormats; ++i) {
+      if (formatList->formats[i].formatId == CF_UNICODETEXT) {
+        hasText = true;
+        break;
+      }
+    }
+  }
+  if (!hasText || context->ClientFormatDataRequest == nullptr)
+    return CHANNEL_RC_OK;
+  if (bridge->attempt == nullptr || hostStale(bridge->attempt))
+    return CHANNEL_RC_OK;
+  CLIPRDR_FORMAT_DATA_REQUEST request;
+  std::memset(&request, 0, sizeof(request));
+  request.common.msgType = CB_FORMAT_DATA_REQUEST;
+  request.requestedFormatId = CF_UNICODETEXT;
+  const UINT error = context->ClientFormatDataRequest(context, &request);
+  if (error != CHANNEL_RC_OK) {
+    diagWarn("cliprdr: CF_UNICODETEXT data request failed [" +
+             std::to_string(error) + "]");
+    return error;
+  }
+  diagWarn("cliprdr: server format list has CF_UNICODETEXT (" +
+           std::to_string(formatList->numFormats) + " formats), data requested");
+  return CHANNEL_RC_OK;
+}
+
+UINT cliprdrServerFormatDataRequest(
+    CliprdrClientContext* context,
+    const CLIPRDR_FORMAT_DATA_REQUEST* formatDataRequest) {
+  if (context == nullptr || formatDataRequest == nullptr)
+    return CHANNEL_RC_OK;
+  CliprdrBridge* bridge = static_cast<CliprdrBridge*>(context->custom);
+  if (bridge == nullptr) return CHANNEL_RC_OK;
+  if (bridge->attempt == nullptr || hostStale(bridge->attempt))
+    return CHANNEL_RC_OK;
+  return cliprdrSendLocalText(*bridge, formatDataRequest->requestedFormatId);
+}
+
+UINT cliprdrServerFormatDataResponse(
+    CliprdrClientContext* context,
+    const CLIPRDR_FORMAT_DATA_RESPONSE* formatDataResponse) {
+  if (context == nullptr || formatDataResponse == nullptr)
+    return CHANNEL_RC_OK;
+  CliprdrBridge* bridge = static_cast<CliprdrBridge*>(context->custom);
+  if (bridge == nullptr) return CHANNEL_RC_OK;
+  const UINT32 dataLen = formatDataResponse->common.dataLen;
+  if (formatDataResponse->common.msgFlags != CB_RESPONSE_OK) {
+    diagWarn("cliprdr: remote text response failed, flags " +
+             std::to_string(formatDataResponse->common.msgFlags));
+    return CHANNEL_RC_OK;
+  }
+  if (formatDataResponse->requestedFormatData == nullptr || dataLen == 0)
+    return CHANNEL_RC_OK;
+  if (dataLen > kMaxClipboardWireBytes) {
+    diagWarn("cliprdr: remote text too large (" + std::to_string(dataLen) +
+             " bytes), dropped");
+    return CHANNEL_RC_OK;
+  }
+  if ((dataLen & 1u) != 0) {
+    diagWarn("cliprdr: remote text has an odd byte length (" +
+             std::to_string(dataLen) + "), dropped");
+    return CHANNEL_RC_OK;
+  }
+  if (bridge->attempt == nullptr || hostStale(bridge->attempt))
+    return CHANNEL_RC_OK;
+  // Copy before converting: the payload arrives as a BYTE buffer and WinPR's
+  // converter reads WCHAR units; the nothrow buffer keeps an out-of-memory
+  // condition from throwing through FreeRDP's C callback frames.
+  const size_t units = dataLen / sizeof(WCHAR);
+  WCHAR* wide = new (std::nothrow) WCHAR[units];
+  if (wide == nullptr) {
+    diagWarn("cliprdr: no memory for remote text (" + std::to_string(dataLen) +
+             " bytes), dropped");
+    return CHANNEL_RC_OK;
+  }
+  std::memcpy(wide, formatDataResponse->requestedFormatData,
+              units * sizeof(WCHAR));
+  size_t utf8Size = 0;
+  char* utf8 = ConvertWCharNToUtf8Alloc(wide, units, &utf8Size);
+  delete[] wide;
+  if (utf8 == nullptr) {
+    diagWarn("cliprdr: UTF-16 to UTF-8 conversion failed (" +
+             std::to_string(dataLen) + " bytes)");
+    return CHANNEL_RC_OK;
+  }
+  const RdpHost* host = bridge->attempt->host;
+  if (host != nullptr && host->sinkClipboard != nullptr) {
+    host->sinkClipboard(host->user, bridge->attempt->generation, utf8,
+                        utf8Size);
+    diagWarn("cliprdr: remote text received (" + std::to_string(dataLen) +
+             " wire bytes, " + std::to_string(utf8Size) + " UTF-8 bytes)");
+  }
+  std::free(utf8);
+  return CHANNEL_RC_OK;
 }
 
 bool validDesktop(UINT32 width, UINT32 height) {
@@ -533,12 +846,13 @@ BOOL preConnect(freerdp* instance) {
       instance->context->settings == nullptr)
     return FALSE;
   rdpSettings* settings = instance->context->settings;
-  // This build contains only the drdynvc + rdpei client channels. client-common
-  // otherwise forces rdpdr/cliprdr/an rdpsnd addin at pre-connect time and the
-  // session fails with "Failed to load addins" (see .work/freerdp-spike).
-  // None of them is needed: v1 has no clipboard channel, no audio and no drive
-  // redirection.
-  return freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, FALSE) &&
+  // This build contains drdynvc + rdpei + cliprdr client channels. Clipboard
+  // redirection is wanted (the cliprdr addin is in CLIENT_STATIC_ADDIN_TABLE),
+  // so client-common loads it at pre-connect. The other three RDP8 features are
+  // still disabled: NetworkAutoDetect/SupportHeartbeatPdu/SupportMultitransport
+  // pull in rdpdr (and its drive/printer device redirection), which is not part
+  // of this build. (See .work/freerdp-spike for the original failure.)
+  return freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, TRUE) &&
          freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) &&
          freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
          freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE);
@@ -760,6 +1074,7 @@ UINT32 keysymToScancode(int keysym) {
 
 struct InputBridge {
   RdpAttemptContext* attempt;
+  CliprdrBridge* cliprdr;
   std::map<int, UINT32> pressed;  // keysym -> scancode of the press
   int pointerMask;
   int lastX;
@@ -894,9 +1209,32 @@ void sinkRelease(void* context) {
 }
 
 void sinkClipboard(void* context, const char* text) {
-  (void)text;
   InputBridge* bridge = static_cast<InputBridge*>(context);
-  if (bridge != nullptr) ++bridge->droppedClipboards;
+  if (bridge == nullptr || bridge->attempt == nullptr || text == nullptr)
+    return;
+  RdpAttemptContext* attempt = bridge->attempt;
+  if (hostStale(attempt)) return;
+  CliprdrBridge* cliprdr = bridge->cliprdr;
+  if (cliprdr == nullptr) return;
+  // Keep the newest local text for the next ServerFormatDataRequest even when
+  // the channel is not ready yet: MonitorReady announces whatever is current.
+  setLocalClipboardText(text, cliprdr->localText);
+  if (cliprdr->localText.empty()) return;  // never announce an empty clipboard
+  if (cliprdr->context == nullptr) {
+    // No cliprdr channel on this connection: count the drop so the event loop
+    // can report it once, exactly like the pre-channel build did.
+    ++bridge->droppedClipboards;
+    return;
+  }
+  if (!cliprdr->ready) return;
+  const UINT error = cliprdrSendFormatList(*cliprdr);
+  if (error != CHANNEL_RC_OK) {
+    diagWarn("cliprdr: local CF_UNICODETEXT format list failed [" +
+             std::to_string(error) + "]");
+    return;
+  }
+  diagWarn("cliprdr: local text set (" + std::to_string(cliprdr->localText.size()) +
+           " bytes), format list sent");
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +1249,7 @@ struct Attempt {
   rdpContext* context;
   freerdp* instance;
   RdpAttemptContext* attempt;
+  CliprdrBridge clipboard;
   bool connected;
 
   Attempt(const RdpHost& host, const RdpOptions& options, int generation)
@@ -938,6 +1277,12 @@ struct Attempt {
     attempt->generation = generation;
     attempt->gdiReady = false;
     attempt->sawLogonErrorInfo = false;
+    // A fresh connection starts with no clipboard ownership; the text queued
+    // by ArkTS is drained again by eventLoop() and re-announced.
+    clipboard.context = nullptr;
+    clipboard.attempt = attempt;
+    clipboard.localText.clear();
+    clipboard.ready = false;
     return true;
   }
 
@@ -996,15 +1341,66 @@ struct Attempt {
                               : static_cast<UINT32>(FREERDP_ERROR_NONE);
   }
 
+  // Hook the cliprdr callbacks once the channel has been opened by
+  // freerdp_connect() (client-common opens static channels during
+  // freerdp_channels_post_connect, after PostConnect). The addin's interface is
+  // published in the channel-open data, which the public channel-manager API
+  // returns by channel name; that pointer is the CliprdrClientContext whose
+  // Client* fields are the already-installed send functions.
+  void attachClipboard() {
+    if (context == nullptr || context->channels == nullptr ||
+        attempt == nullptr)
+      return;
+    void* iface = freerdp_channels_get_static_channel_interface(
+        context->channels, CLIPRDR_SVC_CHANNEL_NAME);
+    CliprdrClientContext* cliprdr =
+        static_cast<CliprdrClientContext*>(iface);
+    if (cliprdr == nullptr) return;
+    clipboard.context = cliprdr;
+    clipboard.attempt = attempt;
+    clipboard.ready = false;
+    cliprdr->custom = &clipboard;
+    cliprdr->MonitorReady = cliprdrMonitorReady;
+    cliprdr->ServerFormatList = cliprdrServerFormatList;
+    cliprdr->ServerFormatDataRequest = cliprdrServerFormatDataRequest;
+    cliprdr->ServerFormatDataResponse = cliprdrServerFormatDataResponse;
+  }
+
+  // Unhook before the channel/context are torn down. Idempotent; called from
+  // teardown() so every path (including a failed connect after attach) clears
+  // the back-pointer to this stack object.
+  void detachClipboard() {
+    if (clipboard.context != nullptr) {
+      if (clipboard.context->custom == &clipboard)
+        clipboard.context->custom = nullptr;
+      clipboard.context->MonitorReady = nullptr;
+      clipboard.context->ServerFormatList = nullptr;
+      clipboard.context->ServerFormatDataRequest = nullptr;
+      clipboard.context->ServerFormatDataResponse = nullptr;
+    }
+    clipboard.context = nullptr;
+    clipboard.attempt = nullptr;
+    clipboard.ready = false;
+  }
+
   void eventLoop() {
     if (attempt == nullptr) return;
     InputBridge bridge;
     bridge.attempt = attempt;
+    bridge.cliprdr = &clipboard;
     bridge.pointerMask = 0;
     bridge.lastX = 0;
     bridge.lastY = 0;
     bridge.droppedClipboards = 0;
     bridge.unmappedKeys = 0;
+    // Attach before pumping the channel message queue: a MonitorReady that
+    // already arrived is dispatched by the first freerdp_check_event_handles()
+    // call below, with these callbacks in place.
+    attachClipboard();
+    if (clipboard.context != nullptr)
+      diagWarn("cliprdr: channel interface attached");
+    else
+      diagWarn("cliprdr: channel not available on this connection");
     // Drop pointer/key input queued for a previous connection and start with
     // nothing held (same reset as the VNC loop before it reads the socket).
     bridge.appliedRelease = host.prepareInput(host.user);
@@ -1030,12 +1426,12 @@ struct Attempt {
       if (freerdp_shall_disconnect_context(context)) break;
     }
     if (bridge.droppedClipboards > 0) {
-      // No cliprdr channel in this build; the text is reported as delivered to
-      // the caller, so say plainly that it could not be forwarded. Never log
-      // the text itself.
+      // The text is reported as delivered to the caller, so say plainly that
+      // it could not be forwarded (cliprdr channel missing or not ready).
+      // Never log the text itself.
       std::fprintf(stderr,
                    "tianguan: rdp dropped %zu clipboard item(s): clipboard "
-                   "channel not built\n",
+                   "channel unavailable\n",
                    bridge.droppedClipboards);
       std::fflush(stderr);
     }
@@ -1050,6 +1446,7 @@ struct Attempt {
 
   void teardown() {
     if (context == nullptr) return;
+    detachClipboard();
     if (connected) {
       connected = false;
       // Both calls are also safe on an already-closed connection; abort first
@@ -1088,7 +1485,7 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       host.commitFrame == nullptr || host.setCursor == nullptr ||
       host.setCursorBlank == nullptr || host.setCursorPos == nullptr ||
       host.prepareInput == nullptr || host.drainInput == nullptr ||
-      host.consumeFullRequest == nullptr) {
+      host.consumeFullRequest == nullptr || host.sinkClipboard == nullptr) {
     return;  // bridge not fully wired: fail closed instead of crashing
   }
   int lastApplied = 0;

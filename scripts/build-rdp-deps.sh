@@ -230,6 +230,12 @@ patch -d "$freerdp_copy" -p1 --batch --forward \
     exit 1
   }
 
+# Channel notes: 剪贴板通道（RDP 双向文本剪贴板）is enabled as
+#   -DCHANNEL_CLIPRDR=ON -DCHANNEL_CLIPRDR_CLIENT=ON -DCHANNEL_CLIPRDR_SERVER=OFF.
+# cliprdr is a static channel: its client OBJECT library is aggregated into the
+# generated freerdp-channels-client sources and registered through
+# CLIENT_STATIC_ADDIN_TABLE, so the code is archived into libfreerdp-client3.a
+# (not just a -DCHANNEL_CLIPRDR define). The server side stays OFF.
 cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -250,7 +256,8 @@ cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DWITH_UNICODE_BUILTIN=ON -DWITH_CHANNELS=ON -DWITH_CLIENT_CHANNELS=ON \
   -DCHANNEL_DRDYNVC=ON -DCHANNEL_DRDYNVC_CLIENT=ON -DCHANNEL_DRDYNVC_SERVER=OFF \
   -DCHANNEL_RDPEI=ON -DCHANNEL_RDPEI_CLIENT=ON -DCHANNEL_RDPEI_SERVER=OFF \
-  -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_CLIPRDR=OFF -DCHANNEL_DISP=OFF \
+  -DCHANNEL_CLIPRDR=ON -DCHANNEL_CLIPRDR_CLIENT=ON -DCHANNEL_CLIPRDR_SERVER=OFF \
+  -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_DISP=OFF \
   -DCHANNEL_DRIVE=OFF -DCHANNEL_ECHO=OFF -DCHANNEL_ENCOMSP=OFF -DCHANNEL_GEOMETRY=OFF \
   -DCHANNEL_LOCATION=OFF -DCHANNEL_PARALLEL=OFF -DCHANNEL_PRINTER=OFF -DCHANNEL_RAIL=OFF \
   -DCHANNEL_RDPDR=OFF -DCHANNEL_RDPECAM=OFF -DCHANNEL_RDPEMSC=OFF -DCHANNEL_RDPGFX=OFF \
@@ -353,7 +360,7 @@ mkdir -p "$prefix/share"
     "${urls[1]}" "${sha256[1]}"
   printf '\nFreeRDP: 3.9.0\n  Commit: %s\n  Source: %s\n' "$freerdp_commit" "$freerdp_src"
   printf '  CMake: WITH_CLIENT=ON WITH_SERVER=OFF, SDL/X11/Wayland/FFmpeg/ALSA/Pulse/CUPS/PCSC/FUSE/KRB5/SAMPLE/MANPAGES off,\n'
-  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei client channels on,\n'
+  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr client channels on,\n'
   printf '         BUILD_SHARED_LIBS=OFF, CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF, CMAKE_POSITION_INDEPENDENT_CODE=ON,\n'
   printf '         OPENSSL_ROOT_DIR/ZLIB_ROOT=%s, OPENSSL_USE_STATIC_LIBS=ON.\n' "$prefix"
   printf '  Source patch: winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'

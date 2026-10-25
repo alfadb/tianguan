@@ -64,7 +64,9 @@ struct RdpInputSink {
   // releaseSessionInput() moved the release epoch: release every key/button
   // this attempt pressed, exactly like the VNC session loop does.
   void (*release)(void* ctx) = nullptr;
-  // RDP has no clipboard channel in this build; implementations drop the text.
+  // Local clipboard text copied by ArkTS (setClipboard). The backend keeps it
+  // as the text to serve the next cliprdr format-data request and announces it
+  // to the server with a CF_UNICODETEXT format list.
   void (*clipboard)(void* ctx, const char* text) = nullptr;
 };
 
@@ -110,6 +112,13 @@ struct RdpHost {
   // requestFullFrame(): the next committed update must be treated as covering
   // the whole desktop.
   void (*consumeFullRequest)(void* user) = nullptr;
+
+  // Remote clipboard text received through cliprdr (CF_UNICODETEXT), already
+  // converted to UTF-8 and NUL-free. `length` may be 0. Invoked on the session
+  // thread; the pointer is only valid for the duration of the call. The adapter
+  // re-checks the generation under the clipboard lock before storing it.
+  void (*sinkClipboard)(void* user, int generation, const char* text,
+                        size_t length) = nullptr;
 };
 
 // Blocks until the host asks to stop. While running it performs the same
