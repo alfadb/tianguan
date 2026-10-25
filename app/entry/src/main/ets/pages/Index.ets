@@ -17,6 +17,7 @@
  * of re-creating every card (the previous key embedded registryVersion).
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { display } from '@kit.ArkUI';
 import type { common } from '@kit.AbilityKit';
 import {
   createSession, diagMultiSessionAvailable
@@ -38,6 +39,14 @@ import { closeRemoteWindow, openRemoteWindow } from '../windows/RemoteWindows';
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
 const HINT_TIMEOUT_MS: number = 5000;
+/**
+ * Below this window width (vp) the two-column layout collapses: the group
+ * column is replaced by one horizontally scrollable chip row and the cards get
+ * their stacked narrow layout. 600 vp is a phone in portrait (376 vp on the
+ * PLA-AL10) or a narrow phone-like window on 2in1; a normal PC window is
+ * wider.
+ */
+const NARROW_BREAKPOINT_VP: number = 600;
 
 /** Aggregated per-connection status for one list row. */
 interface RowStatus {
@@ -89,9 +98,12 @@ class ConnectionView {
 @Component
 struct ConnectionCard {
   @ObjectLink view: ConnectionView;
+  /** True below NARROW_BREAKPOINT_VP: stacked layout, actions on their own row. */
+  @Prop narrow: boolean = false;
   onPrimary: (id: string) => void = (): void => {};
   onReconnect: (id: string) => void = (): void => {};
   onNewSession: (id: string) => void = (): void => {};
+  onDisconnect: (id: string) => void = (): void => {};
   onEdit: (id: string) => void = (): void => {};
   onCopy: (id: string) => void = (): void => {};
   onMove: (id: string) => void = (): void => {};
@@ -148,6 +160,15 @@ struct ConnectionCard {
           this.onNewSession(this.view.id);
         }
       });
+      // Ending the session from the list matters most on a phone: the session
+      // window has no title bar there, so its own close affordance is all the
+      // user has besides this menu row.
+      items.push({
+        value: '断开',
+        action: (): void => {
+          this.onDisconnect(this.view.id);
+        }
+      });
     }
     items.push({
       value: '编辑',
@@ -178,30 +199,36 @@ struct ConnectionCard {
 
   build() {
     Column({ space: 8 }) {
-      Row({ space: 12 }) {
-        Column({ space: 4 }) {
-          Text(this.view.name)
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.protocolEndpoint())
-            .fontSize(13)
-            .fontColor($r('app.color.text_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Row({ space: 6 }) {
+      if (this.narrow) {
+        // Narrow: identity on its own full-width block (otherwise the fixed
+        // status + button + menu eat the whole row and layoutWeight(1) squeezes
+        // name/endpoint to 0 width), actions on a second row.
+        Column({ space: 6 }) {
+          Column({ space: 2 }) {
+            Text(this.view.name)
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+            Text(this.protocolEndpoint())
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
             Text(this.view.lastConnectedText)
               .fontSize(12)
               .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
           }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          .width('100%')
 
-        Column({ space: 2 }) {
-          Row({ space: 6 }) {
+          Row({ space: 8 }) {
             Circle({ width: 8, height: 8 })
               .fill(this.statusColor())
             Text(this.view.statusLabel)
@@ -209,29 +236,85 @@ struct ConnectionCard {
               .fontColor(this.statusColor())
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Button(this.primaryLabel())
+              .fontSize(14)
+              .fontColor(Color.White)
+              .backgroundColor($r('app.color.brand'))
+              .height(36)
+              .borderRadius(12)
+              .onClick(() => {
+                this.onPrimary(this.view.id);
+              })
+            Text('⋯')
+              .fontSize(18)
+              .fontColor($r('app.color.text_secondary'))
+              .width(36)
+              .height(36)
+              .textAlign(TextAlign.Center)
+              .borderRadius(12)
+              .bindMenu(this.menuItems())
           }
+          .width('100%')
         }
-        .justifyContent(FlexAlign.End)
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+      } else {
+        Row({ space: 12 }) {
+          Column({ space: 4 }) {
+            Text(this.view.name)
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(this.protocolEndpoint())
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Row({ space: 6 }) {
+              Text(this.view.lastConnectedText)
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+            }
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
 
-        Button(this.primaryLabel())
-          .fontSize(14)
-          .fontColor(Color.White)
-          .backgroundColor($r('app.color.brand'))
-          .height(40)
-          .borderRadius(12)
-          .onClick(() => {
-            this.onPrimary(this.view.id);
-          })
-        Text('⋯')
-          .fontSize(18)
-          .fontColor($r('app.color.text_secondary'))
-          .width(40)
-          .height(40)
-          .textAlign(TextAlign.Center)
-          .borderRadius(12)
-          .bindMenu(this.menuItems())
+          Column({ space: 2 }) {
+            Row({ space: 6 }) {
+              Circle({ width: 8, height: 8 })
+                .fill(this.statusColor())
+              Text(this.view.statusLabel)
+                .fontSize(13)
+                .fontColor(this.statusColor())
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+          }
+          .justifyContent(FlexAlign.End)
+
+          Button(this.primaryLabel())
+            .fontSize(14)
+            .fontColor(Color.White)
+            .backgroundColor($r('app.color.brand'))
+            .height(40)
+            .borderRadius(12)
+            .onClick(() => {
+              this.onPrimary(this.view.id);
+            })
+          Text('⋯')
+            .fontSize(18)
+            .fontColor($r('app.color.text_secondary'))
+            .width(40)
+            .height(40)
+            .textAlign(TextAlign.Center)
+            .borderRadius(12)
+            .bindMenu(this.menuItems())
+        }
+        .width('100%')
       }
-      .width('100%')
 
       if (this.view.statusKind === 'trust') {
         Column({ space: 8 }) {
@@ -273,6 +356,13 @@ struct Index {
   @State private searchText: string = '';
   @State private hint: string = '';
   @State private hintIsError: boolean = false;
+  /**
+   * Width of this page's own window in vp (not the screen's): on 2in1 the
+   * window can be resized narrower than the display. Seeded from the display
+   * in aboutToAppear so the first frame already uses the right layout, then
+   * kept current by the root's onAreaChange.
+   */
+  @State private viewportWidth: number = 0;
   // Form overlay state.
   @State private formVisible: boolean = false;
   @State private editingId: string = '';
@@ -314,6 +404,7 @@ struct Index {
   private failureText: Map<string, string> = new Map<string, string>();
 
   aboutToAppear(): void {
+    this.viewportWidth = this.initialViewportWidth();
     if (!this.started) {
       this.started = true;
       this.connections = savedConnections();
@@ -333,6 +424,27 @@ struct Index {
   aboutToDisappear(): void {
     removeSessionsListener(this.listener);
     this.clearHintTimer();
+  }
+
+  // -------------------------------------------------------------------------
+  // Layout breakpoint.
+  // -------------------------------------------------------------------------
+
+  /** Screen width in vp, used only before the first onAreaChange lands. */
+  private initialViewportWidth(): number {
+    try {
+      const area = display.getDefaultDisplaySync();
+      if (area.width > 0 && area.densityPixels > 0) {
+        return area.width / area.densityPixels;
+      }
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '读取屏幕宽度失败，按宽屏布局：%{public}s', String(error));
+    }
+    return NARROW_BREAKPOINT_VP;
+  }
+
+  private isNarrow(): boolean {
+    return this.viewportWidth > 0 && this.viewportWidth < NARROW_BREAKPOINT_VP;
   }
 
   // -------------------------------------------------------------------------
@@ -712,6 +824,29 @@ struct Index {
     this.showHint('已删除连接');
   }
 
+  /**
+   * Ends every live session of this connection but keeps the connection
+   * itself (same close path as deleteEntry, minus the deletion). The card drops
+   * back to 未连接 through the registry notification.
+   */
+  private disconnectEntry(entry: ConnectionEntry): void {
+    const sessions = sessionsForConnection(entry.id);
+    if (sessions.length === 0) {
+      this.showHint('该连接没有活跃会话');
+      return;
+    }
+    for (let i = 0; i < sessions.length; i++) {
+      const sessionId = sessions[i].sessionId;
+      closeSessionById(sessionId);
+      closeRemoteWindow(sessionId).then((): void => {}).catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '关闭会话远程窗口失败：%{public}s', String(error));
+      });
+    }
+    this.failureText.delete(entry.id);
+    this.syncViews();
+    this.showHint('已断开：' + entry.name);
+  }
+
   private openMove(entry: ConnectionEntry): void {
     this.moveTargetId = entry.id;
     this.moveGroupText = entry.group;
@@ -819,6 +954,13 @@ struct Index {
     const entry = findConnection(id);
     if (entry !== undefined) {
       this.deleteEntry(entry);
+    }
+  }
+
+  private disconnectEntryById(id: string): void {
+    const entry = findConnection(id);
+    if (entry !== undefined) {
+      this.disconnectEntry(entry);
     }
   }
 
@@ -1144,6 +1286,24 @@ struct Index {
     })
   }
 
+  /** Narrow-screen replacement for the group column: one chip per group. */
+  @Builder
+  private groupChip(label: string, key: string, count: number) {
+    Text(label + ' · ' + String(count))
+      .fontSize(13)
+      .fontColor(this.selectedGroup === key
+        ? Color.White : $r('app.color.text_primary'))
+      .height(32)
+      .padding({ left: 14, right: 14 })
+      .borderRadius(16)
+      .maxLines(1)
+      .backgroundColor(this.selectedGroup === key
+        ? $r('app.color.brand') : $r('app.color.chip_background'))
+      .onClick(() => {
+        this.selectedGroup = key;
+      })
+  }
+
   @Builder
   private formOverlay() {
     Column({ space: 12 }) {
@@ -1335,55 +1495,107 @@ struct Index {
   build() {
     Stack() {
       Column() {
-        // Top bar: search + new.
-        Row({ space: 12 }) {
-          Text('天关').fontSize(20).fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-          Row({ space: 8 }) {
+        // Top bar: search + new. Narrow screens stack the two into two rows so
+        // neither the search field nor the button is squeezed off the edge.
+        if (this.isNarrow()) {
+          Column({ space: 8 }) {
+            Row({ space: 12 }) {
+              Text('天关').fontSize(20).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+                .layoutWeight(1)
+              Button('新建连接')
+                .fontSize(14)
+                .height(40)
+                .borderRadius(12)
+                .backgroundColor($r('app.color.brand'))
+                .fontColor(Color.White)
+                .onClick(() => { this.openFormNew(); })
+            }
+            .width('100%')
             TextInput({ text: this.searchText, placeholder: '搜索名称或 host:port' })
               .height(40)
-              .layoutWeight(1)
+              .width('100%')
               .backgroundColor($r('app.color.chip_background'))
               .onChange((value: string) => { this.searchText = value; })
-            Button('新建连接')
-              .fontSize(14)
-              .height(40)
-              .borderRadius(12)
-              .backgroundColor($r('app.color.brand'))
-              .fontColor(Color.White)
-              .onClick(() => { this.openFormNew(); })
           }
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-
-        Row({ space: 0 }) {
-          // Left group column.
-          Column({ space: 4 }) {
-            Scroll() {
-              Column({ space: 4 }) {
-                ForEach(this.groupsWithCounts(), (group: string) => {
-                  if (group === '__all__') {
-                    this.groupItem('全部', '__all__', this.groupCount(group))
-                  } else if (group === UNGROUPED) {
-                    this.groupItem(UNGROUPED, UNGROUPED, this.groupCount(group))
-                  } else {
-                    this.groupItem(group, group, this.groupCount(group))
-                  }
-                }, (group: string) => group + '#' + String(this.groupCount(group)) +
-                  (this.selectedGroup === group ? '#selected' : ''))
-              }
-              .width('100%')
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        } else {
+          Row({ space: 12 }) {
+            Text('天关').fontSize(20).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 8 }) {
+              TextInput({ text: this.searchText, placeholder: '搜索名称或 host:port' })
+                .height(40)
+                .layoutWeight(1)
+                .backgroundColor($r('app.color.chip_background'))
+                .onChange((value: string) => { this.searchText = value; })
+              Button('新建连接')
+                .fontSize(14)
+                .height(40)
+                .borderRadius(12)
+                .backgroundColor($r('app.color.brand'))
+                .fontColor(Color.White)
+                .onClick(() => { this.openFormNew(); })
             }
-            .scrollBar(BarState.Off)
             .layoutWeight(1)
           }
-          .width(148)
-          .height('100%')
-          .padding({ left: 8, right: 8, top: 4, bottom: 8 })
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        }
+
+        // Narrow: the group column becomes one horizontally scrollable chip row.
+        if (this.isNarrow()) {
+          Scroll() {
+            Row({ space: 8 }) {
+              ForEach(this.groupsWithCounts(), (group: string) => {
+                if (group === '__all__') {
+                  this.groupChip('全部', '__all__', this.groupCount(group))
+                } else if (group === UNGROUPED) {
+                  this.groupChip(UNGROUPED, UNGROUPED, this.groupCount(group))
+                } else {
+                  this.groupChip(group, group, this.groupCount(group))
+                }
+              }, (group: string) => group + '#' + String(this.groupCount(group)) +
+                (this.selectedGroup === group ? '#selected' : ''))
+            }
+            .padding({ left: 16, right: 16 })
+          }
+          .scrollable(ScrollDirection.Horizontal)
+          .scrollBar(BarState.Off)
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
           .backgroundColor($r('app.color.side_background'))
-          .alignItems(HorizontalAlign.Start)
+        }
+
+        Row({ space: 0 }) {
+          // Left group column (wide layout only).
+          if (!this.isNarrow()) {
+            Column({ space: 4 }) {
+              Scroll() {
+                Column({ space: 4 }) {
+                  ForEach(this.groupsWithCounts(), (group: string) => {
+                    if (group === '__all__') {
+                      this.groupItem('全部', '__all__', this.groupCount(group))
+                    } else if (group === UNGROUPED) {
+                      this.groupItem(UNGROUPED, UNGROUPED, this.groupCount(group))
+                    } else {
+                      this.groupItem(group, group, this.groupCount(group))
+                    }
+                  }, (group: string) => group + '#' + String(this.groupCount(group)) +
+                    (this.selectedGroup === group ? '#selected' : ''))
+                }
+                .width('100%')
+              }
+              .scrollBar(BarState.Off)
+              .layoutWeight(1)
+            }
+            .width(148)
+            .height('100%')
+            .padding({ left: 8, right: 8, top: 4, bottom: 8 })
+            .backgroundColor($r('app.color.side_background'))
+            .alignItems(HorizontalAlign.Start)
+          }
 
           // Right connection list.
           Column() {
@@ -1415,6 +1627,7 @@ struct Index {
                   ForEach(this.filteredViews(), (view: ConnectionView) => {
                     ConnectionCard({
                       view: view,
+                      narrow: this.isNarrow(),
                       onPrimary: (id: string): void => {
                         this.primaryActionById(id);
                       },
@@ -1423,6 +1636,9 @@ struct Index {
                       },
                       onNewSession: (id: string): void => {
                         this.newSessionById(id);
+                      },
+                      onDisconnect: (id: string): void => {
+                        this.disconnectEntryById(id);
                       },
                       onEdit: (id: string): void => {
                         this.editEntryById(id);
@@ -1501,5 +1717,14 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    // This window's own width, not the display's: a narrowed 2in1 window uses
+    // the phone layout too. The assignment only happens on a real width change,
+    // so this cannot re-trigger itself in a loop.
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      const width = Number(newValue.width);
+      if (width > 0 && width !== this.viewportWidth) {
+        this.viewportWidth = width;
+      }
+    })
   }
 }

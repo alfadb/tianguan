@@ -36,6 +36,9 @@
         startWindowIcon: '$media:app_icon',
         startWindowBackground: '$color:start_window_background',
         label: '$string:app_name',
+        // Follow the device orientation; the list layout switches on its own
+        // window width (onAreaChange), so rotating re-lays it out.
+        orientation: 'auto_rotation',
         exported: true,
         skills: [{ entities: ['entity.system.home'], actions: ['ohos.want.action.home'] }]
       },
@@ -52,6 +55,9 @@
         startWindowIcon: '$media:app_icon',
         startWindowBackground: '$color:start_window_background',
         label: '$string:app_name',
+        // Rotate with the phone like the main window. On a desktop display this
+        // is inert; the session window keeps the size RemoteAbility gives it.
+        orientation: 'auto_rotation',
         exported: false,
         launchType: 'multiton'
       }

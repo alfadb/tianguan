@@ -12,10 +12,14 @@
  * stays unmounted. There is no "last window", FIFO or "first registry session"
  * fallback.
  *
- * The page is pure picture: no title row, no disconnect button and no padding,
- * so the picture fills the whole window. The connection name belongs to the
- * window title (set by RemoteAbility), and the disconnect path is closing that
- * window — never an action inside this page.
+ * The page is pure picture: no title row, no disconnect button, no overlay and
+ * no padding, so nothing covers the remote picture. The connection name belongs
+ * to the window title (set by RemoteAbility). On a desktop the window's
+ * title-bar X is the disconnect path. A phone has no title bar, so there the
+ * system back action (onBackPress) is the disconnect: it ends this session and
+ * closes this window instead of merely backgrounding it, through the same
+ * programmatic path the connection list uses. Losing the view without a back
+ * action (minimise, another window on top) still must NOT disconnect.
  *
  * Presentation (USE_GL_RENDER = true): an XComponent(SURFACE) whose surface is
  * attached, per session, to the native EGL/GLES renderer (app/native/render.cxx
@@ -36,9 +40,9 @@
  * drives the status text, the trust-required panel and the clipboard edge
  * (clipboard.version -> clipboard/TianguanClipboard); frames no longer depend
  * on it in the GL mode. The local cursor follows pointer events directly; the
- * poll only re-places it after a shape or size change. Two 2 s hilog summaries
- * report the render statistics ("TianguanPerf", info) and the poll stage
- * timings ("TianguanPoll", debug: sessionStatus / applyStatus /
+ * poll only re-places it after a shape or size change. Two 2 s debug-level
+ * hilog summaries report the render statistics ("TianguanPerf") and the poll
+ * stage timings ("TianguanPoll": sessionStatus / applyStatus /
  * pollRenderStats). The poll slows to 1 s
  * (status only) while the page is hidden, and the native renderer is parked
  * for that time.
@@ -56,12 +60,12 @@ import {
   SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
-import { findSession, markWindowOpen } from '../model/SessionRegistry';
+import { findSession, markWindowOpen, closeSessionById } from '../model/SessionRegistry';
 import { findConnection, pinKeyFor, trustFingerprint } from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession, clipboardSetSessionVisible,
   clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
-import { sessionKeyForWindow } from '../windows/RemoteWindows';
+import { closeRemoteWindow, sessionKeyForWindow } from '../windows/RemoteWindows';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -163,6 +167,9 @@ struct Remote {
   private lastRemoteY: number = -1;
   private disposed: boolean = false;
   private tornDown: boolean = false;
+  // A back press already asked this window to disconnect/close. A second back
+  // press while that is still in flight must not be swallowed again.
+  private backCloseRequested: boolean = false;
   private pageVisible: boolean = true;
   private lastState: string = '';
   // Single in-flight render: the Canvas 30 ms poll must never start
@@ -1255,8 +1262,8 @@ struct Remote {
     return (micros / 1000).toFixed(2);
   }
 
-  // One info line every 2 s with the rendering segments. Timing never changes
-  // the rendering path (no added await or synchronization point).
+  // One debug-level line every 2 s with the rendering segments. Timing never
+  // changes the rendering path (no added await or synchronization point).
   private maybeLogPerf(): void {
     const now = Remote.nowUs();
     if (this.perfWindowStart <= 0) {
@@ -1296,11 +1303,11 @@ struct Remote {
         ',swapFail:' + this.renderSwapFailures +
         ',tex:' + this.renderTexW + 'x' + this.renderTexH +
         (this.lastRenderError.length > 0 ? ',error:' + this.lastRenderError : '') + '}' : '');
-    // Debug level: this is a periodic (2 s) timing summary, not an error. The
+    // Debug level: these are periodic (2 s) timing summaries, not errors. The
     // default log level stays quiet; raise it only when diagnosing a stall.
-    // Segments are sessionStatus (sync NAPI + JSON parse), applyStatus (ArkUI
-    // state writes) and pollRenderStats (sync NAPI read); n is the number of
-    // polls in the window.
+    // The TianguanPoll segments are sessionStatus (sync NAPI + JSON parse),
+    // applyStatus (ArkUI state writes) and pollRenderStats (sync NAPI read);
+    // n is the number of polls in the window.
     const pollLine = 'TianguanPoll n=' + this.perfOnceCount +
       ' avg=' + Remote.perfAvg(this.perfOnceSum, this.perfOnceCount) +
       'ms max=' + Remote.perfMs(this.perfOnceMax) +
@@ -1312,7 +1319,7 @@ struct Remote {
       ' render=' + Remote.perfAvgMax(this.perfRenderSum, this.perfRenderCount,
         this.perfRenderMax);
     hilog.debug(DOMAIN, TAG, '%{public}s', pollLine);
-    hilog.info(DOMAIN, TAG, '%{public}s', line);
+    hilog.debug(DOMAIN, TAG, '%{public}s', line);
     this.perfWindowStart = now;
     this.perfPollSum = 0;
     this.perfPollCount = 0;
@@ -1670,6 +1677,59 @@ struct Remote {
     } catch (error) {
       hilog.warn(DOMAIN, TAG, '返回连接列表失败：%{public}s', String(error));
     }
+  }
+
+  /**
+   * The system back action on a session window (phone back key / back gesture).
+   *
+   * The page is router-managed (@Entry), so onBackPress is the supported hook.
+   * Returning true means this page handles the return itself: it does NOT let
+   * the platform merely background the window while the session keeps running
+   * (that was the phone's only behaviour without a title bar). Instead it takes
+   * the same "closing the window = disconnecting" path as the desktop title-bar
+   * X: close this session, then terminate this window.
+   *
+   * The session id is this window's own binding, so a back press can never close
+   * another session. A second back press while the close is still in flight
+   * falls back to the platform default rather than trapping the user on a page
+   * whose own close did not complete.
+   */
+  onBackPress(): boolean {
+    if (this.sessionId.length === 0) {
+      // Nothing was ever bound to this window: just leave.
+      this.leavePage();
+      return true;
+    }
+    if (this.backCloseRequested) {
+      return false;
+    }
+    this.backCloseRequested = true;
+    this.endSessionAndWindow();
+    return true;
+  }
+
+  /**
+   * Ends this page's session and closes its window. This is exactly the path
+   * the connection list's 断开 uses (`closeSessionById` + `closeRemoteWindow`):
+   * the card drops back to 未连接 immediately, the window terminates itself via
+   * RemoteAbility's programmatic-close flag (onDestroy then only drops the
+   * window instead of closing a second time), and closeRemoteWindow falls back
+   * to destroyWindow() if the instance does not react. teardown() runs first so
+   * the renderer and input are already parked when the window goes away.
+   */
+  private endSessionAndWindow(): void {
+    const sessionId = this.sessionId;
+    if (sessionId.length === 0) {
+      this.leavePage();
+      return;
+    }
+    this.teardown();
+    closeSessionById(sessionId);
+    closeRemoteWindow(sessionId).then((): void => {}).catch((error: Error): void => {
+      hilog.warn(DOMAIN, TAG, '返回时关闭会话窗口失败，直接销毁本窗口：%{public}s',
+        String(error));
+      this.leavePage();
+    });
   }
 
   build() {

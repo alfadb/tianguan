@@ -286,6 +286,17 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 
 边界：Dock 无法为每个会话显示独立图标（平台按应用合并）；窗口选择器比「直接点 Dock 会话图标」多一次选卡片。注册表是进程内状态，进程重启后自然失效。窗口名由系统分配，重开同一会话会得到新窗口名。关窗即断会话是产品约定，已在真机验证（见文末「验证边界」）。
 
+## 手机形态与旋转（2026-10-25）
+
+手机（PLA-AL10，`192.168.50.199:37193`）与 PC（SLM-W32）共用同一套界面：PC 的宽屏布局与「关闭窗口即断开」不变，手机按窗口宽度自适应，并用系统返回结束会话。
+
+- **窄屏断点**：`Index.ets:49` 的 `NARROW_BREAKPOINT_VP` 为 600 vp，比较的是**本窗口**宽度而不是屏幕宽度（2in1 窗口可以比屏幕窄）：根 Column 的 `onAreaChange`（`Index.ets:1723`）把实际宽度写进 `viewportWidth`，`isNarrow()`（`Index.ets:446`）据此切换。`aboutToAppear` 先按 `display.getDefaultDisplaySync()` 的屏宽/密度给初值，首帧就是正确的布局，之后由 `onAreaChange` 按真实宽度更新。
+- **窄屏布局**：小于 600 vp 时，左侧 148 vp 分组栏隐藏，改为顶部一行可横向滚动的分组 chips（`groupChip`，`Index.ets:1291`）；顶栏拆两行（「天关」+「新建连接」一行，搜索框独占一行）；连接卡片改两行（`@Prop narrow`，`Index.ets:102`）：第一行名称、`协议 地址`、时间各占满整行，第二行状态、主按钮、「⋯」（`⋯` 用 36 vp 固定宽度，不再被挤出屏幕）。宽屏仍是原来的左侧分组栏 + 卡片单行布局。
+- **手机实测（376×809 vp）**：卡片名称 `62`、`VNC 192.168.50.62:5901`、时间、状态、主按钮与「⋯」全部可见且在屏内；此前被 `layoutWeight(1)` 压成 0 宽的名称/地址恢复显示，「⋯」也不再被裁切。
+- **手机结束会话：返回即断开**：远程画面**不叠加任何控件**（没有标题行、关闭按钮或边距），避免遮挡画面；PC 仍用窗口标题栏的 X 关闭（关窗即断开）。手机没有标题栏，因此 `Remote` 页在 `onBackPress`（`Remote.ets:1697`）里主动结束本窗口的会话并关窗：`teardown()` 后调用 `closeSessionById(sessionId)` + `closeRemoteWindow(sessionId)`（`endSessionAndWindow`，`Remote.ets:1720`），与列表「断开」走同一条程序化路径。返回 `true` 表示本页已处理；关闭请求在飞时第二次返回交回平台默认，不会把用户困在页面上。实测按系统返回键或右边缘返回手势后，到 62:5901 的连接从 ESTABLISHED 变 TIME_WAIT，卡片回到「未连接」，不是只退到后台。
+- **列表「断开」**：卡片「⋯」菜单新增「断开」（`Index.ets:167`），仅在该连接有活跃会话时出现；它在列表页、不遮挡画面，作为第二种入口，实测有效。
+- **屏幕旋转**：`module.json5:41` / `module.json5:60` 给 `EntryAbility` 与 `RemoteAbility` 都加 `orientation: 'auto_rotation'`。手机手动旋转后实测屏幕由 1316×2832 变为 2832×1316，主界面随窗口宽度自动切到宽屏（左侧分组栏回归、卡片单行），远程窗口的 contain 画面按新 surface 尺寸重铺，无拉伸。
+
 ## RDP 接入（2026-10-24）
 
 - **ArkTS → 原生链路**：`connect()` 组装 `SessionOptions` 时按协议分流。RDP 条目带 `protocol: "rdp"`，并在非空时带 `username`/`domain`；密码仍从系统密钥库的 `tianguan:rdp:<host>:<port>` 别名读取（`loadPassword(entry)`）。VNC 条目不传 `protocol`（缺省即 VNC），`security`（None 语义）只在 VNC 分支设置；`expectedFingerprint`（`vnc-pins.json` 信任库）两种协议都会设，键由 `pinKeyFor(entry)` 给出：RDP 用 `rdp:<host>:<port>`，VNC 保持旧键 `<host>:<port>`，因此同地址的 VNC 与 RDP 指纹互不覆盖、VNC 旧指纹继续有效。字段定义见 `app/entry/src/main/ets/diag/SessionApi.ets` 的 `SessionOptions`，契约见 [docs/napi-contract.md](../docs/napi-contract.md)。原来的「RDP 连接尚未接入」拦截（`connect()` 与 `reconnectEntry()` 各一处）已删除。
@@ -357,8 +368,8 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 
 - 原生每秒聚合一次，在 `sessionStatus` JSON 末尾新增 `perf` 对象（只追加、不改既有字段）：`windowMs`、`frames`（该秒提交的 framebuffer update 数）、`delivered`（该秒成功交付的帧数），以及 `decode` / `convert` / `pixWait` / `commit` / `takeFrame` 五组 `{n, mean, p50, max}`。耗时单位是微秒；`decode` 是解码 flush 到转换/拷贝前，`convert` 是把接收矩形转成 BGRA 镜像像素（格式可直接复用时是逐像素 4 字节拷贝并置 alpha=255，否则是 RGB→BGRA 转换），`pixWait` 是提交前等像素锁的时间，`commit` 是持锁写入整屏镜像并推进版本的时间，`takeFrame` 是每次取帧调用（含返回 `NONE` 的调用）。每组最多保留 512 个样本，不逐帧刷日志。
 - 像素格式：`perf` 之后另有只追加的 `pf` 对象，报告 framebuffer 实际协商到的格式 `{bpp, depth, redMax, greenMax, blueMax, bigEndian, redShift, greenShift, blueShift}`（来自 `framebuffer->getPF()`；首个 framebuffer 建立前全为 0）。当其为 32bpp、小端、`redMax/greenMax/blueMax=255`、`redShift/greenShift/blueShift=16/8/0`（即内存里的 BGRX）时，原生直接把每行拷进 BGRA 镜像并跳过 `rgbFromBuffer` 与逐像素通道重排；**alpha 写 255，不依赖渲染端忽略 alpha**：服务端的 X 填充字节不是 alpha 值（Xvnc 实测为 0），即使 PixelMap 声明 `BGRA_8888` + `OPAQUE`，也不把「ArkUI/Canvas 会忽略 alpha」当作前提，拷贝时逐个像素 `| 0xFF000000`。其它格式仍走原转换路径，只把每帧新建的 `row`/`converted` 改为复用缓冲。
-- ArkTS 侧用单调时钟测 `takeFrame` 同步段、`writePixels` await、`drawImage` 调用段与轮询间隔，并计数 `applying` 跳过次数和实际绘制帧数；每 2 秒用 `hilog` info 打一行 `TianguanPerf ...`，格式为 `poll/take/write/draw=均值/最大值`（毫秒），并附带 `cursor={blank,w,h,visible,left,top}`（服务端光标语义与本地光标图层是否可见）、`ptr={x,y}`（最近一次物理指针的窗口坐标）、`lastMeta={x,y,w,h,full}`（最近一次应用的更新矩形）与 `full=N/M`（本窗口整帧次数/应用帧数），用于区分「远端没发帧」「本地光标没画」这类问题。计时与这些字段不改变渲染行为（没有为测量新增 `await` 或同步点），也不新增 UI 元素。
-- 日志级别：周期性的 `TianguanPoll`（ArkTS 轮询分段）与 `TianguanRender`（原生每秒 fps/上传耗时）已从 WARN 降为 **debug**，`TianguanClip` 的 2 s 汇总同样为 debug；正常使用不再周期性刷 warn。一次性诊断（如首帧 `TianguanDiag first-frame pf ...`、渲染线程失败、重连）与真正的错误仍为 WARN/ERROR。
+- ArkTS 侧用单调时钟测 `takeFrame` 同步段、`writePixels` await、`drawImage` 调用段与轮询间隔，并计数 `applying` 跳过次数和实际绘制帧数；每 2 秒用 `hilog.debug` 打一行 `TianguanPerf ...`，格式为 `poll/take/write/draw=均值/最大值`（毫秒），并附带 `cursor={blank,w,h,visible,left,top}`（服务端光标语义与本地光标图层是否可见）、`ptr={x,y}`（最近一次物理指针的窗口坐标）、`lastMeta={x,y,w,h,full}`（最近一次应用的更新矩形）与 `full=N/M`（本窗口整帧次数/应用帧数），用于区分「远端没发帧」「本地光标没画」这类问题。计时与这些字段不改变渲染行为（没有为测量新增 `await` 或同步点），也不新增 UI 元素。
+- 日志级别（2026-10-25）：周期性汇总全部为 **debug**。`TianguanPoll`（ArkTS 轮询分段）、`TianguanRender`（原生每秒 fps/上传耗时及每 5 s 的 `session=...` 行）与 `TianguanClip` 的 2 s 汇总此前已降为 debug；本轮把 `TianguanPerf`（ArkTS 2 s 渲染分段）从 info、原生 `gfx` 的 5 s surface 统计与 `audio` 的 5 s 播放统计从 WARN 也降为 debug。稳态下按默认级别（`hilog -L I,W,E,F`）抓 12 秒为 0 行，正常使用不再周期性刷 info/warn。一次性诊断（如首帧 `TianguanDiag first-frame pf ...`、通道 attached、`gfx: first surface command`）与真正的错误/警告仍保持原级别可见。
 
 ### 键盘
 
@@ -377,9 +388,9 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - 本机 → 远端自动剪贴板受 `READ_PASTEBOARD` 的 ACL 限制（声明已暂时移除，授权路径代码就绪但未真机走通）。
 - 窗口位置/尺寸不持久记忆：新建时按屏幕比例计算并居中，之后用户手动移动或缩放不会被应用覆盖。
 
-## 验证边界（2026-10-24 更新）
+## 验证边界（2026-10-25 更新）
 
-设备为 SLM-W32（HarmonyOS 7.0.0.111 / API 26，调试签名，`192.168.50.183:43833`）。以下按“真机验证过”和“未做/受限”分开，避免把构建通过当成功能通过。
+设备为 SLM-W32（HarmonyOS 7.0.0.111 / API 26，调试签名，`192.168.50.183:43833`）与手机 PLA-AL10（`192.168.50.199:37193`，屏幕 1316×2832、density 3.5，即 376×809 vp）。以下按“真机验证过”和“未做/受限”分开，避免把构建通过当成功能通过。
 
 ### 已真机验证
 
@@ -391,6 +402,7 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - **远端 → 本机剪贴板**：远端终端复制后本机剪贴板被写入（日志 `clipboard 远端->本地 同步 N 字节`，本机输入法出现 `local_data_notify`）。
 - **GL 呈现与显存**：真实 62 会话连续 24 分钟以上、3 分钟采样内应用 GPU 24.4–33.5 MB 波动（增长恒为 3 MB，无随帧数线性增长），1 个 GPU context；`RENDER_MEMORY_OVER_ERROR`/`KillProcessByPid` 计数为 0，进程存活；受控 60 fps 内容下 fps 62.4–69.4、swapFail=0；颜色与 Canvas 对照最大差 0.7/255，contain 布局/黑边与 Canvas 对齐；两会话同时渲染正常。
 - **无周期卡顿**：事件驱动改造完成后实测 `TianguanClip` 为 `mode=event`、`updateEvents` 递增，用户确认此前的周期性卡顿消失；当前版本在未授权时直接停用读取（`mode=off`，不注册监听），授权后的 `mode=event` 路径等 ACL 到位后再复测。
+- **手机形态（2026-10-25，PLA-AL10）**：VNC 连接、返回断开、窄屏/横屏布局与旋转均已在手机上验证：窄屏为 376×809 vp，旋转后屏幕 1316×2832 → 2832×1316；系统返回键与右边缘返回手势都能结束当前会话（到 62:5901 的连接由 ESTABLISHED 变 TIME_WAIT、卡片回「未连接」）；旋转后主界面自动切宽屏、远程画面按 contain 重铺无拉伸。远程画面不叠加任何控件；PC 仍用窗口标题栏关闭，无回归。
 
 ### 未做 / 受限
 
