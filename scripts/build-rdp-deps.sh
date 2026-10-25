@@ -236,6 +236,10 @@ patch -d "$freerdp_copy" -p1 --batch --forward \
 # generated freerdp-channels-client sources and registered through
 # CLIENT_STATIC_ADDIN_TABLE, so the code is archived into libfreerdp-client3.a
 # (not just a -DCHANNEL_CLIPRDR define). The server side stays OFF.
+# GFX（RemoteFX/progressive）动态通道；H.264 需要 ffmpeg，本构建未启用。
+# It is a dynamic channel and therefore requires CHANNEL_DRDYNVC=ON (already
+# enabled above). CHANNEL_VIDEO stays OFF: the RDPSND/VIDEO H.264 path needs
+# WITH_FFMPEG, which this target build deliberately leaves off.
 cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -260,7 +264,8 @@ cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_DISP=OFF \
   -DCHANNEL_DRIVE=OFF -DCHANNEL_ECHO=OFF -DCHANNEL_ENCOMSP=OFF -DCHANNEL_GEOMETRY=OFF \
   -DCHANNEL_LOCATION=OFF -DCHANNEL_PARALLEL=OFF -DCHANNEL_PRINTER=OFF -DCHANNEL_RAIL=OFF \
-  -DCHANNEL_RDPDR=OFF -DCHANNEL_RDPECAM=OFF -DCHANNEL_RDPEMSC=OFF -DCHANNEL_RDPGFX=OFF \
+  -DCHANNEL_RDPDR=OFF -DCHANNEL_RDPECAM=OFF -DCHANNEL_RDPEMSC=OFF \
+  -DCHANNEL_RDPGFX=ON -DCHANNEL_RDPGFX_CLIENT=ON -DCHANNEL_RDPGFX_SERVER=OFF \
   -DCHANNEL_RDPSND=OFF -DCHANNEL_REMDESK=OFF -DCHANNEL_RDP2TCP=OFF -DCHANNEL_SERIAL=OFF \
   -DCHANNEL_SMARTCARD=OFF -DCHANNEL_SSHAGENT=OFF -DCHANNEL_TELEMETRY=OFF -DCHANNEL_TSMF=OFF \
   -DCHANNEL_URBDRC=OFF -DCHANNEL_VIDEO=OFF > "$build/freerdp-configure.log" 2>&1 || {
@@ -360,7 +365,7 @@ mkdir -p "$prefix/share"
     "${urls[1]}" "${sha256[1]}"
   printf '\nFreeRDP: 3.9.0\n  Commit: %s\n  Source: %s\n' "$freerdp_commit" "$freerdp_src"
   printf '  CMake: WITH_CLIENT=ON WITH_SERVER=OFF, SDL/X11/Wayland/FFmpeg/ALSA/Pulse/CUPS/PCSC/FUSE/KRB5/SAMPLE/MANPAGES off,\n'
-  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr client channels on,\n'
+  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx client channels on,\n'
   printf '         BUILD_SHARED_LIBS=OFF, CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF, CMAKE_POSITION_INDEPENDENT_CODE=ON,\n'
   printf '         OPENSSL_ROOT_DIR/ZLIB_ROOT=%s, OPENSSL_USE_STATIC_LIBS=ON.\n' "$prefix"
   printf '  Source patch: winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'

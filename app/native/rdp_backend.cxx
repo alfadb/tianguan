@@ -22,11 +22,17 @@
 
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/cliprdr.h>
+#include <freerdp/channels/rdpgfx.h>
 #include <freerdp/client.h>
 #include <freerdp/client/cliprdr.h>
+#include <freerdp/client/rdpgfx.h>
 #include <freerdp/error.h>
+#include <freerdp/event.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/gdi/gdi.h>
+// gdi/gfx.h uses RdpgfxClientContext without including the client header, so
+// client/rdpgfx.h must come first (already included above).
+#include <freerdp/gdi/gfx.h>
 #include <freerdp/graphics.h>
 #include <freerdp/input.h>
 #include <freerdp/pointer.h>
@@ -46,6 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <new>
 #include <string>
 #include <thread>
@@ -72,6 +79,11 @@ const int kInitialBackoffMs = 1000;
 const int kMaxBackoffMs = 4000;
 const size_t kMaxErrorChars = 240;
 const int kMaxCursorSide = 1024;
+// GFX (EGFX / rdpgfx dynamic channel) takeover switch. true: advertise the
+// graphics pipeline, let gdi decode surface commands and commit those frames.
+// false: the old behaviour (plain GDI bitmap/orders updates only). Rebuild with
+// this set to false to fall back if the EGFX picture is black or frozen.
+const bool kEnableGfx = true;
 // Same 1 MiB text bound as diagnostics.cxx's clipboard state (kClipboardLimit):
 // the ArkTS setClipboard() already refuses larger text, this is the backend's
 // own guard so a queued item can never exceed what the clip state accepts.
@@ -96,12 +108,20 @@ void diagWarn(const std::string& line) {
 // One connection attempt. The head must be the FreeRDP client context: every
 // FreeRDP callback receives an rdpContext* that points at this struct (the
 // client-common entry-point contract, same pattern as .work/freerdp-spike).
+struct GfxBridge;
+
 struct RdpAttemptContext {
   rdpClientContext common;
   const RdpHost* host;
   int generation;
   bool gdiReady;
   bool sawLogonErrorInfo;
+  // Set by Attempt::create() when kEnableGfx is on; owned by the Attempt.
+  GfxBridge* gfx;
+  // gdi update callbacks saved by counted* wrappers (see the GFX section), so
+  // the wrappers can forward unchanged and count what actually paints.
+  pBitmapUpdate bitmapUpdate;
+  pSurfaceBits surfaceBits;
   // Certificate pinning outcome of this attempt. Set by the FreeRDP
   // certificate callbacks and read by runRdpSession() after a failed connect to
   // decide how the attempt is reported instead of guessing from the error code.
@@ -123,6 +143,216 @@ bool hostStopped(const RdpAttemptContext* attempt) {
 bool hostStale(const RdpAttemptContext* attempt) {
   return hostStopped(attempt) ||
          attempt->host->generation(attempt->host->user) != attempt->generation;
+}
+
+// ---------------------------------------------------------------------------
+// Graphics pipeline (EGFX / rdpgfx dynamic channel)
+//
+// rdpgfx is a dynamic channel: after the connection is up the server opens
+// "Microsoft::Windows::RDS::Graphics" inside drdynvc, FreeRDP publishes
+// ChannelConnected on the context pubSub, and gdi_graphics_pipeline_init()
+// installs the gdi surface decoders. Decoded surfaces are painted into the gdi
+// primary buffer and gdi_OutputUpdate() invalidates the copied rectangles, so
+// the EndPaint hook above commits them to the session mirror exactly like a
+// bitmap update. That is also why GFX must be able to use the client codecs:
+// with DeactivateClientDecoding set, gdi_graphics_pipeline_init() clears
+// SurfaceCommand/UpdateSurfaces and no frame would ever be decoded.
+//
+// This FreeRDP prefix is built with WITH_GFX_H264=OFF, i.e. there is no H.264
+// decoder at all; preConnect() still advertises AVC as disabled so a server
+// cannot select an encoding that this client cannot decode.
+// ---------------------------------------------------------------------------
+
+struct GfxBridge {
+  RdpgfxClientContext* context = nullptr;
+  rdpGdi* gdi = nullptr;
+  // gdi_SurfaceCommand/EndFrame, installed by gdi_graphics_pipeline_init(); the
+  // wrappers below count calls and forward to them unchanged.
+  pcRdpgfxSurfaceCommand surfaceCommand = nullptr;
+  pcRdpgfxEndFrame endFrame = nullptr;
+  std::atomic<UINT64> commands{0};
+  std::atomic<UINT32> lastCodec{0};
+  std::atomic<UINT64> lastStatsMs{0};
+  // Frame-source accounting for the 5 s stats line: endFrames are EGFX frames,
+  // commits are frames actually published to the session mirror, bitmap/surface
+  // bits are the fastpath (GDI) paths. If endFrames grows while bitmap/surface
+  // bits stay zero, the picture can only have come from GFX.
+  std::atomic<UINT64> endFrames{0};
+  std::atomic<UINT64> commits{0};
+  std::atomic<UINT64> bitmapUpdates{0};
+  std::atomic<UINT64> surfaceBits{0};
+};
+
+// SurfaceCommand only receives the RdpgfxClientContext*, so the per-attempt
+// bridge is looked up by that pointer. An entry lives for exactly one channel
+// binding. drdynvc runs on its own thread by default (async dynamic channels),
+// hence the mutex; teardown/unbind also happens on that same code path or after
+// the drdynvc thread has been joined, so a returned bridge cannot be freed
+// while a command is being handled.
+std::mutex g_gfxMutex;
+std::map<RdpgfxClientContext*, GfxBridge*> g_gfxBridges;
+
+UINT64 monotonicMillis() {
+  return static_cast<UINT64>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+GfxBridge* findGfxBridge(RdpgfxClientContext* context) {
+  std::lock_guard<std::mutex> lock(g_gfxMutex);
+  const auto it = g_gfxBridges.find(context);
+  return it == g_gfxBridges.end() ? nullptr : it->second;
+}
+
+// Wraps gdi_SurfaceCommand: first command is logged once, then at most one
+// counter line every kGfxStatsIntervalMs. The original implementation always
+// runs, so wrapping cannot change what is painted.
+const UINT64 kGfxStatsIntervalMs = 5000;
+
+UINT gfxSurfaceCommand(RdpgfxClientContext* context,
+                       const RDPGFX_SURFACE_COMMAND* cmd) {
+  GfxBridge* bridge = findGfxBridge(context);
+  if (bridge == nullptr || bridge->surfaceCommand == nullptr)
+    return CHANNEL_RC_BAD_CHANNEL_HANDLE;
+  const UINT64 count = bridge->commands.fetch_add(1) + 1;
+  const UINT32 codec = cmd != nullptr ? cmd->codecId : 0;
+  if (cmd != nullptr) bridge->lastCodec.store(codec);
+  if (count == 1) {
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "gfx: first surface command codec=%u w=%u h=%u",
+                  static_cast<unsigned>(codec),
+                  cmd != nullptr ? static_cast<unsigned>(cmd->width) : 0u,
+                  cmd != nullptr ? static_cast<unsigned>(cmd->height) : 0u);
+    diagWarn(line);
+  } else {
+    const UINT64 now = monotonicMillis();
+    UINT64 previous = bridge->lastStatsMs.load();
+    if (now >= previous + kGfxStatsIntervalMs &&
+        bridge->lastStatsMs.compare_exchange_strong(previous, now)) {
+      char line[240];
+      std::snprintf(line, sizeof(line),
+                    "gfx: %llu surface commands, last codec=%u, endframes=%llu, "
+                    "commits=%llu, bitmap=%llu, surfbits=%llu",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned>(bridge->lastCodec.load()),
+                    static_cast<unsigned long long>(bridge->endFrames.load()),
+                    static_cast<unsigned long long>(bridge->commits.load()),
+                    static_cast<unsigned long long>(bridge->bitmapUpdates.load()),
+                    static_cast<unsigned long long>(bridge->surfaceBits.load()));
+      diagWarn(line);
+    }
+  }
+  return bridge->surfaceCommand(context, cmd);
+}
+
+UINT gfxEndFrame(RdpgfxClientContext* context,
+                 const RDPGFX_END_FRAME_PDU* endFrame) {
+  GfxBridge* bridge = findGfxBridge(context);
+  if (bridge == nullptr) return CHANNEL_RC_BAD_CHANNEL_HANDLE;
+  bridge->endFrames.fetch_add(1);
+  if (bridge->endFrame == nullptr) return CHANNEL_RC_BAD_CHANNEL_HANDLE;
+  return bridge->endFrame(context, endFrame);
+}
+
+// Fastpath (GDI) frame sources. Wrapping update->BitmapUpdate and
+// update->SurfaceBits lets the stats line show whether the picture is also
+// being painted outside GFX; the wrappers themselves only count and forward.
+BOOL countedBitmapUpdate(rdpContext* context, const BITMAP_UPDATE* bitmap) {
+  RdpAttemptContext* attempt = attemptOf(context);
+  if (attempt == nullptr || attempt->bitmapUpdate == nullptr) return TRUE;
+  if (attempt->gfx != nullptr) attempt->gfx->bitmapUpdates.fetch_add(1);
+  return attempt->bitmapUpdate(context, bitmap);
+}
+
+BOOL countedSurfaceBits(rdpContext* context,
+                        const SURFACE_BITS_COMMAND* surfaceBitsCommand) {
+  RdpAttemptContext* attempt = attemptOf(context);
+  if (attempt == nullptr || attempt->surfaceBits == nullptr) return TRUE;
+  if (attempt->gfx != nullptr) attempt->gfx->surfaceBits.fetch_add(1);
+  return attempt->surfaceBits(context, surfaceBitsCommand);
+}
+
+bool isGfxChannelName(const char* name) {
+  // The settings-side dynamic channel is named "rdpgfx", but the server opens
+  // it under its DVC name; the ChannelConnected event carries the latter.
+  return name != nullptr &&
+         (std::strcmp(name, RDPGFX_CHANNEL_NAME) == 0 ||
+          std::strcmp(name, RDPGFX_DVC_CHANNEL_NAME) == 0);
+}
+
+void gfxUnbind(RdpAttemptContext* attempt) {
+  if (attempt == nullptr) return;
+  GfxBridge* bridge = attempt->gfx;
+  if (bridge == nullptr || bridge->context == nullptr) return;
+  RdpgfxClientContext* gfx = bridge->context;
+  {
+    std::lock_guard<std::mutex> lock(g_gfxMutex);
+    g_gfxBridges.erase(gfx);
+  }
+  if (bridge->surfaceCommand != nullptr)
+    gfx->SurfaceCommand = bridge->surfaceCommand;
+  if (bridge->endFrame != nullptr) gfx->EndFrame = bridge->endFrame;
+  // gdi_graphics_pipeline_uninit() only releases what gdi_graphics_pipeline_init
+  // allocated (gfx->custom points at the gdi and is cleared there).
+  if (bridge->gdi != nullptr) gdi_graphics_pipeline_uninit(bridge->gdi, gfx);
+  bridge->context = nullptr;
+  bridge->gdi = nullptr;
+  bridge->surfaceCommand = nullptr;
+  bridge->endFrame = nullptr;
+  diagWarn("rdpgfx: graphics pipeline detached");
+}
+
+void gfxChannelConnected(void* context, const ChannelConnectedEventArgs* e) {
+  if (context == nullptr || e == nullptr || !isGfxChannelName(e->name)) return;
+  RdpAttemptContext* attempt = attemptOf(static_cast<rdpContext*>(context));
+  GfxBridge* bridge = attempt->gfx;
+  if (bridge == nullptr || e->pInterface == nullptr) return;
+  // One binding per attempt: a repeated event must not install the wrapper
+  // twice (and this is what keeps the "channel connected" line single).
+  if (bridge->context != nullptr) return;
+  rdpGdi* gdi = attempt->common.context.gdi;
+  if (!attempt->gdiReady || gdi == nullptr) {
+    diagWarn("rdpgfx: channel connected before gdi_init, pipeline skipped");
+    return;
+  }
+  RdpgfxClientContext* gfx = static_cast<RdpgfxClientContext*>(e->pInterface);
+  if (!gdi_graphics_pipeline_init(gdi, gfx)) {
+    diagWarn("rdpgfx: gdi_graphics_pipeline_init failed");
+    return;
+  }
+  bridge->context = gfx;
+  bridge->gdi = gdi;
+  bridge->surfaceCommand = gfx->SurfaceCommand;
+  bridge->endFrame = gfx->EndFrame;
+  bridge->commands.store(0);
+  bridge->lastCodec.store(0);
+  bridge->lastStatsMs.store(monotonicMillis());
+  bridge->endFrames.store(0);
+  bridge->commits.store(0);
+  bridge->bitmapUpdates.store(0);
+  bridge->surfaceBits.store(0);
+  {
+    std::lock_guard<std::mutex> lock(g_gfxMutex);
+    g_gfxBridges[gfx] = bridge;
+  }
+  gfx->SurfaceCommand = gfxSurfaceCommand;
+  gfx->EndFrame = gfxEndFrame;
+  // The channel name is included for the record; the "rdpgfx channel
+  // connected" prefix is the marker the acceptance log grep uses.
+  diagWarn(std::string("rdpgfx channel connected (") + e->name +
+           "): gdi graphics pipeline active");
+}
+
+void gfxChannelDisconnected(void* context,
+                            const ChannelDisconnectedEventArgs* e) {
+  if (context == nullptr || e == nullptr || !isGfxChannelName(e->name)) return;
+  RdpAttemptContext* attempt = attemptOf(static_cast<rdpContext*>(context));
+  GfxBridge* bridge = attempt->gfx;
+  if (bridge == nullptr || bridge->context == nullptr) return;
+  if (static_cast<void*>(bridge->context) != e->pInterface) return;
+  gfxUnbind(attempt);
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1122,7 @@ BOOL endPaint(rdpContext* context) {
       // the delivery union and bumps the version once.
       attempt->host->commitFrame(attempt->host->user, attempt->generation,
                                  &rect, 1, width, height);
+      if (attempt->gfx != nullptr) attempt->gfx->commits.fetch_add(1);
     }
   }
   // update_begin_paint() resets the region too, but consuming it here matches
@@ -935,10 +1166,26 @@ BOOL preConnect(freerdp* instance) {
   // still disabled: NetworkAutoDetect/SupportHeartbeatPdu/SupportMultitransport
   // pull in rdpdr (and its drive/printer device redirection), which is not part
   // of this build. (See .work/freerdp-spike for the original failure.)
-  return freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, TRUE) &&
-         freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) &&
-         freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
-         freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE);
+  if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, TRUE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE))
+    return FALSE;
+  if (!kEnableGfx) return TRUE;
+  // SupportGraphicsPipeline makes client-common register the "rdpgfx" dynamic
+  // channel (freerdp_client_load_addins) before drdynvc is opened.
+  if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE))
+    return FALSE;
+  // No H.264 backend in this prefix (WITH_GFX_H264=OFF): an AVC420/AVC444
+  // surface could not be decoded, so advertise every AVC flavour as disabled
+  // and leave the still-supported codecs (RemoteFX / progressive / planar /
+  // clear) at their defaults. FreeRDP translates these to
+  // RDPGFX_CAPS_FLAG_AVC_DISABLED in the 10.x capability sets.
+  if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE))
+    return FALSE;
+  return TRUE;
 }
 
 BOOL postConnect(freerdp* instance) {
@@ -955,8 +1202,17 @@ BOOL postConnect(freerdp* instance) {
   // update->BitmapUpdate NULL. (Same order as the spike probe.)
   if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) return FALSE;
   attempt->gdiReady = true;
+  // DeactivateClientDecoding is FreeRDP's "do not decode on the client" flag.
+  // GFX needs the client decoders: gdi_graphics_pipeline_init() checks this
+  // flag and clears SurfaceCommand/UpdateSurfaces when it is set, so with TRUE
+  // the rdpgfx channel would connect but never paint. With GFX enabled the flag
+  // stays at FreeRDP's default (FALSE), exactly like every reference client.
+  // The plain GDI path is unaffected either way: gdi_init() above already
+  // registered the bitmap/order callbacks while the flag was FALSE, so the old
+  // fallback still works when the server never sends GFX. When GFX is switched
+  // off, keep the historical value so the pre-GFX behaviour is bit-for-bit.
   if (!freerdp_settings_set_bool(settings, FreeRDP_DeactivateClientDecoding,
-                                 TRUE))
+                                 kEnableGfx ? FALSE : TRUE))
     return FALSE;
   registerPointer(context->graphics);
   if (context->update == nullptr) return FALSE;
@@ -966,6 +1222,16 @@ BOOL postConnect(freerdp* instance) {
   // uses; it must stay after gdi_init so the gdi callbacks are in place.
   context->update->EndPaint = endPaint;
   context->update->DesktopResize = desktopResize;
+  // Count the fastpath (GDI) frame sources. gdi_init() installed these above
+  // because DeactivateClientDecoding was still FALSE; wrapping them only adds
+  // counters, the gdi implementation still runs. The counts end up in the GFX
+  // stats line so "GFX took the picture" can be told apart from "GDI painted".
+  attempt->bitmapUpdate = context->update->BitmapUpdate;
+  attempt->surfaceBits = context->update->SurfaceBits;
+  if (kEnableGfx && attempt->bitmapUpdate != nullptr)
+    context->update->BitmapUpdate = countedBitmapUpdate;
+  if (kEnableGfx && attempt->surfaceBits != nullptr)
+    context->update->SurfaceBits = countedSurfaceBits;
   // The pointer-position update is only forwarded while GrabMouse is set. The
   // app renders the cursor itself, so it is the cursor authority.
   if (!freerdp_settings_set_bool(settings, FreeRDP_GrabMouse, TRUE))
@@ -985,7 +1251,13 @@ BOOL postConnect(freerdp* instance) {
 void postDisconnect(freerdp* instance) {
   if (instance == nullptr || instance->context == nullptr) return;
   RdpAttemptContext* attempt = attemptOf(instance->context);
-  if (attempt != nullptr && attempt->gdiReady) {
+  if (attempt == nullptr) return;
+  // Safety net: freerdp_disconnect() stops drdynvc and closes its channels
+  // before PostDisconnect, so the ChannelDisconnected handler has normally
+  // released the pipeline already; this keeps a gfx->custom from outliving the
+  // gdi if some disconnect path skips that event. gfxUnbind() is idempotent.
+  gfxUnbind(attempt);
+  if (attempt->gdiReady) {
     gdi_free(instance);
     attempt->gdiReady = false;
   }
@@ -1333,6 +1605,7 @@ struct Attempt {
   freerdp* instance;
   RdpAttemptContext* attempt;
   CliprdrBridge clipboard;
+  GfxBridge gfx;
   bool connected;
 
   Attempt(const RdpHost& host, const RdpOptions& options, int generation)
@@ -1362,6 +1635,23 @@ struct Attempt {
     attempt->sawLogonErrorInfo = false;
     attempt->trustRequired = false;
     attempt->fingerprintMismatch = false;
+    attempt->bitmapUpdate = nullptr;
+    attempt->surfaceBits = nullptr;
+    // Subscribe before connect: the rdpgfx channel is opened after PostConnect
+    // (gdi_init) and its ChannelConnected event is what installs the gdi
+    // graphics pipeline. The reference clients (xfreerdp/SDL) subscribe at the
+    // same point. context->pubSub exists as soon as the client context is
+    // created.
+    if (kEnableGfx && context->pubSub != nullptr) {
+      attempt->gfx = &gfx;
+      if (PubSub_SubscribeChannelConnected(context->pubSub,
+                                           gfxChannelConnected) < 0 ||
+          PubSub_SubscribeChannelDisconnected(context->pubSub,
+                                              gfxChannelDisconnected) < 0)
+        return false;
+    } else {
+      attempt->gfx = nullptr;
+    }
     // A fresh connection starts with no clipboard ownership; the text queued
     // by ArkTS is drained again by eventLoop() and re-announced.
     clipboard.context = nullptr;
@@ -1541,8 +1831,18 @@ struct Attempt {
     } else if (attempt != nullptr && attempt->gdiReady) {
       // PostConnect ran (gdi_init succeeded) but freerdp_connect() failed after
       // that point and did not call PostDisconnect; release gdi here.
+      gfxUnbind(attempt);
       gdi_free(instance);
       attempt->gdiReady = false;
+    }
+    // Idempotent safety net: normally the ChannelDisconnected handler (emitted
+    // by drdynvc while freerdp_disconnect() stops it) already unbound.
+    gfxUnbind(attempt);
+    if (attempt != nullptr) attempt->gfx = nullptr;
+    if (kEnableGfx && context->pubSub != nullptr) {
+      PubSub_UnsubscribeChannelConnected(context->pubSub, gfxChannelConnected);
+      PubSub_UnsubscribeChannelDisconnected(context->pubSub,
+                                            gfxChannelDisconnected);
     }
     // The credentials are copied into the settings by configure(); clear the
     // password copy before the settings are freed.
