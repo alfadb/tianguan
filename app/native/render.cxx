@@ -749,7 +749,7 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
                       renderer->sessionId.c_str(), frames, fps, uploads, fullUploads, skips,
                       swapFailures, surfaceWidth, surfaceHeight, texWidth, texHeight,
                       afterVersion, nowMs - startedAt);
-        LogLine(line);
+        LogDebug(line);
       }
       publishStatsIfDue("running");
     }

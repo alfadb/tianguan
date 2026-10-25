@@ -120,6 +120,17 @@ void diagWarn(const std::string& line) {
 #endif
 }
 
+// Periodic statistics lines use DEBUG: they are diagnostics, not errors, and
+// must not spam the default log level. One-shot and error lines stay WARN.
+void diagDebug(const std::string& line) {
+#if defined(__MUSL__)
+  OH_LOG_Print(LOG_APP, LOG_DEBUG, 0, "TianguanDiag", "%{public}s", line.c_str());
+#else
+  std::fprintf(stderr, "D TianguanDiag %s\n", line.c_str());
+  std::fflush(stderr);
+#endif
+}
+
 // One connection attempt. The head must be the FreeRDP client context: every
 // FreeRDP callback receives an rdpContext* that points at this struct (the
 // client-common entry-point contract, same pattern as .work/freerdp-spike).
@@ -261,7 +272,7 @@ UINT gfxSurfaceCommand(RdpgfxClientContext* context,
                     static_cast<unsigned long long>(bridge->commits.load()),
                     static_cast<unsigned long long>(bridge->bitmapUpdates.load()),
                     static_cast<unsigned long long>(bridge->surfaceBits.load()));
-      diagWarn(line);
+      diagDebug(line);
     }
   }
   return bridge->surfaceCommand(context, cmd);
@@ -894,7 +905,7 @@ void RdpsndPlayer::logStats(bool force) {
         static_cast<unsigned long long>(dspFailures),
         static_cast<unsigned long long>(lostDiscarded));
   }
-  diagWarn(line);
+  diagDebug(line);
 }
 
 // The device object itself carries no state: it is the key the rdpsnd channel
