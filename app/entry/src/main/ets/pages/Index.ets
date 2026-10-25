@@ -23,7 +23,7 @@ import {
 } from '../diag/SessionApi';
 import type { SessionOptions } from '../diag/SessionApi';
 import {
-  findConnection, loadPassword, newConnectionId, readTrustedFingerprint,
+  findConnection, loadPassword, newConnectionId, pinKeyFor, readTrustedFingerprint,
   removeConnection, removePassword, savePassword, savedConnections,
   trustFingerprint, upsertConnection, DEFAULT_PORT, defaultPortFor, UNGROUPED
 } from '../model/ConnectionStore';
@@ -908,8 +908,9 @@ struct Index {
       }
       if (entry.protocol === 'rdp') {
         // RDP shares the session state machine; only the endpoint options
-        // differ. security/expectedFingerprint are VNC-only (RFB security
-        // types and the RA2 trust store), so they are never set here.
+        // differ. security stays unset (RFB security types only), but
+        // expectedFingerprint is the RDP server certificate pin: the pin is
+        // keyed per protocol so a VNC pin on the same host:port never applies.
         options.protocol = 'rdp';
         if (entry.username.length > 0) {
           options.username = entry.username;
@@ -917,13 +918,17 @@ struct Index {
         if (entry.domain.length > 0) {
           options.domain = entry.domain;
         }
+        const pin = readTrustedFingerprint(pinKeyFor(entry));
+        if (pin.length > 0) {
+          options.expectedFingerprint = pin;
+        }
       } else {
         // Servers that publish only None (type 1) reject the encrypted-only
         // default, so a "no password" connection offers None explicitly.
         if (entry.noPassword === true) {
           options.security = 'None';
         }
-        const pin = readTrustedFingerprint(endpoint);
+        const pin = readTrustedFingerprint(pinKeyFor(entry));
         if (pin.length > 0) {
           options.expectedFingerprint = pin;
         }
@@ -1098,7 +1103,7 @@ struct Index {
     if (fingerprint.length === 0) {
       return;
     }
-    trustFingerprint(this.endpointOf(entry), fingerprint);
+    trustFingerprint(pinKeyFor(entry), fingerprint);
     const sessions = sessionsForConnection(entry.id);
     for (let i = 0; i < sessions.length; i++) {
       const state = sessions[i].state;

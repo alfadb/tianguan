@@ -57,7 +57,7 @@ import {
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
 import { findSession, markWindowOpen } from '../model/SessionRegistry';
-import { trustFingerprint } from '../model/ConnectionStore';
+import { findConnection, pinKeyFor, trustFingerprint } from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession, clipboardSetSessionVisible,
   clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
@@ -1630,7 +1630,12 @@ struct Remote {
       this.statusText = '无法确定该服务器地址，请在连接列表里确认身份';
       return;
     }
-    trustFingerprint(endpoint, this.fingerprint);
+    // Same protocol-scoped key as the connection list: VNC keeps the legacy
+    // "host:port" key, RDP uses "rdp:host:port". An orphan session has no
+    // connection entry, so it falls back to the endpoint it was adopted with.
+    const entry = session !== undefined && session.connectionId.length > 0
+      ? findConnection(session.connectionId) : undefined;
+    trustFingerprint(entry === undefined ? endpoint : pinKeyFor(entry), this.fingerprint);
     reconnectSession(this.sessionId);
     // The reconnect is already in flight; do not wait for the next 1 s status
     // poll to learn the generation changed. Invalidate the in-flight render and

@@ -338,6 +338,17 @@ export function distinctGroups(): string[] {
 // Fingerprint trust store.
 // ---------------------------------------------------------------------------
 
+/**
+ * Key of one connection's pin in vnc-pins.json. VNC keeps its historical
+ * "host:port" key so fingerprints confirmed by older builds stay valid; RDP
+ * uses its own "rdp:host:port" namespace so the two protocols can never
+ * overwrite each other's trust anchor on the same address.
+ */
+export function pinKeyFor(entry: ConnectionEntry): string {
+  const hostPort = entry.host + ':' + entry.port;
+  return entry.protocol === 'rdp' ? 'rdp:' + hostPort : hostPort;
+}
+
 export function readTrustedFingerprint(endpoint: string): string {
   try {
     const text = readText('vnc-pins.json');

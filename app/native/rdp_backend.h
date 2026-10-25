@@ -78,6 +78,17 @@ struct RdpHost {
 
   bool (*stopRequested)(void* user) = nullptr;
   int (*generation)(void* user) = nullptr;
+  // Current trust anchor for this endpoint: the fingerprint pinned by an
+  // earlier confirmed connection, read fresh from the session under its meta
+  // lock for every attempt (the UI may have confirmed one between attempts,
+  // after the options were copied for the thread). Empty means "no pin yet":
+  // the next certificate is offered to the user instead of being accepted.
+  void (*currentPin)(void* user, std::string* out) = nullptr;
+  // First contact: record the normalized fingerprint and report
+  // phase=trust-required so the UI can show it and ask the user. Takes the meta
+  // lock, ignores the call when stop is set or generation no longer matches.
+  void (*setTrustRequired)(void* user, int generation,
+                           const char* fingerprint) = nullptr;
   // Same policy as the VNC loop's beginAttempt(): bump the generation when an
   // automatic retry starts an attempt. *lastApplied is owned by the backend.
   int (*beginAttempt)(void* user, int* lastApplied) = nullptr;

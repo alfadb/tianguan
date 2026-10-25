@@ -2258,6 +2258,32 @@ void rdpHostWaitForReconnect(void* user) {
   waitForReconnect(*static_cast<SessionState*>(user));
 }
 
+// The pinned fingerprint for this endpoint, read under the meta lock for every
+// attempt: reconnectSession() may have pinned a confirmed fingerprint after the
+// session thread copied its options.
+void rdpHostCurrentPin(void* user, std::string* out) {
+  if (out == nullptr) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.meta);
+  *out = state.expectedPin;
+}
+
+// First contact with an RDP server's certificate (TOFU). Mirrors the VNC path's
+// trust-required state: the fingerprint is published for the UI, the session is
+// not connected, and the caller refuses the attempt.
+void rdpHostSetTrustRequired(void* user, int generation, const char* fingerprint) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.meta);
+  if (state.stop || state.generation.load() != generation) return;
+  state.phase = PhaseTrustRequired;
+  state.fingerprint = fingerprint != nullptr ? fingerprint : "";
+  state.error = "server not trusted yet: " + state.fingerprint;
+  state.errorCode = "fingerprint-mismatch";
+  state.retryInMs = 0;
+  state.connected = false;
+  state.running = false;
+}
+
 void rdpResizeFrame(void* user, int generation, int width, int height) {
   SessionState& state = *static_cast<SessionState*>(user);
   if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return;
@@ -2564,6 +2590,8 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
   bridge.setPhase = rdpHostSetPhase;
   bridge.sleepUnlessStopped = rdpHostSleepUnlessStopped;
   bridge.waitForReconnect = rdpHostWaitForReconnect;
+  bridge.currentPin = rdpHostCurrentPin;
+  bridge.setTrustRequired = rdpHostSetTrustRequired;
   bridge.resizeFrame = rdpResizeFrame;
   bridge.commitFrame = rdpCommitFrame;
   bridge.setCursor = rdpSetCursor;

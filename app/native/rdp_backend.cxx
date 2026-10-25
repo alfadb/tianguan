@@ -102,6 +102,11 @@ struct RdpAttemptContext {
   int generation;
   bool gdiReady;
   bool sawLogonErrorInfo;
+  // Certificate pinning outcome of this attempt. Set by the FreeRDP
+  // certificate callbacks and read by runRdpSession() after a failed connect to
+  // decide how the attempt is reported instead of guessing from the error code.
+  bool trustRequired;
+  bool fingerprintMismatch;
 };
 
 RdpAttemptContext* attemptOf(rdpContext* context) {
@@ -565,24 +570,100 @@ RdpFailureClass classifyConnectFailure(UINT32 code, bool sawLogonErrorInfo) {
 }
 
 // ---------------------------------------------------------------------------
-// Certificate handling
+// Certificate handling (trust on first use, same model as the VNC path)
 // ---------------------------------------------------------------------------
+//
+// FreeRDP hands over the SHA-256 certificate fingerprint as lowercase hex bytes
+// separated by ':'. The app's trust store (vnc-pins.json) uses lowercase bytes
+// separated by '-', so the conversion happens here: the state JSON, the UI and
+// the store only ever see the normalized form.
 
-// v1 known limitation: the RDP server certificate is accepted for this session
-// only and is NOT pinned, so the VNC-style trust-on-first-use store does not
-// apply here yet. Returning 2 = "accept for this session, do not store".
+// Hex digits only (lowercase), so both fingerprint styles can be compared
+// without caring about case or separators.
+std::string fingerprintHex(const char* fingerprint) {
+  std::string hex;
+  if (fingerprint == nullptr) return hex;
+  for (const char* p = fingerprint; *p != '\0'; ++p) {
+    const char c = *p;
+    if (c >= '0' && c <= '9')
+      hex.push_back(c);
+    else if (c >= 'a' && c <= 'f')
+      hex.push_back(c);
+    else if (c >= 'A' && c <= 'F')
+      hex.push_back(static_cast<char>(c - 'A' + 'a'));
+  }
+  return hex;
+}
+
+// "AB:CD:0d" -> "ab-cd-0d". An empty result means the server supplied no
+// usable fingerprint (or a malformed one); callers fail closed on it.
+std::string normalizeFingerprint(const char* fingerprint) {
+  const std::string hex = fingerprintHex(fingerprint);
+  if (hex.empty() || hex.size() % 2 != 0) return std::string();
+  std::string out;
+  out.reserve(hex.size() + hex.size() / 2);
+  for (size_t i = 0; i < hex.size(); i += 2) {
+    if (i != 0) out.push_back('-');
+    out.push_back(hex[i]);
+    out.push_back(hex[i + 1]);
+  }
+  return out;
+}
+
+bool fingerprintsEqual(const std::string& pinned, const std::string& observed) {
+  const std::string a = fingerprintHex(pinned.c_str());
+  const std::string b = fingerprintHex(observed.c_str());
+  return !a.empty() && a == b;
+}
+
+// One decision for both the first-contact and the changed-certificate callback:
+// FreeRDP passes the fingerprint of the certificate being presented, and the
+// pin (if any) comes fresh from the session so a confirmation that happened
+// between attempts is honored. Returning 0 rejects the attempt; the flags on
+// the attempt tell runRdpSession() how to report it.
+DWORD decideCertificate(RdpAttemptContext* attempt, const char* fingerprint) {
+  if (attempt == nullptr || attempt->host == nullptr ||
+      attempt->host->currentPin == nullptr ||
+      attempt->host->setTrustRequired == nullptr) {
+    return 0;  // bridge not fully wired: fail closed, never accept blindly
+  }
+  const std::string observed = normalizeFingerprint(fingerprint);
+  if (observed.empty()) {
+    // No identity to show and no identity to pin: refuse instead of offering a
+    // blank "confirm this" prompt.
+    attempt->fingerprintMismatch = true;
+    return 0;
+  }
+  std::string pinned;
+  attempt->host->currentPin(attempt->host->user, &pinned);
+  if (pinned.empty()) {
+    // First connection to this endpoint: publish the fingerprint as
+    // "trust required" and refuse this attempt. The UI confirms it, saves the
+    // pin and calls reconnectSession(); retrying before that would only spin.
+    attempt->host->setTrustRequired(attempt->host->user, attempt->generation,
+                                    observed.c_str());
+    attempt->trustRequired = true;
+    return 0;
+  }
+  if (fingerprintsEqual(pinned, observed))
+    return 2;  // accept for this session only; 1 would store it in FreeRDP's own
+               // known_hosts, which this app deliberately does not use
+  attempt->fingerprintMismatch = true;
+  diagWarn("rdp: server certificate fingerprint differs from the trusted value");
+  return 0;
+}
+
 DWORD verifyCertificate(freerdp* instance, const char* host, UINT16 port,
                         const char* commonName, const char* subject,
                         const char* issuer, const char* fingerprint, DWORD flags) {
-  (void)instance;
   (void)host;
   (void)port;
   (void)commonName;
   (void)subject;
   (void)issuer;
-  (void)fingerprint;
   (void)flags;
-  return 2;
+  if (instance == nullptr || instance->context == nullptr) return 0;
+  return decideCertificate(attemptOf(instance->context), fingerprint);
 }
 
 DWORD verifyChangedCertificate(freerdp* instance, const char* host, UINT16 port,
@@ -590,18 +671,20 @@ DWORD verifyChangedCertificate(freerdp* instance, const char* host, UINT16 port,
                                const char* issuer, const char* newFingerprint,
                                const char* oldSubject, const char* oldIssuer,
                                const char* oldFingerprint, DWORD flags) {
-  (void)instance;
   (void)host;
   (void)port;
   (void)commonName;
   (void)subject;
   (void)issuer;
-  (void)newFingerprint;
   (void)oldSubject;
   (void)oldIssuer;
   (void)oldFingerprint;
   (void)flags;
-  return 2;
+  // A changed certificate is held to exactly the same pin as a first contact:
+  // it may only be accepted when it matches the trusted fingerprint. This
+  // callback must never be an unconditional acceptance path.
+  if (instance == nullptr || instance->context == nullptr) return 0;
+  return decideCertificate(attemptOf(instance->context), newFingerprint);
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1360,8 @@ struct Attempt {
     attempt->generation = generation;
     attempt->gdiReady = false;
     attempt->sawLogonErrorInfo = false;
+    attempt->trustRequired = false;
+    attempt->fingerprintMismatch = false;
     // A fresh connection starts with no clipboard ownership; the text queued
     // by ArkTS is drained again by eventLoop() and re-announced.
     clipboard.context = nullptr;
@@ -1485,7 +1570,8 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       host.commitFrame == nullptr || host.setCursor == nullptr ||
       host.setCursorBlank == nullptr || host.setCursorPos == nullptr ||
       host.prepareInput == nullptr || host.drainInput == nullptr ||
-      host.consumeFullRequest == nullptr || host.sinkClipboard == nullptr) {
+      host.consumeFullRequest == nullptr || host.sinkClipboard == nullptr ||
+      host.currentPin == nullptr || host.setTrustRequired == nullptr) {
     return;  // bridge not fully wired: fail closed instead of crashing
   }
   int lastApplied = 0;
@@ -1525,9 +1611,28 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       const UINT32 code = attempt.lastError();
       const bool sawLogonErrorInfo =
           attempt.attempt != nullptr && attempt.attempt->sawLogonErrorInfo;
+      // Certificate pinning outcomes are known exactly, so they are handled
+      // before the error-code classification: a rejected certificate must not
+      // be mistaken for a network failure and retried automatically.
+      const bool trustRequired =
+          attempt.attempt != nullptr && attempt.attempt->trustRequired;
+      const bool fingerprintMismatch =
+          attempt.attempt != nullptr && attempt.attempt->fingerprintMismatch;
       const RdpFailureClass failure = classifyConnectFailure(code, sawLogonErrorInfo);
       const std::string message = connectErrorText(code, options);
       attempt.teardown();
+      if (trustRequired) {
+        // setTrustRequired() already published phase=trust-required with the
+        // fingerprint; wait for the UI to confirm and call reconnectSession().
+        host.waitForReconnect(host.user);
+        continue;
+      }
+      if (fingerprintMismatch) {
+        setPhase(host, RdpPhaseFailed,
+                 "服务端指纹与已信任值不一致，已拒绝连接", "fingerprint-mismatch", 0);
+        host.waitForReconnect(host.user);
+        continue;
+      }
       if (failure == RdpFailureAuth) {
         // The UI's password-retry sheet keys off failed/auth-failed.
         setPhase(host, RdpPhaseFailed, message, "auth-failed", 0);
