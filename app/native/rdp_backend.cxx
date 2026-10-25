@@ -32,6 +32,7 @@
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/rdpsnd.h>
 #include <freerdp/codec/audio.h>
+#include <freerdp/codec/dsp.h>
 #include <freerdp/error.h>
 #include <freerdp/event.h>
 #include <freerdp/freerdp.h>
@@ -172,9 +173,14 @@ bool hostStale(const RdpAttemptContext* attempt) {
 // with DeactivateClientDecoding set, gdi_graphics_pipeline_init() clears
 // SurfaceCommand/UpdateSurfaces and no frame would ever be decoded.
 //
-// This FreeRDP prefix is built with WITH_GFX_H264=OFF, i.e. there is no H.264
-// decoder at all; preConnect() still advertises AVC as disabled so a server
-// cannot select an encoding that this client cannot decode.
+// This FreeRDP prefix is built with WITH_FFMPEG/WITH_SWSCALE, which puts
+// WITH_GFX_H264 into config.h: libavcodec supplies the H.264 decoder and
+// libswscale the YUV->RGB conversion for AVC420/AVC444(x) surfaces. preConnect()
+// therefore advertises those codecs in the 8.1/10.x capability sets so the
+// server may select them; ClearCodec / planar / RemoteFX / progressive stay at
+// their defaults. The "gfx: ... last codec=<id>" stats line reports which codec
+// the server actually picked (11=AVC420, 14=AVC444, 15=AVC444v2, see
+// freerdp/channels/rdpgfx.h).
 // ---------------------------------------------------------------------------
 
 struct GfxBridge {
@@ -378,24 +384,38 @@ void gfxChannelDisconnected(void* context,
 // therefore registers a static addin provider (installRdpsndAddinProvider)
 // that answers the channel's "rdpsnd" + "tianguan" subsystem lookup with the
 // device plugin below. preConnect() adds the channel as
-// {"rdpsnd","sys:tianguan","format:1","channel:2"} to both the static and the
-// dynamic channel collection: the arguments select that subsystem and pin
-// rdpsnd's fixed_format to PCM/stereo, so a compressed format is never
-// advertised (this build has neither a decoder nor a resampler). Modern
+// {"rdpsnd","sys:tianguan","channel:2"} to both the static and the dynamic
+// channel collection: the arguments select that subsystem and pin rdpsnd's
+// fixed_format to stereo only. "format" is deliberately not pinned to PCM
+// anymore (it used to be "format:1"): that filter would reject every
+// compressed format before this device ever saw it, and FreeRDP is now built
+// WITH_FFMPEG (WITH_DSP_FFMPEG), so AAC/AAC-LATM can be decoded. Modern
 // servers (Windows 8.1+) carry the audio over the AUDIO_PLAYBACK_DVC dynamic
 // channels opened by drdynvc, whose instances parse the same arguments; if
 // only the static collection had them, those instances would silently fall
 // back to the built-in fake sink and no audio would ever be negotiated.
 //
 // Call flow: ServerFormatAnnounce() sees the server's format list,
-// FormatSupported() filters it (PCM, 16-bit, stereo), Open() receives the
-// format the server selected, Play() pushes PCM into a ring buffer and Close()
-// stops the renderer. The OHOS NDK has no blocking OH_AudioRenderer_Write;
-// playback is pulled by OH_AudioRenderer_OnWriteDataCallback, which fills the
-// buffer from the ring and writes silence when the server is not sending
-// audio, so a starved stream never stalls. Audio is strictly a side path: no
-// failure in here is turned into a channel error, so it cannot break the
-// picture or input.
+// FormatSupported() accepts PCM 16-bit stereo plus compressed formats that
+// freerdp_dsp_supports_format() can decode (and that the renderer can handle:
+// 2 channels, 8k..192k), Open() receives the format the server selected, Play()
+// decodes compressed data to PCM through freerdp_dsp_decode() (PCM passes
+// through unchanged) and pushes it into a ring buffer, Close() stops the
+// renderer. The decoder output is configured (freerdp_dsp_context_reset) with
+// the same AUDIO_FORMAT that Open() got, so the PCM it produces always matches
+// the renderer's rate/channels; libswresample does the decoder-side rate/
+// channel conversion when the bitstream differs from the declared format.
+// The OHOS NDK has no blocking OH_AudioRenderer_Write; playback is pulled by
+// OH_AudioRenderer_OnWriteDataCallback, which fills the buffer from the ring
+// and writes silence when the server is not sending audio, so a starved stream
+// never stalls. Audio is strictly a side path: no failure in here is turned
+// into a channel error, so it cannot break the picture or input.
+// Note (checked against the dependencies): libavcodec is built with the AAC,
+// AAC-LATM and ADPCM decoders, but FreeRDP's dsp_ffmpeg.c filters ADPCM/GSM/
+// A-law/u-law out unless WITH_DSP_EXPERIMENTAL is defined, which this FreeRDP
+// build leaves off. Of the compressed tags only WAVE_FORMAT_AAC_MS (and OPUS if
+// the server offered it) actually reaches a decoder; the rest are rejected at
+// negotiation and reported by the format announce line.
 //
 // Threading: rdpsnd dispatches its channel data on its own thread by default
 // (FreeRDP_SynchronousStaticChannels is FALSE), while Close/Free arrive on the
@@ -412,8 +432,9 @@ const char kRdpsndSubsystem[] = "tianguan";
 // PCM formats the renderer is allowed to open. The server normally offers
 // 44.1 or 48 kHz 16-bit stereo PCM; other rates are still valid for
 // OH_AudioRenderer, so accept the whole common range instead of narrowing the
-// negotiation. No resampling is available, so the renderer always runs at the
-// exact rate the server selected.
+// negotiation. The renderer always runs at the exact rate/channels of the
+// format rdpsnd selected; for compressed formats the decoder is reset with that
+// same format, so libswresample produces PCM in the renderer's layout.
 const int kAudioMinRate = 8000;
 const int kAudioMaxRate = 192000;
 // Ring capacity = half a second of PCM, clamped. Dropping the oldest bytes when
@@ -452,25 +473,44 @@ struct RdpsndPlayer {
         dropped(0),
         lastStatsMs(0),
         lastStatsBytes(0),
-        statsLines(0) {}
+        statsLines(0),
+        dsp(nullptr),
+        dspOut(nullptr),
+        sourceTag(WAVE_FORMAT_PCM),
+        dspDecoded(false),
+        dspLogged(false),
+        decodedBytes(0),
+        decodeFailures(0),
+        discarded(0),
+        lastDspLogMs(0) {}
 
-  ~RdpsndPlayer() { stop(); }
+  ~RdpsndPlayer() {
+    stop();
+    // No callback can be inside this object here: every callback takes a
+    // shared_ptr from gRdpsndPlayers first, and Free() removed the map entry
+    // before dropping the last reference.
+    if (dsp != nullptr) freerdp_dsp_context_free(dsp);
+    if (dspOut != nullptr) Stream_Free(dspOut, TRUE);
+  }
 
-  // Open a renderer for the format rdpsnd selected. Replaces any previous one.
-  void start(int sampleRate, int channelCount);
+  // Open a renderer for the format rdpsnd selected. For a compressed format the
+  // decoder is (re)configured to produce PCM in that same rate/channel layout.
+  // Replaces any previous renderer/decoder.
+  void start(const AUDIO_FORMAT& format);
   // Stop and release the renderer and drop buffered audio. Idempotent.
   void stop() {
     std::lock_guard<std::mutex> lifecycleLock(lifecycle);
     stopLocked();
   }
-  // rdpsnd Play: append PCM without ever blocking the channel thread for more
-  // than the ring lock.
+  // rdpsnd Play: append PCM, decoding a compressed payload first, without ever
+  // blocking the channel thread for more than the ring/decode locks.
   void push(const uint8_t* data, size_t size);
   // OHOS write callback: fill out[0,size) with PCM, silence when starved.
   size_t fill(uint8_t* out, size_t size);
 
  private:
   void startRenderer();
+  void pushPcm(const uint8_t* data, size_t size);
   void stopLocked();
   void logStats(bool force);
 
@@ -493,6 +533,19 @@ struct RdpsndPlayer {
   uint64_t lastStatsMs;
   uint64_t lastStatsBytes;
   int statsLines;
+  // Guards the decoder state below. Play runs on the rdpsnd channel thread,
+  // start()/stop() on the session thread, so a reset must not race a decode.
+  std::mutex decodeLock;
+  FREERDP_DSP_CONTEXT* dsp;
+  wStream* dspOut;
+  AUDIO_FORMAT sourceFormat;  // format of the stream Play() currently receives
+  UINT16 sourceTag;
+  bool dspDecoded;  // source is compressed and the decoder is ready
+  bool dspLogged;   // the "dsp: ... -> PCM ok" line was already printed
+  std::atomic<uint64_t> decodedBytes;
+  std::atomic<uint64_t> decodeFailures;
+  std::atomic<uint64_t> discarded;  // PCM dropped because no renderer is open
+  uint64_t lastDspLogMs;
 };
 
 OH_AudioData_Callback_Result audioWriteData(OH_AudioRenderer* renderer,
@@ -509,18 +562,58 @@ OH_AudioData_Callback_Result audioWriteData(OH_AudioRenderer* renderer,
   return AUDIO_DATA_CALLBACK_RESULT_VALID;
 }
 
-void RdpsndPlayer::start(int sampleRate, int channelCount) {
+void RdpsndPlayer::start(const AUDIO_FORMAT& format) {
   std::lock_guard<std::mutex> lifecycleLock(lifecycle);
   // A format change (or a re-open after SNDC_CLOSE) always restarts cleanly.
   stopLocked();
-  char line[200];
+  const int sampleRate = static_cast<int>(format.nSamplesPerSec);
+  const int channelCount = static_cast<int>(format.nChannels);
+  char line[240];
+  {
+    // Reset the decode state first: if the format is unusable below, Play must
+    // not keep decoding the previous stream into a dead ring.
+    std::lock_guard<std::mutex> guard(decodeLock);
+    sourceFormat = format;
+    sourceTag = format.wFormatTag;
+    dspDecoded = false;
+    dspLogged = false;
+    decodedBytes.store(0);
+    decodeFailures.store(0);
+    discarded.store(0);
+    lastDspLogMs = 0;
+  }
   if (sampleRate < kAudioMinRate || sampleRate > kAudioMaxRate ||
       channelCount != 2) {
     std::snprintf(line, sizeof(line),
-                  "audio: unsupported format %dHz %dch, PCM 16-bit stereo only",
+                  "audio: unsupported format %dHz %dch, stereo 8k..192k only",
                   sampleRate, channelCount);
     diagWarn(line);
     return;
+  }
+  if (format.wFormatTag != WAVE_FORMAT_PCM) {
+    // Compressed payload: let FreeRDP's DSP (dsp_ffmpeg.c) decode it. The
+    // context is reset with the very format rdpsnd selected, so the decoder
+    // output is S16LE at this same rate/channels; libswresample handles a
+    // bitstream whose real layout differs. If the decoder cannot be opened the
+    // player stays in "drop" mode and the session keeps running silently.
+    bool ready = false;
+    {
+      std::lock_guard<std::mutex> guard(decodeLock);
+      if (dsp == nullptr) dsp = freerdp_dsp_context_new(FALSE);
+      if (dspOut == nullptr) dspOut = Stream_New(nullptr, 4096);
+      if (dsp != nullptr && dspOut != nullptr &&
+          freerdp_dsp_context_reset(dsp, &format, 0)) {
+        dspDecoded = true;
+        ready = true;
+      }
+    }
+    if (!ready) {
+      std::snprintf(line, sizeof(line),
+                    "dsp: no decoder for tag=%u (0x%04x), staying silent",
+                    static_cast<unsigned>(format.wFormatTag),
+                    static_cast<unsigned>(format.wFormatTag));
+      diagWarn(line);
+    }
   }
   size_t ringBytes = static_cast<size_t>(sampleRate) *
                      static_cast<size_t>(channelCount) * 2u / 2u;
@@ -585,8 +678,62 @@ void RdpsndPlayer::stopLocked() {
 
 void RdpsndPlayer::push(const uint8_t* data, size_t size) {
   if (data == nullptr || size == 0) return;
+  std::lock_guard<std::mutex> guard(decodeLock);
+  if (!dspDecoded) {
+    // Uncompressed PCM: the ring is fed exactly like before.
+    pushPcm(data, size);
+    return;
+  }
+  if (dsp == nullptr || dspOut == nullptr) {
+    discarded.fetch_add(size);
+    return;
+  }
+  char line[220];
+  Stream_SetPosition(dspOut, 0);
+  if (!freerdp_dsp_decode(dsp, &sourceFormat, data, size, dspOut)) {
+    // A decode failure only costs this packet. Count it and log at most once
+    // per kAudioStatsIntervalMs so a broken stream cannot flood hilog.
+    const uint64_t failures = decodeFailures.fetch_add(1) + 1;
+    const UINT64 now = monotonicMillis();
+    if (now >= lastDspLogMs + kAudioStatsIntervalMs) {
+      lastDspLogMs = now;
+      std::snprintf(line, sizeof(line),
+                    "dsp: decode failed tag=%u (0x%04x), failures=%llu, "
+                    "%zu compressed bytes",
+                    static_cast<unsigned>(sourceTag),
+                    static_cast<unsigned>(sourceTag),
+                    static_cast<unsigned long long>(failures), size);
+      diagWarn(line);
+    }
+    return;
+  }
+  const size_t decoded = Stream_GetPosition(dspOut);
+  // An AAC packet can decode to zero samples while the decoder primes; that is
+  // not a failure and there is nothing to enqueue yet.
+  if (decoded == 0) return;
+  decodedBytes.fetch_add(decoded);
+  if (!dspLogged) {
+    // First successful decode of this connection: the acceptance log line.
+    dspLogged = true;
+    std::snprintf(line, sizeof(line), "dsp: %u (0x%04x) -> PCM ok, %zu bytes",
+                  static_cast<unsigned>(sourceTag),
+                  static_cast<unsigned>(sourceTag), decoded);
+    diagWarn(line);
+  }
+  // The decoder was reset with the Open() format, so this is S16LE at the
+  // renderer's rate/channels by construction; push it like server PCM.
+  pushPcm(Stream_Buffer(dspOut), decoded);
+}
+
+void RdpsndPlayer::pushPcm(const uint8_t* data, size_t size) {
+  if (data == nullptr || size == 0) return;
   std::lock_guard<std::mutex> guard(lock);
-  if (!started || capacity == 0) return;
+  if (!started || capacity == 0) {
+    // No renderer (should not happen for an accepted format): count the audio
+    // that had to be thrown away instead of pretending it played.
+    discarded.fetch_add(size);
+    return;
+  }
   if (size > capacity) {
     // A single block larger than the ring: keep the newest PCM only.
     const size_t excess = size - capacity;
@@ -727,6 +874,9 @@ void RdpsndPlayer::logStats(bool force) {
     const uint64_t ratePerSecond = elapsed > 0 ? delta * 1000u / elapsed : 0;
     const uint64_t under = underruns.load();
     const uint64_t lost = dropped.load();
+    const uint64_t decoded = decodedBytes.load();
+    const uint64_t dspFailures = decodeFailures.load();
+    const uint64_t lostDiscarded = discarded.load();
     const unsigned sampleRate = static_cast<unsigned>(rate);
     const unsigned channelCount = static_cast<unsigned>(channels);
     lastStatsMs = now;
@@ -735,11 +885,14 @@ void RdpsndPlayer::logStats(bool force) {
     std::snprintf(
         line, sizeof(line),
         "audio: %llu bytes played (rate=%llu B/s), underrun=%llu, dropped=%llu, "
-        "%uHz %uch",
+        "%uHz %uch, decoded=%llu, dspfail=%llu, discarded=%llu",
         static_cast<unsigned long long>(played),
         static_cast<unsigned long long>(ratePerSecond),
         static_cast<unsigned long long>(under),
-        static_cast<unsigned long long>(lost), sampleRate, channelCount);
+        static_cast<unsigned long long>(lost), sampleRate, channelCount,
+        static_cast<unsigned long long>(decoded),
+        static_cast<unsigned long long>(dspFailures),
+        static_cast<unsigned long long>(lostDiscarded));
   }
   diagWarn(line);
 }
@@ -769,14 +922,21 @@ std::shared_ptr<RdpsndPlayer> rdpsndPlayerFor(rdpsndDevicePlugin* device) {
 BOOL rdpsndFormatSupported(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format) {
   (void)device;
   if (format == nullptr) return FALSE;
-  // Only uncompressed 16-bit stereo is played: there is no decoder for the
-  // compressed tags and no resampler. The rate is left to the server.
-  return format->wFormatTag == WAVE_FORMAT_PCM && format->nChannels == 2 &&
-                 format->wBitsPerSample == 16 &&
-                 format->nSamplesPerSec >= static_cast<UINT32>(kAudioMinRate) &&
-                 format->nSamplesPerSec <= static_cast<UINT32>(kAudioMaxRate)
-             ? TRUE
-             : FALSE;
+  // The renderer can only open 2-channel streams in this rate range; anything
+  // else is left out of the reply so the server never selects it.
+  if (format->nChannels != 2 ||
+      format->nSamplesPerSec < static_cast<UINT32>(kAudioMinRate) ||
+      format->nSamplesPerSec > static_cast<UINT32>(kAudioMaxRate))
+    return FALSE;
+  if (format->wFormatTag == WAVE_FORMAT_PCM) {
+    // Uncompressed: the renderer plays S16LE directly, so only 16-bit PCM.
+    return format->wBitsPerSample == 16 ? TRUE : FALSE;
+  }
+  // Compressed: accept exactly what this FreeRDP build's DSP can decode with
+  // libavcodec (AAC/AAC-LATM reach a decoder; ADPCM/GSM/A-law/u-law are
+  // filtered out by dsp_ffmpeg.c because WITH_DSP_EXPERIMENTAL is off). Play()
+  // then decodes each packet with freerdp_dsp_decode().
+  return freerdp_dsp_supports_format(format, FALSE) ? TRUE : FALSE;
 }
 
 UINT32 rdpsndGetVolume(rdpsndDevicePlugin* device) {
@@ -794,19 +954,22 @@ BOOL rdpsndOpen(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format,
                 UINT32 latency) {
   (void)latency;
   if (format == nullptr) return FALSE;
-  char line[200];
+  char line[240];
   // "rdpsnd format selected: ..." is the acceptance marker for negotiation.
+  // tag + decode mode are appended so the log shows whether audio arrived as
+  // PCM or as a compressed payload that Play() hands to the DSP.
   std::snprintf(line, sizeof(line),
-                "rdpsnd format selected: %uHz %uch %ubit (PCM %s)",
+                "rdpsnd format selected: %uHz %uch %ubit tag=%u (0x%04x), %s",
                 static_cast<unsigned>(format->nSamplesPerSec),
                 static_cast<unsigned>(format->nChannels),
                 static_cast<unsigned>(format->wBitsPerSample),
-                format->wFormatTag == WAVE_FORMAT_PCM ? "yes" : "converted");
+                static_cast<unsigned>(format->wFormatTag),
+                static_cast<unsigned>(format->wFormatTag),
+                format->wFormatTag == WAVE_FORMAT_PCM ? "PCM passthrough"
+                                                      : "DSP decode");
   diagWarn(line);
   std::shared_ptr<RdpsndPlayer> player = rdpsndPlayerFor(device);
-  if (player != nullptr)
-    player->start(static_cast<int>(format->nSamplesPerSec),
-                  static_cast<int>(format->nChannels));
+  if (player != nullptr) player->start(*format);
   // Audio is a side path: a renderer failure must not fail the channel, so
   // Open always reports success and the session keeps running silently.
   return TRUE;
@@ -847,27 +1010,35 @@ BOOL rdpsndDefaultFormat(rdpsndDevicePlugin* device, const AUDIO_FORMAT* desired
   (void)device;
   (void)desired;
   (void)defaultFormat;
-  // No conversion fallback: only the PCM 16-bit stereo formats above are
-  // opened, so rdpsnd's !FormatSupported path is not taken for them.
+  // No fallback conversion: a format that FormatSupported() rejected is also
+  // left out of the client's format list, so rdpsnd can never select it and
+  // this callback stays unused. Returning FALSE keeps FreeRDP's PCM default.
   return FALSE;
 }
 
 UINT rdpsndServerFormatAnnounce(rdpsndDevicePlugin* device,
                                 const AUDIO_FORMAT* formats, size_t count) {
   (void)device;
-  size_t usable = 0;
+  size_t usablePcm = 0;
+  size_t usableCompressed = 0;
   if (formats != nullptr) {
     for (size_t index = 0; index < count; ++index) {
-      if (rdpsndFormatSupported(nullptr, &formats[index]) == TRUE) ++usable;
+      if (rdpsndFormatSupported(nullptr, &formats[index]) != TRUE) continue;
+      if (formats[index].wFormatTag == WAVE_FORMAT_PCM)
+        ++usablePcm;
+      else
+        ++usableCompressed;
     }
   }
+  const size_t usable = usablePcm + usableCompressed;
   char line[240];
   if (count == 0 || formats == nullptr) {
     std::snprintf(line, sizeof(line),
                   "rdpsnd: server offered no audio formats, staying silent");
   } else if (usable == 0) {
+    // Kept behaviour: nothing playable -> stay silent and say why.
     std::snprintf(line, sizeof(line),
-                  "rdpsnd: no PCM format offered (%zu format(s); first tag=%u "
+                  "rdpsnd: no usable format offered (%zu format(s); first tag=%u "
                   "%uHz %uch %ubit), staying silent",
                   count, static_cast<unsigned>(formats[0].wFormatTag),
                   static_cast<unsigned>(formats[0].nSamplesPerSec),
@@ -876,8 +1047,8 @@ UINT rdpsndServerFormatAnnounce(rdpsndDevicePlugin* device,
   } else {
     std::snprintf(line, sizeof(line),
                   "rdpsnd: server offered %zu format(s), %zu usable PCM 16-bit "
-                  "stereo format(s)",
-                  count, usable);
+                  "stereo + %zu decodable compressed (2ch)",
+                  count, usablePcm, usableCompressed);
   }
   diagWarn(line);
   return CHANNEL_RC_OK;
@@ -1767,11 +1938,13 @@ BOOL preConnect(freerdp* instance) {
   //    which accepts every format and silently discards all audio.
   //  - the arguments select the OHOS renderer device subsystem registered by
   //    installRdpsndAddinProvider() ("sys:tianguan"), and pin rdpsnd's
-  //    fixed_format to PCM stereo ("format:1"/"channel:2") so the client never
-  //    advertises a compressed format (no decoder) or an odd layout it cannot
-  //    open.
+  //    fixed_format to stereo ("channel:2") so the client never advertises a
+  //    layout this renderer cannot open. "format:1" (PCM only) is gone on
+  //    purpose: it filtered every compressed format out before the device saw
+  //    it, and this FreeRDP build now has WITH_DSP_FFMPEG, so AAC/AAC-LATM can
+  //    be decoded by the device plugin (freerdp_dsp_decode).
   static const char* kSoundChannel[] = {
-      RDPSND_CHANNEL_NAME, "sys:tianguan", "format:1", "channel:2"};
+      RDPSND_CHANNEL_NAME, "sys:tianguan", "channel:2"};
   if (!freerdp_client_add_static_channel(settings, ARRAYSIZE(kSoundChannel),
                                          kSoundChannel) ||
       !freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(kSoundChannel),
@@ -1790,14 +1963,17 @@ BOOL preConnect(freerdp* instance) {
   // channel (freerdp_client_load_addins) before drdynvc is opened.
   if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE))
     return FALSE;
-  // No H.264 backend in this prefix (WITH_GFX_H264=OFF): an AVC420/AVC444
-  // surface could not be decoded, so advertise every AVC flavour as disabled
-  // and leave the still-supported codecs (RemoteFX / progressive / planar /
-  // clear) at their defaults. FreeRDP translates these to
-  // RDPGFX_CAPS_FLAG_AVC_DISABLED in the 10.x capability sets.
-  if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE) ||
-      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE) ||
-      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE))
+  // This prefix is built WITH_FFMPEG/WITH_SWSCALE, so config.h defines
+  // WITH_GFX_H264 and libavcodec/libswscale decode AVC420/AVC444(x). Advertise
+  // all three AVC flavours instead of the previous explicit disable:
+  // FreeRDP_GfxH264 adds RDPGFX_CAPS_FLAG_AVC420_ENABLED to the 8.1 caps set,
+  // and GfxAVC444/GfxAVC444v2 clear RDPGFX_CAPS_FLAG_AVC_DISABLED on 10.x.
+  // The still-supported codecs (RemoteFX / progressive / planar / clear) stay
+  // at their defaults. If the server never selects AVC the stats line keeps
+  // reporting whatever codec id it did select (8=clear, 10=planar, ...).
+  if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE))
     return FALSE;
   return TRUE;
 }

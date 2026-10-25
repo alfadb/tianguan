@@ -16,7 +16,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
   # linked into libtianguan_diag.so without adding any shared dependency.
   set(RDP_DEPS_PREFIX
     "${CMAKE_CURRENT_SOURCE_DIR}/../../.work/rdp-deps/ohos/prefix"
-    CACHE PATH "FreeRDP 3.9.0 / OpenSSL / zlib static prefix for OHOS")
+    CACHE PATH "FreeRDP 3.9.0 / FFmpeg 7.1.5 / OpenSSL / zlib static prefix for OHOS")
   add_library(tianguan_diag SHARED
     diagnostics.cxx napi_bridge.cxx render.cxx rdp_backend.cxx)
   target_compile_definitions(tianguan_diag PRIVATE TIANGUAN_WITH_RDP=1)
@@ -31,8 +31,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
     # library, so the shared object gains exactly one more system NEEDED entry.
     EGL GLESv3 native_window ohaudio
     # Static FreeRDP stack, in link order: client-common, core, WinPR, then the
-    # static OpenSSL/zlib and libc dependencies. No shared FreeRDP/OpenSSL.
-    freerdp-client3 freerdp3 winpr3 ssl crypto z pthread dl m)
+    # static OpenSSL/zlib dependencies. No shared FreeRDP/OpenSSL.
+    freerdp-client3 freerdp3 winpr3 ssl crypto z
+    # Static FFmpeg 7.1.5 archives from the same prefix, last as the dependency
+    # manifest orders them (FreeRDP was built WITH_FFMPEG/WITH_SWSCALE, but its
+    # .pc files do not list the libav* archives). libavcodec provides the GFX
+    # H.264 decoder (AVC420/AVC444) and the rdpsnd compressed-audio decoders
+    # (AAC/AAC-LATM), libswscale the YUV->RGB conversion, libswresample the
+    # decoder sample-rate/channel conversion, libavutil the common runtime.
+    # They are archives only: -Wl,-z,defs must still close over them here.
+    avcodec swscale swresample avutil
+    # libc dependencies last (libavcodec needs pthread/dl/m too).
+    pthread dl m)
   target_link_options(tianguan_diag PRIVATE "-Wl,-z,defs")
 else()
   # Host build deliberately excludes rdp_backend.cxx: the OHOS FreeRDP prefix
