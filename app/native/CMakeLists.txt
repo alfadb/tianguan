@@ -4,9 +4,16 @@ project(tianguan_diag LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(BUILD_TESTING OFF CACHE BOOL "Disable upstream experiment tests" FORCE)
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../experiments/vnc-core"
-  "${CMAKE_CURRENT_BINARY_DIR}/vnc-core" EXCLUDE_FROM_ALL)
-set_target_properties(tigervnc_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# scripts/test.sh configures with this ON to build ONLY the host unit test:
+# the TigerVNC experiment subdirectory needs a pinned upstream checkout and
+# prebuilt dependency prefixes, which the pure view-geometry test must not
+# require. Default OFF keeps every normal host/OHOS build unchanged.
+option(TIANGUAN_GEOMETRY_TEST_ONLY "Configure only the host-side unit test" OFF)
+if(NOT TIANGUAN_GEOMETRY_TEST_ONLY)
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../experiments/vnc-core"
+    "${CMAKE_CURRENT_BINARY_DIR}/vnc-core" EXCLUDE_FROM_ALL)
+  set_target_properties(tigervnc_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
   # FreeRDP 3.9.0 (RDP client) static prefix built by
   # `scripts/build-rdp-deps.sh ohos`. The default is the repository-local
@@ -49,6 +56,16 @@ else()
   # is AArch64-only and its static OpenSSL is incompatible with the host's
   # shared system OpenSSL. diagnostics.cxx compiles its RDP entry point out
   # unless TIANGUAN_WITH_RDP is defined.
-  add_executable(tianguan_diag_host diagnostics.cxx host_main.cxx)
-  target_link_libraries(tianguan_diag_host PRIVATE tigervnc_client)
+  # The diagnostics host binary links the TigerVNC experiment; in test-only
+  # mode that subtree is not configured, so only the pure test is built.
+  if(NOT TIANGUAN_GEOMETRY_TEST_ONLY)
+    add_executable(tianguan_diag_host diagnostics.cxx host_main.cxx)
+    target_link_libraries(tianguan_diag_host PRIVATE tigervnc_client)
+  endif()
+
+  # Pure-logic host unit test for the view transform geometry (no EGL/GLES, no
+  # device). `ctest` in this build directory runs it; scripts/test.sh does.
+  enable_testing()
+  add_executable(tianguan_geometry_test tests/view_geometry_test.cxx)
+  add_test(NAME tianguan_geometry_test COMMAND tianguan_geometry_test)
 endif()

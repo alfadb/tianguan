@@ -225,6 +225,25 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 
 输出：`app/entry/build/default/outputs/default/entry-default-unsigned.hap`。构建缓存与复制库位于本工程忽略的生成目录。本地 `cpp/types` 只有 API 声明，不编译或替代 `app/native` 实现。
 
+## 自动化单测（`bash scripts/test.sh`）
+
+纯逻辑回归的统一入口，不需要设备、网络、签名或凭据，不修改源码：
+
+```sh
+bash scripts/test.sh            # 原生几何 + ArkTS 连接逻辑
+bash scripts/test.sh --native   # 只跑原生几何单测
+bash scripts/test.sh --arkts    # 只跑 ArkTS 连接逻辑单测
+```
+
+当前覆盖两个套件：
+
+- **原生几何**（CTest，1 个用例 / 104 项断言）：`app/native/tests/view_geometry_test.cxx` 只依赖 C++ 标准库和 `app/native/view_geometry.h`。覆盖 zoom=1 时非 0 pan 仍居中、放大后内容超出时 pan 夹在 `[surface-content, 0]`（纵向同理）、内容小于表面时强制居中、zoom 夹取 `[1, 4]` 且 NaN/inf 回退 1、NaN pan 回退 0、旋转（surface 宽高互换）后重算，以及 `renderStats` 的 surface 点 → 远端像素映射公式。脚本在 `.work/test-native-host` 用 `-DTIANGUAN_GEOMETRY_TEST_ONLY=ON` 做 host 配置后构建 `tianguan_geometry_test` 并跑 `ctest`；该开关只跳过需要 TigerVNC 固定源码与预编译依赖前缀的 `experiments/vnc-core` 子目录，默认 OFF，正常 host/OHOS 构建不变。测试目标只在 `app/native/CMakeLists.txt` 的 host 分支注册，OHOS 分支不编译测试。
+- **ArkTS 连接逻辑**（node，20 个用例）：`app/tests/arkts/connection_codec.test.mjs` 用 node 直接运行。它把 `app/entry/src/main/ets/model/ConnectionCodec.ets` 逐字节复制到临时目录（不改生产源码），用 HarmonyOS SDK 自带的 TypeScript（`.../ets-loader/node_modules/typescript`；可用 `TIANGUAN_TSC` 指向 tsc，或用 `TIANGUAN_SDK_ROOT` 指向 SDK）编译成 `.mjs` 后 import。覆盖连接记录解析与迁移（旧记录无 id 时 id=`host:port`、已有 id 不重写、缺/未知 protocol 归一为 `vnc`、username/domain 缺省 `''`、group/lastConnectedAt 缺省、数组中混入 null/数字/字符串等非法元素时只跳过坏记录而不丢弃整表）、序列化与往返（F8 字段丢失回归）、`pinKeyFor`（VNC `host:port` / RDP `rdp:host:port`）、`defaultPortFor`（VNC 5901 / RDP 3389）与密码 alias（VNC `tianguan:host:port` / RDP `tianguan:rdp:host:port`，同 host:port 不冲突）。
+
+每个阶段打印 `[PASS]/[FAIL] <name>`，结束打印汇总；任一阶段失败脚本以非零状态退出。`ConnectionStore.ets` 只保留文件/密钥库 I/O，纯函数从 `ConnectionCodec.ets` 导入并按原签名再导出，`Index.ets` / `Remote.ets` 的 import 与连接数据格式不变。
+
+未覆盖：真机冒烟（签名安装、真实 VNC/RDP 连接、手势与输入回传）仍按本文其它章节在设备上人工执行；RDP 原生后端（FreeRDP、证书校验）没有 host 单测；`ConnectionStore.ets` 的文件读写与系统密钥库路径仍需真机验证。
+
 ## 历史验证记录（2026-10-16，纯诊断轮次）
 
 该轮验证时间为 `2026-10-16T01:23:30Z`（UTC）。已运行 `cmake --build .work/hap-native-host --target tianguan_diag_host -j 2` 并执行 `.work/hap-native-host/tianguan_diag_host`，退出 0，同源真实三项全部 PASS：RA2_256 工厂、RFB 3.8 内存 Raw 2×1、Thread 协作退出。随后 `cmake --build .work/hap-native-ohos --target tianguan_diag -j 2` 与 `bash app/build.sh` 均退出 0，完成更新后的 OHOS shared 与 unsigned HAP。实查库依赖包含 `libc++_shared.so`，已随包携带 SDK runtime；包内诊断库与本轮输入经同一 SDK `llvm-strip` 后字节一致。包内 bundle、版本、API26、`2in1` 与 `phone` 双设备已核对（该历史纯诊断包无权限声明）。未重跑未触及的原 host 9 项或 RA2 socket 集成 3 项。此证据仅覆盖该轮 host 诊断、OHOS 编译链接与本机构建/包内核验；该轮未执行设备诊断。网络测试的设备结果见上文「实测结果（2026-10-20，指纹确认实现前的旧测试模式）」的历史记录。
