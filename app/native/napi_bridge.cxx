@@ -133,6 +133,10 @@ bool GetIntArg(napi_env env, napi_value value, int& out) {
   out = number;
   return true;
 }
+bool GetDoubleArg(napi_env env, napi_value value, double& out) {
+  if (napi_get_value_double(env, value, &out) != napi_ok) return false;
+  return true;
+}
 napi_value StartSession(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -390,6 +394,23 @@ napi_value SuspendRenderSurface(napi_env env, napi_callback_info info) {
     return MakeString(env, "INVALID_SESSION");
   return MakeString(env, tianguan::setRenderSurfaceSuspended(sessionId, suspended));
 }
+// View transform for the native renderer: zoom multiple of the contain fit
+// (clamped natively to [1, maxZoom]) plus a pan offset in surface pixels,
+// clamped by the renderer against the live surface size. Returns "OK" or an
+// error string.
+napi_value SetViewTransform(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4];
+  std::string sessionId;
+  double zoom = 1.0;
+  double panX = 0.0;
+  double panY = 0.0;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 4 ||
+      !GetStringArg(env, argv[0], 256, sessionId) || !GetDoubleArg(env, argv[1], zoom) ||
+      !GetDoubleArg(env, argv[2], panX) || !GetDoubleArg(env, argv[3], panY))
+    return MakeString(env, "ERROR:INVALID_ARGUMENTS");
+  return MakeString(env, tianguan::setViewTransform(sessionId, zoom, panX, panY));
+}
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
     {"runDiagnostics", nullptr, Run, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -415,9 +436,10 @@ napi_value Init(napi_env env, napi_value exports) {
     {"attachRenderSurface", nullptr, AttachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"detachRenderSurface", nullptr, DetachRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"renderStats", nullptr, RenderStats, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 24, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 25, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

@@ -398,6 +398,20 @@ export interface RenderStatsInfo {
   elapsedMs: number;
   lastEglError: number;
   suspended: boolean;
+  // Presented geometry (surface pixels, top-left origin). These are computed
+  // by the native renderer and must be used as-is for input mapping:
+  // remoteX = (surfaceX - contentLeft) / contentScale,
+  // remoteY = (surfaceY - contentTop) / contentScaleY.
+  contentLeft: number;
+  contentTop: number;
+  contentScale: number;
+  contentScaleY: number;
+  contentW: number;
+  contentH: number;
+  zoom: number;
+  panX: number;
+  panY: number;
+  maxZoom: number;
 }
 
 /**
@@ -437,6 +451,23 @@ export function renderStats(sessionId: string): RenderStatsInfo | undefined {
     return JSON.parse(raw) as RenderStatsInfo;
   } catch (error) {
     return undefined;
+  }
+}
+
+/**
+ * Sets the native renderer's view transform on top of its contain fit. zoom is
+ * clamped natively to [1, maxZoom] (the renderStats field); panX/panY are
+ * surface-pixel offsets from the centred position and are clamped against the
+ * live surface size while drawing, so they never expose a blank strip.
+ * Returns 'OK' or an error string.
+ */
+export function setViewTransform(sessionId: string, zoom: number, panX: number,
+  panY: number): string {
+  try {
+    return diag.setViewTransform(sessionId, zoom, panX, panY);
+  } catch (error) {
+    warn('setViewTransform', error);
+    return 'ERROR:' + String(error);
   }
 }
 

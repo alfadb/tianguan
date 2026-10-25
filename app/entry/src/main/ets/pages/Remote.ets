@@ -34,6 +34,21 @@
  * the local cursor overlay. Setting USE_GL_RENDER = false restores the Canvas
  * path unchanged (both paths must never be mounted at the same time).
  *
+ * View transform (GL mode): a two-finger pinch zooms about the pinch centre
+ * (zoom 1 = the contain fit, never smaller) and a two-finger drag pans; both go
+ * through the native setViewTransform (coalesced to one call per frame-ish) and
+ * are clamped again by the renderer. Input mapping does not recompute the
+ * contain rectangle: it converts vp to surface pixels and uses the geometry the
+ * renderer reports in renderStats (contentLeft/contentTop/contentScale*), so
+ * clicks and the local cursor stay exact at any zoom/pan. A session
+ * (re)connect, a surface attach or a resolution change resets the transform to
+ * the contain fit, and a window resize re-clamps the pan to the new surface.
+ * Two-finger touches are never forwarded as remote pointer input: a
+ * single-finger touch only presses the remote button after a short delay, so
+ * the second finger of a pinch can no longer turn that press into a click.
+ * Three or more fingers are ignored completely (no view transform, no remote
+ * pointer event): those sequences belong to the system.
+ *
  * Everything talks to the native layer through diag/SessionApi.ets with THIS
  * session's id; the status is parsed as JSON per docs/napi-contract.md (never
  * the legacy "key=value" text). The 250 ms poll (30 ms on the Canvas path)
@@ -52,11 +67,11 @@ import { image } from '@kit.ImageKit';
 import { systemDateTime } from '@kit.BasicServicesKit';
 import { KeyCode } from '@ohos.multimodalInput.keyCode';
 import pointer from '@ohos.multimodalInput.pointer';
-import { window } from '@kit.ArkUI';
+import { display, window } from '@kit.ArkUI';
 import {
   copyCursor, parseFrameMeta, reconnectSession, releaseSessionInput, requestFullFrame,
   sendKey, sendPointer, sessionStatus, takeFrameRaw,
-  attachRenderSurface, detachRenderSurface, renderStats, suspendRenderSurface,
+  attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
   SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
@@ -78,9 +93,46 @@ const USE_GL_RENDER: boolean = true;
 // renderer pulls frames itself), so it only watches status/cursor/clipboard;
 // the Canvas path keeps its historical 30 ms frame cadence.
 const POLL_INTERVAL_MS: number = USE_GL_RENDER ? 250 : 30;
+// Two-finger view gestures (GL mode only). setViewTransform is a synchronous
+// NAPI call, so gesture updates are coalesced to at most one call per interval
+// instead of one per onActionUpdate.
+const VIEW_SEND_INTERVAL_MS: number = 33;
+// After a transform reset a poll can still return stats produced BEFORE the
+// reset; for this long the local zoom/pan must not be re-adopted from them.
+const VIEW_SYNC_GUARD_MS: number = 600;
+// Used until the renderer reports its own maxZoom.
+const MAX_VIEW_ZOOM_FALLBACK: number = 4;
+// Touch path only: a single finger does not press the remote button on
+// TouchType.Down. A second finger usually lands within this window and turns
+// the touch into a two-finger view gesture; pressing on Down and releasing
+// when the pinch starts was one complete click on the remote (the reported
+// "pinch clicks the remote desktop" bug). A quick tap (Up before the window
+// expires) still clicks: press + release are sent together on Up.
+const TOUCH_PRESS_DELAY_MS: number = 70;
+// Three or more fingers belong to the system (screenshot, split screen, ...):
+// from a third finger until every finger is up this page neither transforms
+// the view nor sends any remote pointer event.
+const MIN_BLOCKED_FINGERS: number = 3;
 
 interface RemoteRouterParams {
   sessionId?: string;
+}
+
+/**
+ * Presented rectangle of the remote framebuffer, in surface physical pixels
+ * with a top-left origin. Mirrors tianguan::ViewGeometry in
+ * app/native/view_geometry.h (the renderer's single source of truth).
+ */
+interface ViewGeometry {
+  zoom: number;
+  left: number;
+  top: number;
+  contentW: number;
+  contentH: number;
+  scaleX: number;  // surface pixels per remote pixel
+  scaleY: number;
+  panX: number;    // effective pan after clamping (surface pixels)
+  panY: number;
 }
 
 /**
@@ -260,6 +312,69 @@ struct Remote {
   private renderTexW: number = 0;
   private renderTexH: number = 0;
   private lastRenderError: string = '';
+  // --- Two-finger view transform (USE_GL_RENDER) ---------------------------
+  // zoom is a multiple of the contain fit (1 = the old letterboxed layout,
+  // never below 1); panX/panY are surface-pixel offsets from the centred
+  // position. Native is the authority (it clamps both while drawing); these
+  // fields hold what this page asked for, and are re-synced from renderStats
+  // once the renderer has drawn it.
+  private viewZoom: number = 1;
+  private viewPanX: number = 0;
+  private viewPanY: number = 0;
+  private viewMaxZoom: number = MAX_VIEW_ZOOM_FALLBACK;
+  // Presented geometry from the last renderStats(): exactly what is on screen.
+  // Input mapping (and the local cursor overlay) read these values; the contain
+  // layout is never recomputed locally while a snapshot is available.
+  private statsGeometryValid: boolean = false;
+  private statsSurfaceW: number = 0;
+  private statsSurfaceH: number = 0;
+  private statsContentLeft: number = 0;
+  private statsContentTop: number = 0;
+  private statsContentScale: number = 0;
+  private statsContentScaleY: number = 0;
+  private statsContentW: number = 0;
+  private statsContentH: number = 0;
+  // Last resort vp->surface-pixel factor when no stats snapshot exists yet.
+  private densityPixels: number = 0;
+  private viewSyncGuardUntil: number = 0;
+  private viewSendTimer: number = -1;
+  private viewSendAt: number = 0;
+  private geometryRefreshTimer: number = -1;
+  private lastViewTransformError: string = '';
+  // Live two-finger gesture. The pinch and the two-finger pan recognizers run
+  // in parallel; the last event of either re-applies the same combined state.
+  private gestureActive: boolean = false;
+  private gestureStartZoom: number = 1;
+  private gestureStartPanX: number = 0;
+  private gestureStartPanY: number = 0;
+  private gestureAnchorValid: boolean = false;
+  private gestureAnchorRemoteX: number = 0;
+  private gestureAnchorRemoteY: number = 0;
+  private gestureCenterSurfX: number = 0;
+  private gestureCenterSurfY: number = 0;
+  private gestureScale: number = 1;
+  private gesturePanRawX: number = 0;
+  private gesturePanRawY: number = 0;
+  private gesturePanBaseX: number = 0;
+  private gesturePanBaseY: number = 0;
+  // True while two fingers are down: single-finger remote pointer input is
+  // frozen (and any held button released) until a fresh one-finger touch.
+  private multiTouchActive: boolean = false;
+  // --- Touch press delay / three-finger block ------------------------------
+  // Identifier of every finger currently down, maintained from changedTouches
+  // (Down adds, Up removes, Cancel clears) and healed from touches on
+  // Down/Move. event.touches can be empty on Up/Cancel, so the finger count
+  // that gates the deferred press and the three-finger block comes from here.
+  private touchFingerIds: Set<number> = new Set<number>();
+  // Deferred single-finger press: armed on Down, fired after
+  // TOUCH_PRESS_DELAY_MS if exactly one finger is still down, and cancelled for
+  // the whole gesture as soon as a second finger lands.
+  private touchPressTimer: number = -1;
+  private touchPressPending: boolean = false;
+  // True from the third finger until every finger is up: pinch/two-finger pan
+  // callbacks return immediately (the transform is frozen where it was) and no
+  // remote pointer event is sent.
+  private multiTouchBlocked: boolean = false;
 
   aboutToAppear(): void {
     this.glController.onSurfaceReady = (surfaceId: string): void => {
@@ -348,6 +463,16 @@ struct Remote {
     this.tornDown = true;
     this.stopFrameTimer();
     this.stopIdleTimer();
+    // Drop pending view-transform work before the surface goes away: the
+    // timers would otherwise fire against a detached renderer.
+    this.cancelViewSendTimer();
+    this.cancelGeometryRefresh();
+    this.cancelTouchPress();
+    this.touchFingerIds.clear();
+    this.multiTouchBlocked = false;
+    this.multiTouchActive = false;
+    this.gestureActive = false;
+    this.statsGeometryValid = false;
     this.detachWindowEvents();
     this.detachRendererSurface('teardown');
     this.dropFramePixels();
@@ -473,6 +598,7 @@ struct Remote {
       // Another window now owns the keyboard/mouse: anything held here would
       // otherwise stay pressed on the server.
       this.releaseAllInputs('window-inactive');
+      this.endGesture();
     } else if (event === window.WindowEventType.WINDOW_HIDDEN) {
       this.setPageVisible(false);
     } else if (event === window.WindowEventType.WINDOW_SHOWN) {
@@ -510,7 +636,12 @@ struct Remote {
       // Keep the id only when the native side accepted it, so a later surface
       // event can retry.
       this.glAttachedSurfaceId = previous;
+      return;
     }
+    // A newly attached renderer starts at the contain fit (zoom 1, pan 0):
+    // drop whatever transform the previous surface had, so the page and the
+    // renderer agree from the first frame on.
+    this.resetViewTransform('surface-attached');
   }
 
   private detachRendererSurface(reason: string): void {
@@ -545,6 +676,40 @@ struct Remote {
     this.renderSwapFailures = stats.swapFailures;
     this.renderTexW = stats.texWidth;
     this.renderTexH = stats.texHeight;
+    // Presented geometry: the native renderer reports the rectangle AND the
+    // surface size it drew on, both in surface physical pixels. These values
+    // are the truth for input mapping and for vp->pixel conversion; nothing
+    // here recomputes a contain layout.
+    if (stats.width > 0 && stats.height > 0) {
+      this.statsSurfaceW = stats.width;
+      this.statsSurfaceH = stats.height;
+    }
+    if (stats.maxZoom > 1) {
+      this.viewMaxZoom = stats.maxZoom;
+    }
+    const geometryValid = stats.contentW > 0 && stats.contentH > 0 &&
+      stats.contentScale > 0 && stats.contentScaleY > 0 &&
+      stats.width > 0 && stats.height > 0;
+    if (geometryValid) {
+      this.statsContentLeft = stats.contentLeft;
+      this.statsContentTop = stats.contentTop;
+      this.statsContentScale = stats.contentScale;
+      this.statsContentScaleY = stats.contentScaleY;
+      this.statsContentW = stats.contentW;
+      this.statsContentH = stats.contentH;
+      this.statsGeometryValid = true;
+      // Adopt the renderer's clamped zoom/pan (e.g. after a rotation re-clamped
+      // the pan) — unless a gesture is driving them, or the snapshot may still
+      // belong to a transform this page has already replaced.
+      if (!this.gestureActive && Date.now() >= this.viewSyncGuardUntil &&
+          Date.now() - this.viewSendAt > 120 && stats.zoom >= 1) {
+        this.viewZoom = stats.zoom;
+        this.viewPanX = stats.panX;
+        this.viewPanY = stats.panY;
+      }
+    } else {
+      this.statsGeometryValid = false;
+    }
     if (stats.frames > 0 && !this.canvasShown) {
       this.canvasShown = true;
     }
@@ -606,6 +771,8 @@ struct Remote {
       // Nobody can see the frames, so stop fetching them; the 1 s status poll
       // keeps reconnects/trust prompts advancing.
       this.releaseAllInputs('page-hidden');
+      // A gesture in flight must not survive the window going away.
+      this.endGesture();
       if (USE_GL_RENDER) {
         suspendRenderSurface(this.sessionId, true);
       }
@@ -665,6 +832,11 @@ struct Remote {
   // -------------------------------------------------------------------------
 
   private releaseAllInputs(reason: string): void {
+    // A touch that has not pressed yet must not press after the release.
+    this.cancelTouchPress();
+    this.touchFingerIds.clear();
+    this.multiTouchBlocked = false;
+    this.multiTouchActive = false;
     const hadLocalState = this.pressedMask !== 0 || this.shiftDown ||
       this.pressedKeysym.size > 0;
     this.pressedMask = 0;
@@ -1003,28 +1175,26 @@ struct Remote {
 
   // Computes `[left, top, width, height]` for the local cursor, or an empty
   // array when the pointer is outside the picture. Pure so the poll fallback
-  // and the per-event path place the cursor identically.
+  // and the per-event path place the cursor identically. left/top/scale* are
+  // the picture geometry in vp (from renderStats in GL mode, or the contain fit
+  // on the Canvas path), so the overlay follows zoom and pan.
   private static cursorRect(cw: number, ch: number, hotX: number, hotY: number,
-                            viewW: number, viewH: number,
-                            frameW: number, frameH: number,
+                            left: number, top: number,
+                            scaleX: number, scaleY: number,
+                            contentW: number, contentH: number,
                             px: number, py: number): number[] {
-    if (cw <= 0 || ch <= 0 || viewW <= 0 || viewH <= 0 || frameW <= 0 || frameH <= 0 ||
-        px < 0 || py < 0) {
+    if (cw <= 0 || ch <= 0 || contentW <= 0 || contentH <= 0 ||
+        scaleX <= 0 || scaleY <= 0 || px < 0 || py < 0) {
       return [];
     }
-    const scale = Math.min(viewW / frameW, viewH / frameH);
-    const contentW = frameW * scale;
-    const contentH = frameH * scale;
-    const offsetX = (viewW - contentW) / 2;
-    const offsetY = (viewH - contentH) / 2;
-    if (px < offsetX || py < offsetY || px > offsetX + contentW || py > offsetY + contentH) {
+    if (px < left || py < top || px > left + contentW || py > top + contentH) {
       return [];
     }
     return [
-      Math.round(px - hotX * scale),
-      Math.round(py - hotY * scale),
-      Math.max(1, Math.round(cw * scale)),
-      Math.max(1, Math.round(ch * scale))
+      Math.round(px - hotX * scaleX),
+      Math.round(py - hotY * scaleY),
+      Math.max(1, Math.round(cw * scaleX)),
+      Math.max(1, Math.round(ch * scaleY))
     ];
   }
 
@@ -1036,10 +1206,29 @@ struct Remote {
         this.disposed) {
       return;
     }
-    const rect = Remote.cursorRect(this.cursorShapeW, this.cursorShapeH,
-      this.cursorHotX, this.cursorHotY,
-      this.viewWidth, this.viewHeight, this.frameWidth, this.frameHeight,
-      this.viewPointerX, this.viewPointerY);
+    let rect: number[] = [];
+    const pxPerVpX = this.surfacePixelsPerVpX();
+    const pxPerVpY = this.surfacePixelsPerVpY();
+    if (USE_GL_RENDER && this.statsGeometryValid && pxPerVpX > 0 && pxPerVpY > 0) {
+      // Same geometry input mapping uses: the cursor cannot drift away from
+      // the remote pointer at zoom != 1.
+      rect = Remote.cursorRect(this.cursorShapeW, this.cursorShapeH,
+        this.cursorHotX, this.cursorHotY,
+        this.statsContentLeft / pxPerVpX, this.statsContentTop / pxPerVpY,
+        this.statsContentScale / pxPerVpX, this.statsContentScaleY / pxPerVpY,
+        this.statsContentW / pxPerVpX, this.statsContentH / pxPerVpY,
+        this.viewPointerX, this.viewPointerY);
+    } else if (this.viewWidth > 0 && this.viewHeight > 0 &&
+               this.frameWidth > 0 && this.frameHeight > 0) {
+      const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
+      const contentW = this.frameWidth * scale;
+      const contentH = this.frameHeight * scale;
+      rect = Remote.cursorRect(this.cursorShapeW, this.cursorShapeH,
+        this.cursorHotX, this.cursorHotY,
+        (this.viewWidth - contentW) / 2, (this.viewHeight - contentH) / 2,
+        scale, scale, contentW, contentH,
+        this.viewPointerX, this.viewPointerY);
+    }
     if (rect.length === 0) {
       // Pointer in the letterbox margin or not on the picture: leave the cursor
       // where it was instead of moving it into the black border.
@@ -1083,6 +1272,9 @@ struct Remote {
     if (generation > 0) {
       if (this.lastGeneration >= 0 && generation !== this.lastGeneration) {
         this.releaseAllInputs('generation');
+        // A reconnect rebuilds the native mirror and renderer state: the view
+        // transform restarts at the contain fit on both sides.
+        this.resetViewTransform('reconnect');
         this.invalidateRender();
         this.requestFull();
       }
@@ -1302,6 +1494,7 @@ struct Remote {
         ',skips:' + this.renderSkips +
         ',swapFail:' + this.renderSwapFailures +
         ',tex:' + this.renderTexW + 'x' + this.renderTexH +
+        ',view:' + this.viewStateText() +
         (this.lastRenderError.length > 0 ? ',error:' + this.lastRenderError : '') + '}' : '');
     // Debug level: these are periodic (2 s) timing summaries, not errors. The
     // default log level stays quiet; raise it only when diagnosing a stall.
@@ -1350,7 +1543,600 @@ struct Remote {
     this.perfFullFrames = 0;
   }
 
-  // RFB button bits: 1 left, 2 middle, 4 right (8/16 are the wheel notches).
+  // -------------------------------------------------------------------------
+  // Two-finger view transform: pinch zooms, two-finger drag pans (GL mode).
+  //
+  // Units: ArkUI gesture events are vp relative to the remote_area Column; the
+  // native renderer's geometry is in surface physical pixels. The conversion
+  // factor is the surface size renderStats reports divided by the component
+  // size in vp — the actual surface this renderer draws on — and only falls
+  // back to the display density when no snapshot exists yet.
+  //
+  // The picture geometry used for input mapping is NEVER recomputed there: it
+  // is read from renderStats (contentLeft/contentTop/contentScale*), so clicks
+  // keep matching what the renderer presented at any zoom/pan. The local
+  // computeViewGeometry() below exists only to predict/limit gesture motion
+  // (same formula and rounding as app/native/view_geometry.h) and is clamped
+  // by the native side again on every setViewTransform.
+  // -------------------------------------------------------------------------
+
+  /** Compact one-line view state for the 2 s perf summary and gesture logs. */
+  private viewStateText(): string {
+    return 'zoom=' + this.viewZoom.toFixed(3) +
+      ',pan=' + this.viewPanX.toFixed(1) + ',' + this.viewPanY.toFixed(1) +
+      ',content=' + this.statsContentLeft + ',' + this.statsContentTop +
+      ',' + this.statsContentW + 'x' + this.statsContentH +
+      ',scale=' + this.statsContentScale.toFixed(4) + ',' + this.statsContentScaleY.toFixed(4) +
+      ',surf=' + this.statsSurfaceW + 'x' + this.statsSurfaceH +
+      ',vp=' + this.viewWidth + 'x' + this.viewHeight;
+  }
+
+  private deviceDensity(): number {
+    if (this.densityPixels > 0) {
+      return this.densityPixels;
+    }
+    try {
+      const info = display.getDefaultDisplaySync();
+      if (info.densityPixels > 0) {
+        this.densityPixels = info.densityPixels;
+      }
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '读取屏幕密度失败：%{public}s', String(error));
+    }
+    return this.densityPixels > 0 ? this.densityPixels : 1;
+  }
+
+  /** Surface physical pixels per vp, for converting gesture coordinates. */
+  private surfacePixelsPerVpX(): number {
+    if (this.statsSurfaceW > 0 && this.viewWidth > 0) {
+      return this.statsSurfaceW / this.viewWidth;
+    }
+    return this.deviceDensity();
+  }
+
+  private surfacePixelsPerVpY(): number {
+    if (this.statsSurfaceH > 0 && this.viewHeight > 0) {
+      return this.statsSurfaceH / this.viewHeight;
+    }
+    return this.deviceDensity();
+  }
+
+  private clampViewZoom(zoom: number): number {
+    const max = this.viewMaxZoom > 1 ? this.viewMaxZoom : MAX_VIEW_ZOOM_FALLBACK;
+    if (!Number.isFinite(zoom)) {
+      return 1;
+    }
+    return Math.min(Math.max(zoom, 1), max);
+  }
+
+  /**
+   * Predicted presentation rectangle for a requested zoom/pan in surface
+   * pixels, computed exactly like app/native/view_geometry.h (float32 scale,
+   * same rounding, same clamp). Gesture maths and the resize re-clamp use it;
+   * input mapping reads the native renderStats fields instead.
+   */
+  private computeViewGeometry(zoom: number, panX: number, panY: number): ViewGeometry | undefined {
+    const surfW = this.statsSurfaceW;
+    const surfH = this.statsSurfaceH;
+    const fbW = this.frameWidth;
+    const fbH = this.frameHeight;
+    if (surfW <= 0 || surfH <= 0 || fbW <= 0 || fbH <= 0) {
+      return undefined;
+    }
+    const z = this.clampViewZoom(zoom);
+    // The native geometry uses float32; Math.fround reproduces it exactly. This
+    // matters at .5 rounding boundaries, where a double would predict a
+    // rectangle one surface pixel away from the one the renderer actually drew.
+    const base = Math.fround(Math.min(Math.fround(surfW / fbW), Math.fround(surfH / fbH)));
+    const scale = Math.fround(base * Math.fround(z));
+    const contentW = Math.max(1, Math.floor(Math.fround(Math.fround(fbW * scale) + 0.5)));
+    const contentH = Math.max(1, Math.floor(Math.fround(Math.fround(fbH * scale) + 0.5)));
+    // Integer centring uses truncation, exactly like the native int division.
+    const centredLeft = Math.trunc((surfW - contentW) / 2);
+    const centredTop = Math.trunc((surfH - contentH) / 2);
+    let left = centredLeft;
+    let panXEff = 0;
+    if (contentW > surfW) {
+      const minLeft = surfW - contentW;
+      let wanted = centredLeft + (Number.isFinite(panX) ? panX : 0);
+      if (wanted < minLeft) {
+        wanted = minLeft;
+      }
+      if (wanted > 0) {
+        wanted = 0;
+      }
+      left = wanted;
+      panXEff = left - centredLeft;
+    }
+    let top = centredTop;
+    let panYEff = 0;
+    if (contentH > surfH) {
+      const minTop = surfH - contentH;
+      let wanted = centredTop + (Number.isFinite(panY) ? panY : 0);
+      if (wanted < minTop) {
+        wanted = minTop;
+      }
+      if (wanted > 0) {
+        wanted = 0;
+      }
+      top = wanted;
+      panYEff = top - centredTop;
+    }
+    return {
+      zoom: z,
+      left: left,
+      top: top,
+      contentW: contentW,
+      contentH: contentH,
+      scaleX: contentW / fbW,
+      scaleY: contentH / fbH,
+      panX: panXEff,
+      panY: panYEff
+    };
+  }
+
+  private clearStatsGeometry(): void {
+    this.statsGeometryValid = false;
+    this.statsContentLeft = 0;
+    this.statsContentTop = 0;
+    this.statsContentScale = 0;
+    this.statsContentScaleY = 0;
+    this.statsContentW = 0;
+    this.statsContentH = 0;
+  }
+
+  private cancelViewSendTimer(): void {
+    if (this.viewSendTimer >= 0) {
+      clearTimeout(this.viewSendTimer);
+      this.viewSendTimer = -1;
+    }
+  }
+
+  private cancelGeometryRefresh(): void {
+    if (this.geometryRefreshTimer >= 0) {
+      clearTimeout(this.geometryRefreshTimer);
+      this.geometryRefreshTimer = -1;
+    }
+  }
+
+  /** Coalesces gesture updates into at most one setViewTransform per interval. */
+  private scheduleViewTransform(): void {
+    if (!USE_GL_RENDER || this.disposed) {
+      return;
+    }
+    if (this.viewSendTimer >= 0) {
+      return;
+    }
+    const elapsed = Date.now() - this.viewSendAt;
+    const wait = elapsed >= VIEW_SEND_INTERVAL_MS ? 0 : VIEW_SEND_INTERVAL_MS - elapsed;
+    this.viewSendTimer = setTimeout((): void => {
+      this.flushViewTransform();
+    }, wait);
+  }
+
+  private flushViewTransform(): void {
+    this.cancelViewSendTimer();
+    if (!USE_GL_RENDER || this.disposed || this.sessionId.length === 0 ||
+        this.glAttachedSurfaceId.length === 0) {
+      return;
+    }
+    this.viewSendAt = Date.now();
+    const result = setViewTransform(this.sessionId, this.viewZoom, this.viewPanX, this.viewPanY);
+    if (result !== 'OK' && result !== this.lastViewTransformError) {
+      this.lastViewTransformError = result;
+      hilog.warn(DOMAIN, TAG,
+        'setViewTransform 失败 session=%{public}s result=%{public}s view=%{public}s',
+        this.sessionId, result, this.viewStateText());
+    }
+  }
+
+  /**
+   * Reads renderStats again shortly after a transform or resize, so the
+   * geometry used by input mapping catches up without waiting for the 250 ms
+   * status poll (and a tap right after a pinch still lands on target).
+   */
+  private scheduleGeometryRefresh(delayMs: number): void {
+    if (!USE_GL_RENDER || this.disposed) {
+      return;
+    }
+    this.cancelGeometryRefresh();
+    this.geometryRefreshTimer = setTimeout((): void => {
+      this.geometryRefreshTimer = -1;
+      if (this.disposed) {
+        return;
+      }
+      this.pollRenderStats();
+    }, delayMs);
+  }
+
+  /**
+   * Drops the local zoom/pan and asks the native renderer for the contain fit.
+   * Called when a session is (re)created/reconnected or a surface is attached:
+   * the native renderer starts at 1/0 in those cases, so both sides must agree.
+   */
+  private resetViewTransform(reason: string): void {
+    this.cancelViewSendTimer();
+    this.gestureActive = false;
+    this.gestureAnchorValid = false;
+    this.gestureScale = 1;
+    this.viewZoom = 1;
+    this.viewPanX = 0;
+    this.viewPanY = 0;
+    this.clearStatsGeometry();
+    // The next stats snapshot may still describe the transform before the
+    // reset; do not adopt it back into the local state.
+    this.viewSyncGuardUntil = Date.now() + VIEW_SYNC_GUARD_MS;
+    if (!USE_GL_RENDER || this.sessionId.length === 0 ||
+        this.glAttachedSurfaceId.length === 0) {
+      return;
+    }
+    this.viewSendAt = Date.now();
+    const result = setViewTransform(this.sessionId, 1, 0, 0);
+    hilog.info(DOMAIN, TAG, '视图变换重置 reason=%{public}s session=%{public}s result=%{public}s',
+      reason, this.sessionId, result);
+    if (result !== 'OK') {
+      this.lastViewTransformError = result;
+      hilog.warn(DOMAIN, TAG, '重置视图变换失败 session=%{public}s result=%{public}s',
+        this.sessionId, result);
+    }
+    this.scheduleGeometryRefresh(60);
+  }
+
+  /** Releases a button the first finger pressed, without a stray click. */
+  private abortSingleFingerInput(): void {
+    if (this.pressedMask === 0) {
+      return;
+    }
+    this.pressedMask = 0;
+    // Cancel the two-quick-taps double-click detection: this was a gesture.
+    this.lastTapMs = 0;
+    if (this.sessionId.length > 0 && this.lastRemoteX >= 0 && this.lastRemoteY >= 0) {
+      hilog.debug(DOMAIN, TAG,
+        '远端指针 source=abort mask=0 remote=%{public}d,%{public}d',
+        this.lastRemoteX, this.lastRemoteY);
+      sendPointer(this.sessionId, this.lastRemoteX, this.lastRemoteY, 0);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Touch press delay and three-finger block. The touch sequence is shared
+  // with the two-finger view gestures: a press must not go out before it is
+  // known that the touch is not a pinch, and three or more fingers must not
+  // reach the remote at all.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Updates the set of fingers currently down and returns its size.
+   * event.touches may be empty on Up/Cancel, so membership is tracked by the
+   * stable TouchObject.id instead of a length: Down adds the changed fingers
+   * (and re-syncs from touches, which lists every finger), Up removes the
+   * changed ones and Cancel ends the whole sequence.
+   */
+  private updateTouchFingers(event: TouchEvent): number {
+    const touches = event.touches;
+    const changed = event.changedTouches;
+    if (event.type === TouchType.Down) {
+      // A second finger's Down reports both fingers in touches, so rebuilding
+      // here also heals a missed Up.
+      if (touches.length > 0) {
+        this.touchFingerIds.clear();
+        for (let i = 0; i < touches.length; i++) {
+          this.touchFingerIds.add(touches[i].id);
+        }
+      }
+      for (let i = 0; i < changed.length; i++) {
+        this.touchFingerIds.add(changed[i].id);
+      }
+    } else if (event.type === TouchType.Up) {
+      if (changed.length > 0) {
+        // changedTouches names exactly the pointer that went up. touches may be
+        // empty here, so the remaining fingers must come from this set only.
+        for (let i = 0; i < changed.length; i++) {
+          this.touchFingerIds.delete(changed[i].id);
+        }
+      } else if (touches.length > 0) {
+        // No changed list: touches is the only evidence available.
+        this.touchFingerIds.clear();
+        for (let i = 0; i < touches.length; i++) {
+          this.touchFingerIds.add(touches[i].id);
+        }
+      } else {
+        this.touchFingerIds.clear();
+      }
+    } else if (event.type === TouchType.Cancel) {
+      // A cancel ends every pointer of this sequence.
+      this.touchFingerIds.clear();
+    } else if (touches.length > 0) {
+      // Move: touches is authoritative. Rebuilding keeps a missed Up from
+      // leaving a phantom finger that would block single-finger input.
+      this.touchFingerIds.clear();
+      for (let i = 0; i < touches.length; i++) {
+        this.touchFingerIds.add(touches[i].id);
+      }
+    }
+    return this.touchFingerIds.size;
+  }
+
+  /** Drops the deferred single-finger press without pressing anything. */
+  private cancelTouchPress(): void {
+    if (this.touchPressTimer >= 0) {
+      clearTimeout(this.touchPressTimer);
+      this.touchPressTimer = -1;
+    }
+    if (this.touchPressPending) {
+      hilog.debug(DOMAIN, TAG,
+        '触摸按下延迟取消 press 未发送 fingers=%{public}d blocked=%{public}s',
+        this.touchFingerIds.size, String(this.multiTouchBlocked));
+    }
+    this.touchPressPending = false;
+  }
+
+  /**
+   * Arms the delayed press for the touch path. If exactly one finger is still
+   * down when the window expires, the press (mask 1) is sent then and the
+   * normal move/release logic takes over; a second finger, a mouse or a
+   * three-finger block cancels it for the rest of the gesture.
+   */
+  private armTouchPress(): void {
+    this.cancelTouchPress();
+    this.touchPressPending = true;
+    this.touchPressTimer = setTimeout((): void => {
+      this.touchPressTimer = -1;
+      if (!this.touchPressPending) {
+        return;
+      }
+      this.touchPressPending = false;
+      if (this.disposed || this.hasMouse || this.multiTouchBlocked ||
+          this.touchFingerIds.size !== 1) {
+        hilog.debug(DOMAIN, TAG, '触摸按下延迟到期但未按下 fingers=%{public}d blocked=%{public}s',
+          this.touchFingerIds.size, String(this.multiTouchBlocked));
+        return;
+      }
+      hilog.debug(DOMAIN, TAG, '触摸按下延迟到期，发送 press x=%{public}d y=%{public}d',
+        this.lastTouchX, this.lastTouchY);
+      this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
+    }, TOUCH_PRESS_DELAY_MS);
+  }
+
+  /**
+   * Three or more fingers: freeze the view where it is and stay out of the
+   * way. The live gesture is ended (final transform flushed, baseline
+   * dropped), so the frozen zoom/pan become the base of the next two-finger
+   * gesture and nothing jumps when the extra fingers lift. Pinch/pan callbacks
+   * return immediately while this is set.
+   */
+  private enterMultiTouchBlock(): void {
+    if (this.multiTouchBlocked) {
+      return;
+    }
+    this.multiTouchBlocked = true;
+    this.multiTouchActive = true;
+    this.cancelTouchPress();
+    // The only remote event that can still go out here is releasing a button
+    // the first finger already pressed. With the press delay that happens only
+    // when one finger was held for > TOUCH_PRESS_DELAY_MS before the others;
+    // leaving the button down would be worse.
+    this.abortSingleFingerInput();
+    this.endGesture();
+    hilog.info(DOMAIN, TAG,
+      '三指及以上手势屏蔽 session=%{public}s fingers=%{public}d view=%{public}s',
+      this.sessionId, this.touchFingerIds.size, this.viewStateText());
+  }
+
+  /** Every finger is up again: leave the block, zoom/pan stay where they are. */
+  private leaveMultiTouchBlock(): void {
+    if (!this.multiTouchBlocked) {
+      return;
+    }
+    this.multiTouchBlocked = false;
+    this.multiTouchActive = false;
+    hilog.info(DOMAIN, TAG, '三指及以上手势结束 session=%{public}s view=%{public}s',
+      this.sessionId, this.viewStateText());
+  }
+
+  private beginGesture(): void {
+    if (!USE_GL_RENDER || this.disposed || this.sessionId.length === 0) {
+      return;
+    }
+    // A pinch/pan recognizer has started: this touch can no longer become a
+    // single-finger click, so drop a press that is still inside the delay
+    // window and never press for the rest of the gesture.
+    this.cancelTouchPress();
+    if (this.gestureActive) {
+      return;
+    }
+    const geom = this.computeViewGeometry(this.viewZoom, this.viewPanX, this.viewPanY);
+    if (geom === undefined) {
+      // No presented geometry yet: a two-finger gesture must not invent one.
+      return;
+    }
+    this.gestureActive = true;
+    this.multiTouchActive = true;
+    this.gestureStartZoom = geom.zoom;
+    this.gestureStartPanX = geom.panX;
+    this.gestureStartPanY = geom.panY;
+    this.gestureScale = 1;
+    this.gesturePanRawX = 0;
+    this.gesturePanRawY = 0;
+    this.gesturePanBaseX = 0;
+    this.gesturePanBaseY = 0;
+    this.gestureAnchorValid = false;
+    // The first of the two fingers may already have pressed a remote button:
+    // release it before the view starts moving.
+    this.abortSingleFingerInput();
+    hilog.info(DOMAIN, TAG, '双指手势开始 session=%{public}s view=%{public}s',
+      this.sessionId, this.viewStateText());
+  }
+
+  /**
+   * Anchors the pinch: remembers the remote pixel under the pinch centre and
+   * restarts the scale/pan measurement from the current transform.
+   */
+  private setPinchAnchor(centerX: number, centerY: number): void {
+    if (!this.gestureActive) {
+      return;
+    }
+    const geom = this.computeViewGeometry(this.viewZoom, this.viewPanX, this.viewPanY);
+    if (geom === undefined || geom.scaleX <= 0 || geom.scaleY <= 0) {
+      return;
+    }
+    const pxPerVpX = this.surfacePixelsPerVpX();
+    const pxPerVpY = this.surfacePixelsPerVpY();
+    if (pxPerVpX <= 0 || pxPerVpY <= 0) {
+      return;
+    }
+    this.gestureCenterSurfX = centerX * pxPerVpX;
+    this.gestureCenterSurfY = centerY * pxPerVpY;
+    this.gestureAnchorRemoteX = (this.gestureCenterSurfX - geom.left) / geom.scaleX;
+    this.gestureAnchorRemoteY = (this.gestureCenterSurfY - geom.top) / geom.scaleY;
+    this.gestureAnchorValid = true;
+    this.gestureStartZoom = geom.zoom;
+    this.gestureStartPanX = geom.panX;
+    this.gestureStartPanY = geom.panY;
+    this.gestureScale = 1;
+    // The two-finger pan offset is measured from here on, so a pinch that
+    // starts after the drag already moved does not double-count that motion.
+    this.gesturePanBaseX = this.gesturePanRawX;
+    this.gesturePanBaseY = this.gesturePanRawY;
+  }
+
+  /** Recomputes zoom/pan from the current gesture state and schedules a send. */
+  private applyGestureView(): void {
+    if (!this.gestureActive || this.disposed) {
+      return;
+    }
+    const zoom = this.clampViewZoom(this.gestureStartZoom * this.gestureScale);
+    // Centred layout at this zoom: its left/top are the "pan 0" reference.
+    const centred = this.computeViewGeometry(zoom, 0, 0);
+    if (centred === undefined) {
+      return;
+    }
+    const dx = (this.gesturePanRawX - this.gesturePanBaseX) * this.surfacePixelsPerVpX();
+    const dy = (this.gesturePanRawY - this.gesturePanBaseY) * this.surfacePixelsPerVpY();
+    let panX = this.gestureStartPanX + dx;
+    let panY = this.gestureStartPanY + dy;
+    if (this.gestureAnchorValid) {
+      // Keep the remote pixel that was under the pinch centre under the same
+      // surface point: left = centre - anchor * scale, converted to a pan
+      // request relative to the centred layout. The gesture's two-finger drag
+      // adds on top of that.
+      const scaleX = centred.contentW / this.frameWidth;
+      const scaleY = centred.contentH / this.frameHeight;
+      panX = this.gestureCenterSurfX - this.gestureAnchorRemoteX * scaleX - centred.left + dx;
+      panY = this.gestureCenterSurfY - this.gestureAnchorRemoteY * scaleY - centred.top + dy;
+    }
+    const geom = this.computeViewGeometry(zoom, panX, panY);
+    if (geom === undefined) {
+      return;
+    }
+    this.viewZoom = geom.zoom;
+    this.viewPanX = geom.panX;
+    this.viewPanY = geom.panY;
+    this.scheduleViewTransform();
+  }
+
+  private endGesture(): void {
+    if (!this.gestureActive) {
+      return;
+    }
+    this.gestureActive = false;
+    this.gestureAnchorValid = false;
+    this.gestureScale = 1;
+    this.gesturePanRawX = 0;
+    this.gesturePanRawY = 0;
+    if (!USE_GL_RENDER || this.disposed) {
+      return;
+    }
+    // Send the final transform now, then read the presented geometry back so a
+    // tap immediately after the gesture maps against what is on screen.
+    this.flushViewTransform();
+    this.scheduleGeometryRefresh(80);
+    hilog.info(DOMAIN, TAG, '双指手势结束 session=%{public}s view=%{public}s',
+      this.sessionId, this.viewStateText());
+  }
+
+  private onPinchStart(event: GestureEvent): void {
+    // Three or more fingers are the system's: no transform, no pointer event.
+    if (!USE_GL_RENDER || this.multiTouchBlocked) {
+      return;
+    }
+    this.beginGesture();
+    this.setPinchAnchor(event.pinchCenterX, event.pinchCenterY);
+  }
+
+  private onPinchUpdate(event: GestureEvent): void {
+    if (!USE_GL_RENDER || this.disposed || this.multiTouchBlocked) {
+      return;
+    }
+    this.beginGesture();
+    if (!this.gestureActive) {
+      return;
+    }
+    if (!this.gestureAnchorValid) {
+      this.setPinchAnchor(event.pinchCenterX, event.pinchCenterY);
+    }
+    this.gestureScale = event.scale > 0 ? event.scale : 1;
+    this.applyGestureView();
+  }
+
+  private onPinchEnd(): void {
+    if (this.multiTouchBlocked) {
+      return;
+    }
+    this.endGesture();
+  }
+
+  private onTwoFingerPanStart(event: GestureEvent): void {
+    if (!USE_GL_RENDER || this.multiTouchBlocked) {
+      return;
+    }
+    this.beginGesture();
+    if (!this.gestureActive) {
+      return;
+    }
+    this.gesturePanRawX = event.offsetX;
+    this.gesturePanRawY = event.offsetY;
+    this.gesturePanBaseX = event.offsetX;
+    this.gesturePanBaseY = event.offsetY;
+  }
+
+  private onTwoFingerPanUpdate(event: GestureEvent): void {
+    if (!USE_GL_RENDER || this.disposed || this.multiTouchBlocked) {
+      return;
+    }
+    this.beginGesture();
+    if (!this.gestureActive) {
+      return;
+    }
+    this.gesturePanRawX = event.offsetX;
+    this.gesturePanRawY = event.offsetY;
+    this.applyGestureView();
+  }
+
+  private onTwoFingerPanEnd(): void {
+    if (this.multiTouchBlocked) {
+      return;
+    }
+    this.endGesture();
+  }
+
+  /**
+   * Window/surface size changed (rotation, window resize). The native renderer
+   * re-clamps the pan against the new surface size while drawing; re-sending
+   * the transform triggers that redraw, and the following stats read adopts
+   * the re-clamped pan.
+   */
+  private handleViewResize(): void {
+    if (!USE_GL_RENDER || this.disposed) {
+      return;
+    }
+    if (this.gestureActive) {
+      this.endGesture();
+    }
+    this.scheduleViewTransform();
+    this.scheduleGeometryRefresh(100);
+  }
+
   private static buttonMask(button: MouseButton): number {
     if (button === MouseButton.Right) {
       return 4;
@@ -1393,6 +2179,9 @@ struct Remote {
     if (rx >= 0 && ry >= 0) {
       this.lastRemoteX = rx;
       this.lastRemoteY = ry;
+      hilog.debug(DOMAIN, TAG,
+        '远端指针 source=release mask=0 remote=%{public}d,%{public}d',
+        rx, ry);
       sendPointer(this.sessionId, rx, ry, 0);
     }
     // Touch screens have no double-click gesture: two quick taps at the same
@@ -1400,6 +2189,8 @@ struct Remote {
     const now = Date.now();
     const near = Math.abs(x - this.lastTapX) < 24 && Math.abs(y - this.lastTapY) < 24;
     if (fromTouch && now - this.lastTapMs < 400 && near && rx >= 0 && ry >= 0) {
+      hilog.debug(DOMAIN, TAG,
+        '远端指针 source=doubleclick mask=1,0 remote=%{public}d,%{public}d', rx, ry);
       sendPointer(this.sessionId, rx, ry, 1);
       sendPointer(this.sessionId, rx, ry, 0);
       this.lastTapMs = 0;
@@ -1410,12 +2201,39 @@ struct Remote {
     this.lastTapY = y;
   }
 
-  // Maps a view point to remote pixels; returns -1,-1 when outside the picture.
+  // Maps a view point (vp) to remote pixels; returns -1,-1 when outside the
+  // picture. GL mode maps through the geometry the native renderer reported for
+  // the frame on screen (contentLeft/contentTop/contentScale*), converted from
+  // vp to surface pixels first, so clicks stay exact at any zoom/pan. Only when
+  // no snapshot exists (first frame) does it fall back to the old contain
+  // formula in vp.
   private mapToRemote(x: number, y: number): number[] {
     if (this.frameWidth <= 0 || this.frameHeight <= 0 ||
         this.viewWidth <= 0 || this.viewHeight <= 0) {
       return [-1, -1];
     }
+    if (USE_GL_RENDER && this.statsGeometryValid) {
+      const pxPerVpX = this.surfacePixelsPerVpX();
+      const pxPerVpY = this.surfacePixelsPerVpY();
+      if (pxPerVpX > 0 && pxPerVpY > 0 && this.statsContentScale > 0 &&
+          this.statsContentScaleY > 0) {
+        const px = x * pxPerVpX;
+        const py = y * pxPerVpY;
+        if (px < this.statsContentLeft || py < this.statsContentTop ||
+            px > this.statsContentLeft + this.statsContentW ||
+            py > this.statsContentTop + this.statsContentH) {
+          return [-1, -1];
+        }
+        return [
+          Math.max(0, Math.min(this.frameWidth - 1,
+            Math.round((px - this.statsContentLeft) / this.statsContentScale))),
+          Math.max(0, Math.min(this.frameHeight - 1,
+            Math.round((py - this.statsContentTop) / this.statsContentScaleY)))
+        ];
+      }
+    }
+    // Fallback (Canvas path / before the first stats snapshot): the historical
+    // contain layout computed in vp.
     const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
     const contentW = this.frameWidth * scale;
     const contentH = this.frameHeight * scale;
@@ -1466,6 +2284,9 @@ struct Remote {
     }
     this.lastRemoteX = point[0];
     this.lastRemoteY = point[1];
+    hilog.debug(DOMAIN, TAG,
+      '远端指针 source=report mask=%{public}d remote=%{public}d,%{public}d',
+      mask, point[0], point[1]);
     sendPointer(this.sessionId, point[0], point[1], mask);
   }
 
@@ -1647,6 +2468,7 @@ struct Remote {
     // The reconnect is already in flight; do not wait for the next 1 s status
     // poll to learn the generation changed. Invalidate the in-flight render and
     // the local mirror NOW and make the next render request a complete frame.
+    this.resetViewTransform('trust-reconnect');
     this.invalidateRender();
     this.forceFull = true;
     this.needsTrust = false;
@@ -1828,6 +2650,9 @@ struct Remote {
             this.lastAreaHeight = height;
             if (resized) {
               this.redrawAfterResize();
+              if (USE_GL_RENDER) {
+                this.handleViewResize();
+              }
             }
             this.placeCursor();
           })
@@ -1846,6 +2671,43 @@ struct Remote {
             if (this.hasMouse) {
               return;
             }
+            // Track the fingers by identifier: event.touches may be empty on
+            // Up/Cancel, and the count gates the press delay and the
+            // three-finger block below.
+            const fingers = this.updateTouchFingers(event);
+            if (USE_GL_RENDER) {
+              if (fingers >= MIN_BLOCKED_FINGERS) {
+                // Three or more fingers are the system's: no view transform,
+                // and no remote pointer event from here on.
+                this.enterMultiTouchBlock();
+              } else if (fingers === 0) {
+                // Every finger is up: a three-finger block is over.
+                this.leaveMultiTouchBlock();
+              }
+            }
+            // Two fingers belong to the view gestures in GL mode: never forward
+            // them as a remote pointer, and release a button the first finger
+            // may already have pressed before the second one landed. The flag
+            // clears on a fresh one-finger Down, so a stray Up ordering can
+            // never let the remaining gesture finger click the remote.
+            if (USE_GL_RENDER &&
+                (fingers >= 2 || this.multiTouchActive || this.multiTouchBlocked)) {
+              this.multiTouchActive = true;
+              // No press for a gesture: a second finger inside the press delay
+              // window cancels it, and a press already sent is released here.
+              this.cancelTouchPress();
+              this.abortSingleFingerInput();
+              const freshSingleDown = !this.multiTouchBlocked &&
+                event.type === TouchType.Down && fingers === 1;
+              if (!freshSingleDown) {
+                if (!this.multiTouchBlocked && fingers === 0) {
+                  this.multiTouchActive = false;
+                }
+                return;
+              }
+              // A new one-finger touch starts here: the gesture is over.
+              this.multiTouchActive = false;
+            }
             if (event.touches.length > 0) {
               this.lastTouchX = event.touches[0].x;
               this.lastTouchY = event.touches[0].y;
@@ -1856,15 +2718,33 @@ struct Remote {
             }
             if (event.type === TouchType.Down) {
               this.requestViewFocus();
-              this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
+              // Do not press yet: the second finger of a pinch usually lands
+              // inside TOUCH_PRESS_DELAY_MS. The mask-0 move keeps the remote
+              // pointer (and its hover) where the press will happen.
+              this.sendPointerAt(this.lastTouchX, this.lastTouchY, 0);
+              this.armTouchPress();
             } else if (event.type === TouchType.Move) {
               this.sendPointerAt(this.lastTouchX, this.lastTouchY, this.pressedMask);
-            } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+            } else if (event.type === TouchType.Up) {
+              if (this.touchPressPending) {
+                // Quick tap: the finger was lifted inside the delay window, so
+                // the press never went out. Send press + release now so the tap
+                // still clicks exactly once.
+                this.cancelTouchPress();
+                this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
+              }
+              this.pointerUp(this.lastTouchX, this.lastTouchY, true);
+            } else if (event.type === TouchType.Cancel) {
+              // A cancelled touch must not turn into a click.
+              this.cancelTouchPress();
               this.pointerUp(this.lastTouchX, this.lastTouchY, true);
             }
           })
           .onMouse((event: MouseEvent) => {
             this.hasMouse = true;
+            // A real mouse event means the mouse owns input from now on; any
+            // press still waiting for the touch delay must not fire.
+            this.cancelTouchPress();
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
             // The local cursor follows every pointer event; the poll only acts
@@ -1881,13 +2761,36 @@ struct Remote {
               this.sendPointerAt(event.x, event.y, this.pressedMask);
             }
           })
-          // Consume drags so the system does not treat a drag on the remote
-          // desktop as moving the application window.
+          // Gestures on the picture area, all in one parallel group:
+          //  - the one-finger pan only consumes drags so the system does not
+          //    treat a drag on the remote desktop as moving the app window
+          //    (its handlers stay empty on purpose);
+          //  - two-finger pinch/drag drive the native view transform (GL mode;
+          //    the handlers are inert on the Canvas path). Pinch zooms about
+          //    the pinch centre, the two-finger pan moves the picture, and both
+          //    are clamped again natively. Gesture recognizers do not consume
+          //    the single-finger/mouse remote pointer events: onTouch/onMouse
+          //    keep their existing paths.
+          //  - three or more fingers are ignored: a recognizer may keep
+          //    reporting while extra fingers are down, so every handler returns
+          //    early while onTouch has multiTouchBlocked set.
           .parallelGesture(
-            PanGesture({ fingers: 1, distance: 1 })
-              .onActionStart(() => {})
-              .onActionUpdate(() => {})
-              .onActionEnd(() => {})
+            GestureGroup(GestureMode.Parallel,
+              PanGesture({ fingers: 1, distance: 1 })
+                .onActionStart(() => {})
+                .onActionUpdate(() => {})
+                .onActionEnd(() => {}),
+              PinchGesture({ fingers: 2, distance: 1 })
+                .onActionStart((event: GestureEvent) => { this.onPinchStart(event); })
+                .onActionUpdate((event: GestureEvent) => { this.onPinchUpdate(event); })
+                .onActionEnd(() => { this.onPinchEnd(); })
+                .onActionCancel(() => { this.onPinchEnd(); }),
+              PanGesture({ fingers: 2, distance: 1 })
+                .onActionStart((event: GestureEvent) => { this.onTwoFingerPanStart(event); })
+                .onActionUpdate((event: GestureEvent) => { this.onTwoFingerPanUpdate(event); })
+                .onActionEnd(() => { this.onTwoFingerPanEnd(); })
+                .onActionCancel(() => { this.onTwoFingerPanEnd(); })
+            )
           )
           // Secondary UI only: the Canvas stays mounted underneath while the
           // first frame is on its way.

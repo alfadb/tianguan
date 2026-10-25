@@ -21,7 +21,13 @@ namespace tianguan {
 //
 // Layout: contain scaling with black letterbox bars, recomputed from the
 // actual EGL surface size every frame, so a window resize re-fits the picture
-// by itself.
+// by itself. On top of that fit sits a per-session view transform: zoom
+// (1.0 = the contain fit, up to kMaxViewZoom) and pan in surface pixels.
+// Zooming out below the contain fit is impossible; pan is ignored in an axis
+// where the content is still smaller than the surface (centred), and clamped
+// to the content edges otherwise, so no blank strip can ever be dragged in.
+// Geometry (content rectangle, scale) is the single source of truth shared by
+// the viewport and renderStats(), see view_geometry.h.
 //
 // Lifecycle: attach on XComponent surface creation, detach on surface/page
 // destruction. detach() only requests a stop and returns immediately — a
@@ -41,8 +47,17 @@ std::string attachRenderSurface(const std::string& sessionId, const std::string&
                                 bool startSuspended = false);
 std::string detachRenderSurface(const std::string& sessionId);
 // JSON snapshot for diagnostics: state, fps, uploads, skipped polls, surface
-// and texture size, EGL error. "ERROR:NO_RENDERER" when not attached.
+// and texture size, EGL error, and the presented geometry (contentLeft/
+// contentTop/contentScale/contentScaleY/contentW/contentH/zoom/panX/panY/
+// maxZoom) ArkTS maps input from. "ERROR:NO_RENDERER" when not attached.
 std::string renderStats(const std::string& sessionId);
+// Sets this session's view transform. zoom is clamped to [1, kMaxViewZoom];
+// panX/panY are surface-pixel offsets from the centred position and are
+// clamped against the live surface size while drawing. Returns "OK" or
+// "ERROR:NO_RENDERER". The idle render loop redraws the current texture once
+// even if no new frame arrives.
+std::string setViewTransform(const std::string& sessionId, double zoom, double panX,
+                             double panY);
 // true = park the render thread (window hidden), false = resume (window
 // shown). Returns OK even when no renderer is attached; that state has no
 // thread to park.

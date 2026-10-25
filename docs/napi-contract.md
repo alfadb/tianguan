@@ -75,6 +75,30 @@ requestFullFrame(sessionId: string): string
 
 请求一次非增量整屏更新（空闲桌面不会主动推全帧，界面就绪后必须调用一次）。
 
+### 视图变换（缩放/平移）
+
+```
+setViewTransform(sessionId: string, zoom: number, panX: number, panY: number): string
+```
+
+- `zoom` 是相对 contain 适配的倍数，默认 `1.0`，原生夹到 `[1, maxZoom]`（当前 `maxZoom=4`），不能缩到比窗口小。
+- `panX`/`panY` 单位是 surface 像素，相对居中位置的偏移。内容在某个轴上仍不大于 surface 时该轴忽略 pan（保持居中）；内容大于 surface 时夹在 `[surface-content, 0]`，不会拖出空白。夹取使用当前 surface 的实际尺寸（每帧 `eglQuerySurface`），旋转/改窗口后自动重新夹。
+- 返回 `OK`，或 `ERROR:NO_RENDERER` / `ERROR:INVALID_ARGUMENTS`。
+- 改视图后会重绘已上传的纹理一次，即使远端没有新帧。
+
+几何的唯一真源是原生：`renderStats(sessionId)` 返回实际绘制矩形，界面必须用它做输入映射，不得自行按 contain 复算：
+
+```json
+{ "contentLeft": 40, "contentTop": 0, "contentScale": 1.125, "contentScaleY": 1.125,
+  "contentW": 2160, "contentH": 1350, "zoom": 2.0, "panX": -120.0, "panY": 0.0,
+  "maxZoom": 4.0 }
+```
+
+- `contentLeft`/`contentTop`：绘制矩形左上角（surface 像素，左上原点）。
+- `contentScale = contentW / texWidth`，`contentScaleY = contentH / texHeight`；远端坐标 `remoteX = (x - contentLeft) / contentScale`，`remoteY = (y - contentTop) / contentScaleY`。
+- `zoom`/`panX`/`panY` 是实际生效值（zoom 已夹、pan 已按当前 surface 夹）。
+- `renderStats` 原有字段（state/fps/width/height/texWidth/texHeight/…）含义不变。Canvas 回退路径（`USE_GL_RENDER=false`）没有原生渲染器，不提供这些字段，也不支持缩放。
+
 ### 光标
 
 ```

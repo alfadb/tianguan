@@ -297,6 +297,20 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - **列表「断开」**：卡片「⋯」菜单新增「断开」（`Index.ets:167`），仅在该连接有活跃会话时出现；它在列表页、不遮挡画面，作为第二种入口，实测有效。
 - **屏幕旋转**：`module.json5:41` / `module.json5:60` 给 `EntryAbility` 与 `RemoteAbility` 都加 `orientation: 'auto_rotation'`。手机手动旋转后实测屏幕由 1316×2832 变为 2832×1316，主界面随窗口宽度自动切到宽屏（左侧分组栏回归、卡片单行），远程窗口的 contain 画面按新 surface 尺寸重铺，无拉伸。
 
+## 双指缩放与平移（2026-10-26）
+
+GL 模式下远程画面支持双指手势：两指捏合缩放、两指拖动平移。几何全部由原生渲染器决定，界面只转发请求、并按原生回报的矩形做输入映射。
+
+- **范围与下限**：`zoom` 是相对 contain 适配的倍数，`1.0` 即旧 contain 布局，上限 `4.0`（`kMaxViewZoom`）。下限就是 contain（`1.0`），不能缩得比窗口小；缩放围绕捏合中心，捏合点下的远端像素保持不动。
+- **平移**：`panX`/`panY` 是相对居中位置的 surface 像素偏移。某个轴上内容仍不大于 surface 时该轴强制居中、忽略 pan；内容大于 surface 时夹在 `[surface-content, 0]`，拖不出黑边空白。实际生效值每帧按 `eglQuerySurface` 的真实尺寸重算，旋转/改窗口后自动重新夹取。
+- **仅 GL 模式**：Canvas 回退路径（`USE_GL_RENDER = false`）没有原生渲染器，手势处理器为空，不提供缩放/平移。
+- **原生几何是唯一真源**：`app/native/view_geometry.h`（header-only，`ComputeViewGeometry`/`ClampViewZoom`）同时供渲染循环的 `glViewport` 与 `renderStats()` 使用，界面不再自己按 contain 复算。`renderStats` 新增 `contentLeft/contentTop/contentScale/contentScaleY/contentW/contentH/zoom/panX/panY/maxZoom`（surface 物理像素，左上原点）；`zoom=1, pan=0` 与原 contain 布局逐像素一致（host 几何单测 120 组 framebuffer×surface 组合逐项相同，边界夹取、旋转、NaN 均通过）。输入映射为 `remote=(px-contentLeft)/contentScale`，本地光标也用同一矩形，任何 zoom/pan 下都不漂移；手势坐标从 vp 转 surface 像素的因子取 `renderStats().width / viewWidth`（高度同理）。
+- **NAPI**：`setViewTransform(sessionId, zoom, panX, panY)` 设置变换，返回 `OK` 或 `ERROR:NO_RENDERER` / `ERROR:INVALID_ARGUMENTS`；改视图后原生会重绘已上传的纹理一次，静态桌面也能立即看到缩放/平移。契约见 [docs/napi-contract.md](../docs/napi-contract.md)。
+- **节流与收尾**：手势更新合并到最多每 33 ms 一次 `setViewTransform`（同步 NAPI），手势结束时立即 flush 一次并回读几何。连接/重连、surface 重新挂载、远端分辨率变化都重置到 contain；窗口尺寸变化重发变换，由原生按新 surface 再夹。
+- **捏合误点击修复（70 ms 按下延迟）**：单指触摸 Down 只发一次 mask-0 的移动（不按远端按钮），延迟 70 ms 后才补发按下；窗口内第二指落下则整个手势不发任何 press（此前单指立即 press、第二指到达只补 release，press+release 就是一次点击）。快速单击在抬手时补发 press+release，仍恰好一次点击。**固有限制**：第二指若在首指按下 70 ms 之后才落，仍可能漏出一次点击（实测 74 次捏合全部落在窗口内）。
+- **三指及以上屏蔽**：从第三指落下到全部抬起，本页不响应捏合/平移、不发任何远端指针事件，zoom/pan 冻结在进入时的值，抬起后不漂移（三/四指属于系统手势）。
+- **手机实测（PLA-AL10）**：74 段双指手势区间内远端 press/release 为 0；单指点击 press/release 各 26 次 1:1；12 次三指手势前后 zoom/pan 完全一致（如 1.896→1.896）；双击与单指拖动正常；缩放实测 1.0→4.0。
+
 ## RDP 接入（2026-10-24）
 
 - **ArkTS → 原生链路**：`connect()` 组装 `SessionOptions` 时按协议分流。RDP 条目带 `protocol: "rdp"`，并在非空时带 `username`/`domain`；密码仍从系统密钥库的 `tianguan:rdp:<host>:<port>` 别名读取（`loadPassword(entry)`）。VNC 条目不传 `protocol`（缺省即 VNC），`security`（None 语义）只在 VNC 分支设置；`expectedFingerprint`（`vnc-pins.json` 信任库）两种协议都会设，键由 `pinKeyFor(entry)` 给出：RDP 用 `rdp:<host>:<port>`，VNC 保持旧键 `<host>:<port>`，因此同地址的 VNC 与 RDP 指纹互不覆盖、VNC 旧指纹继续有效。字段定义见 `app/entry/src/main/ets/diag/SessionApi.ets` 的 `SessionOptions`，契约见 [docs/napi-contract.md](../docs/napi-contract.md)。原来的「RDP 连接尚未接入」拦截（`connect()` 与 `reconnectEntry()` 各一处）已删除。
@@ -387,8 +401,9 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - 中文输入法（IME 组合输入）未处理，键盘按物理按键逐个转发；Unicode 直接输入、粘贴与部分快捷键组合未验证。
 - 本机 → 远端自动剪贴板受 `READ_PASTEBOARD` 的 ACL 限制（声明已暂时移除，授权路径代码就绪但未真机走通）。
 - 窗口位置/尺寸不持久记忆：新建时按屏幕比例计算并居中，之后用户手动移动或缩放不会被应用覆盖。
+- PC 端缩放需触屏双指；鼠标不缩放（未实现 Ctrl+滚轮），`onMouse` 路径也不走 70 ms 触摸按下延迟。
 
-## 验证边界（2026-10-25 更新）
+## 验证边界（2026-10-26 更新）
 
 设备为 SLM-W32（HarmonyOS 7.0.0.111 / API 26，调试签名，`192.168.50.183:43833`）与手机 PLA-AL10（`192.168.50.199:37193`，屏幕 1316×2832、density 3.5，即 376×809 vp）。以下按“真机验证过”和“未做/受限”分开，避免把构建通过当成功能通过。
 
@@ -403,11 +418,13 @@ bash app/build.sh /absolute/path/libtianguan_diag.so
 - **GL 呈现与显存**：真实 62 会话连续 24 分钟以上、3 分钟采样内应用 GPU 24.4–33.5 MB 波动（增长恒为 3 MB，无随帧数线性增长），1 个 GPU context；`RENDER_MEMORY_OVER_ERROR`/`KillProcessByPid` 计数为 0，进程存活；受控 60 fps 内容下 fps 62.4–69.4、swapFail=0；颜色与 Canvas 对照最大差 0.7/255，contain 布局/黑边与 Canvas 对齐；两会话同时渲染正常。
 - **无周期卡顿**：事件驱动改造完成后实测 `TianguanClip` 为 `mode=event`、`updateEvents` 递增，用户确认此前的周期性卡顿消失；当前版本在未授权时直接停用读取（`mode=off`，不注册监听），授权后的 `mode=event` 路径等 ACL 到位后再复测。
 - **手机形态（2026-10-25，PLA-AL10）**：VNC 连接、返回断开、窄屏/横屏布局与旋转均已在手机上验证：窄屏为 376×809 vp，旋转后屏幕 1316×2832 → 2832×1316；系统返回键与右边缘返回手势都能结束当前会话（到 62:5901 的连接由 ESTABLISHED 变 TIME_WAIT、卡片回「未连接」）；旋转后主界面自动切宽屏、远程画面按 contain 重铺无拉伸。远程画面不叠加任何控件；PC 仍用窗口标题栏关闭，无回归。
+- **双指缩放与平移（2026-10-26，PLA-AL10 手机）**：捏合缩放实测 1.0→4.0 连续可用，围绕捏合中心、平移夹边界不出黑边；74 段双指手势区间内远端 press/release 为 0（捏合不再误点击），单指点击 press/release 各 26 次 1:1，三指手势 12 次前后 zoom/pan 完全一致（屏蔽生效、无漂移），双击与单指拖动正常。PC 端尚未装修复版回归（见下节）。
 
 ### 未做 / 受限
 
 - **本机 → 远端剪贴板**：等 AGC 的 `READ_PASTEBOARD` ACL 审批；当前声明保持移除，读取完全停用，授权弹窗/允许后的自动同步未真机走通。
 - **主窗口隐藏态从托盘打开会话**：会话窗口正常出现且在最先，但平台会顺带拉起主窗口并显示在会话窗口后面（不遮挡，属外观限制）。曾尝试抑制/收回，真机上会导致会话窗口不可见，已回滚（详见「多会话与窗口」）。
 - **滚轮**：仅代码路径保留，未做可视化真机验收。
+- **PC 端双指缩放回归**：2026-10-26 手机验证时 PC（SLM-W32）设备掉线，带缩放/平移与按下延迟的修复版尚未装到 PC；`onMouse` 路径没有加延迟（只多一句取消未发出的触摸 press），鼠标点击/拖动待补装回归。
 - **RDP 真机连接**：已在 192.168.50.12 与 192.168.50.18 上验证连接、首帧、鼠标点击与键盘（详见「RDP 接入（2026-10-24）」的验证状态）；延迟实测（2026-10-25）显示稳态下两台均为亚秒级，未复现持续滞后；新连接会先停在 Windows 锁屏约 3 s、桌面在 +5.2~6.2 s 就绪，桌面就绪后的首次远端交互约 3.5 s 才出画面（客户端 0.6 s 内已发出，延迟在 Windows 侧），一次 > 7.9 s 的慢首击未复现。RDP 的剪贴板「远端 → 本机」已可用、本机 → 远端待 `READ_PASTEBOARD` ACL；中文输入通过远端 Windows 输入法已可用；RDP 服务端证书已做 TOFU 指纹固定（首次确认写入 `rdp:<host>:<port>`，之后指纹变化拒绝）；GFX 已启用并实测接管；H.264/AVC 已启用并在真机全屏视频时实测协商到 AVC420（`last codec=11`）；H.265/HEVC 在 RDP GFX 协议里没有对应编码，不支持也不可协商；音频（PCM 回放）已完成并听验通过；压缩音频的解码路径已就绪（AAC 等可解码格式），但实测 Windows 仍偏好 PCM，AAC/ADPCM 未被协商到。
 - **IME / Unicode 直接输入 / X509**：未实现或未验证。

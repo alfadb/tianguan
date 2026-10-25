@@ -41,8 +41,15 @@ export const takeRegion: (buffer: ArrayBuffer) => string;
 export const attachRenderSurface: (sessionId: string, surfaceId: string,
   startSuspended?: boolean) => string;
 export const detachRenderSurface: (sessionId: string) => string;
-// JSON stats: state/fps/uploads/skips/surface+texture size/EGL error, or
-// 'ERROR:NO_RENDERER' when nothing is attached.
+// JSON stats: state/fps/uploads/skips/surface+texture size/EGL error plus the
+// presented geometry (contentLeft/contentTop/contentScale/contentScaleY/
+// contentW/contentH/zoom/panX/panY/maxZoom); ArkTS maps input from those
+// native values. 'ERROR:NO_RENDERER' when nothing is attached.
 export const renderStats: (sessionId: string) => string;
+// View transform on top of the contain fit: zoom is clamped to
+// [1, maxZoom], panX/panY are surface-pixel offsets from the centred position
+// (clamped by the renderer while drawing). Returns 'OK' or an error string.
+export const setViewTransform: (sessionId: string, zoom: number, panX: number,
+  panY: number) => string;
 // true parks the render thread (window hidden), false resumes it.
 export const suspendRenderSurface: (sessionId: string, suspended: boolean) => string;

@@ -7,6 +7,7 @@
 // Vulkan buffer per frame into RenderService.
 #include "diagnostics.h"
 #include "render.h"
+#include "view_geometry.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -15,6 +16,7 @@
 #include <native_window/external_window.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -137,6 +139,17 @@ struct RenderStats {
   int height = 0;
   int texWidth = 0;            // texture (== remote framebuffer) size
   int texHeight = 0;
+  // Presented geometry, exactly the rectangle the last draw used. This is the
+  // single source of truth ArkTS maps input from (never recomputed there).
+  int contentLeft = 0;   // surface pixels, top-left origin
+  int contentTop = 0;
+  int contentW = 0;
+  int contentH = 0;
+  double contentScale = 1.0;   // contentW / texWidth
+  double contentScaleY = 1.0;  // contentH / texHeight
+  double zoom = 1.0;           // clamped zoom actually used
+  double panX = 0.0;           // effective pan after clamping (surface pixels)
+  double panY = 0.0;
   int frameVersion = -1;       // last consumed mirror version
   long long elapsedMs = 0;
   int lastEglError = 0;
@@ -156,6 +169,15 @@ struct Renderer {
   std::condition_variable wake;
   bool suspended;
   bool stopRequested = false;
+  // View transform: written by the NAPI thread, read once per loop iteration
+  // by the render thread. The mutex only ever guards three doubles (never held
+  // during uploads, draws or swaps), and viewDirty asks the idle loop to
+  // redraw the already-uploaded texture once after a change.
+  std::mutex viewMutex;
+  double viewZoom = 1.0;
+  double viewPanX = 0.0;
+  double viewPanY = 0.0;
+  std::atomic<bool> viewDirty{false};
   std::mutex statsMutex;
   RenderStats stats;
 };
@@ -303,6 +325,12 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
   int surfaceHeight = 0;
   int texWidth = 0;
   int texHeight = 0;
+  // Snapshot of the renderer's view transform, refreshed at the top of every
+  // loop iteration (a 3-double copy under the view mutex, ~4 ms apart at most
+  // while idle) so a draw never holds that lock.
+  double viewZoom = 1.0;
+  double viewPanX = 0.0;
+  double viewPanY = 0.0;
   int afterVersion = -1;
   bool forceFull = true;
   // geometryDirty: the layout (surface size or texture size) changed, so the
@@ -378,15 +406,30 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
   // pixels actually stored — never from a not-yet-uploaded mirror geometry.
   auto drawAndSwap = [&]() -> bool {
     if (texture == 0 || texWidth <= 0 || texHeight <= 0) return false;
-    // Contain scaling with black bars, exactly like the Canvas path did:
-    // scale = min(viewW/texW, viewH/texH), centred, GL origin bottom-left.
-    const float scale = std::min(static_cast<float>(surfaceWidth) / texWidth,
-                                 static_cast<float>(surfaceHeight) / texHeight);
-    const int contentW = std::max(1, static_cast<int>(texWidth * scale + 0.5f));
-    const int contentH = std::max(1, static_cast<int>(texHeight * scale + 0.5f));
-    const int offX = (surfaceWidth - contentW) / 2;
-    const int offYTop = (surfaceHeight - contentH) / 2;
-    glViewport(offX, surfaceHeight - offYTop - contentH, contentW, contentH);
+    // Contain * zoom, panned and clamped, computed once here and reused for
+    // the stats report: the picture ArkTS maps input against is exactly the
+    // rectangle drawn below. zoom == 1 / pan == 0 reproduces the old contain
+    // layout pixel for pixel (including its integer centring).
+    const tianguan::ViewGeometry geometry = tianguan::ComputeViewGeometry(
+        texWidth, texHeight, surfaceWidth, surfaceHeight, viewZoom, viewPanX, viewPanY);
+    const int viewportLeft = tianguan::RoundViewportCoord(geometry.left);
+    const int viewportTop = tianguan::RoundViewportCoord(geometry.top);
+    glViewport(viewportLeft, surfaceHeight - viewportTop - geometry.contentH, geometry.contentW,
+               geometry.contentH);
+    {
+      // Publish before presenting so a stats read right after a redraw sees
+      // the rectangle that was just drawn. Short lock, no GL calls inside.
+      std::lock_guard<std::mutex> lock(renderer->statsMutex);
+      renderer->stats.contentLeft = viewportLeft;
+      renderer->stats.contentTop = viewportTop;
+      renderer->stats.contentW = geometry.contentW;
+      renderer->stats.contentH = geometry.contentH;
+      renderer->stats.contentScale = geometry.contentScale;
+      renderer->stats.contentScaleY = geometry.contentScaleY;
+      renderer->stats.zoom = geometry.zoom;
+      renderer->stats.panX = geometry.panX;
+      renderer->stats.panY = geometry.panY;
+    }
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(program);
@@ -593,6 +636,17 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     publishStatsIfDue("running");
 
     while (true) {
+      // Consume a view transform change first: it must redraw even when no new
+      // frame arrives (pan/zoom over a static desktop). Then copy the current
+      // transform for this iteration; the lock is released before any query,
+      // upload, draw or swap.
+      if (renderer->viewDirty.exchange(false)) geometryDirty = true;
+      {
+        std::lock_guard<std::mutex> lock(renderer->viewMutex);
+        viewZoom = renderer->viewZoom;
+        viewPanX = renderer->viewPanX;
+        viewPanY = renderer->viewPanY;
+      }
       logDiagIfDue();
       {
         std::unique_lock<std::mutex> lock(renderer->mutex);
@@ -886,20 +940,52 @@ std::string renderStats(const std::string& sessionId) {
     std::lock_guard<std::mutex> lock(renderer->mutex);
     snapshot.suspended = renderer->suspended;
   }
-  char buffer[1024];
+  char buffer[1536];
   std::snprintf(
       buffer, sizeof(buffer),
       "{\"state\":\"%s\",\"surfaceId\":\"%s\",\"error\":\"%s\",\"frames\":%lld,"
       "\"swapFailures\":%lld,\"uploads\":%lld,\"fullUploads\":%lld,\"skips\":%lld,"
       "\"fps\":%.1f,\"width\":%d,\"height\":%d,\"texWidth\":%d,\"texHeight\":%d,"
-      "\"frameVersion\":%d,\"elapsedMs\":%lld,\"lastEglError\":%d,\"suspended\":%s}",
+      "\"frameVersion\":%d,\"elapsedMs\":%lld,\"lastEglError\":%d,\"suspended\":%s,"
+      "\"contentLeft\":%d,\"contentTop\":%d,\"contentScale\":%.6f,"
+      "\"contentScaleY\":%.6f,\"contentW\":%d,\"contentH\":%d,"
+      "\"zoom\":%.4f,\"panX\":%.3f,\"panY\":%.3f,\"maxZoom\":%.1f}",
       JsonEscape(snapshot.state).c_str(), JsonEscape(snapshot.surfaceId).c_str(),
       JsonEscape(snapshot.error).c_str(), snapshot.frames, snapshot.swapFailures,
       snapshot.uploads, snapshot.fullUploads, snapshot.skips, snapshot.fps,
       snapshot.width, snapshot.height, snapshot.texWidth, snapshot.texHeight,
       snapshot.frameVersion, snapshot.elapsedMs, snapshot.lastEglError,
-      snapshot.suspended ? "true" : "false");
+      snapshot.suspended ? "true" : "false", snapshot.contentLeft, snapshot.contentTop,
+      snapshot.contentScale, snapshot.contentScaleY, snapshot.contentW, snapshot.contentH,
+      snapshot.zoom, snapshot.panX, snapshot.panY, kMaxViewZoom);
   return std::string(buffer);
+}
+
+std::string setViewTransform(const std::string& sessionId, double zoom, double panX,
+                             double panY) {
+  std::shared_ptr<Renderer> renderer;
+  {
+    std::lock_guard<std::mutex> lock(g_registryMutex);
+    const auto found = g_renderers.find(sessionId);
+    if (found == g_renderers.end()) return "ERROR:NO_RENDERER";
+    renderer = found->second;
+  }
+  // Zoom is clamped here (contract: [1, kMaxViewZoom]); pan is stored as
+  // requested and clamped against the live surface size while drawing, so a
+  // rotation/resize automatically re-clamps it instead of leaving a gap.
+  const double clampedZoom = ClampViewZoom(zoom);
+  const double safePanX = std::isfinite(panX) ? panX : 0.0;
+  const double safePanY = std::isfinite(panY) ? panY : 0.0;
+  {
+    std::lock_guard<std::mutex> lock(renderer->viewMutex);
+    renderer->viewZoom = clampedZoom;
+    renderer->viewPanX = safePanX;
+    renderer->viewPanY = safePanY;
+  }
+  // Redraw the already-uploaded texture on the next loop iteration even when
+  // the session is idle (no new frames arriving).
+  renderer->viewDirty.store(true);
+  return "OK";
 }
 
 std::string setRenderSurfaceSuspended(const std::string& sessionId, bool suspended) {
