@@ -20,12 +20,18 @@
 // stop/generation so a superseded attempt can never touch the current mirror.
 #include "rdp_backend.h"
 
+#include <freerdp/addin.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/cliprdr.h>
 #include <freerdp/channels/rdpgfx.h>
+#include <freerdp/channels/rdpsnd.h>
 #include <freerdp/client.h>
+#include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
+#include <freerdp/client/cmdline.h>
 #include <freerdp/client/rdpgfx.h>
+#include <freerdp/client/rdpsnd.h>
+#include <freerdp/codec/audio.h>
 #include <freerdp/error.h>
 #include <freerdp/event.h>
 #include <freerdp/freerdp.h>
@@ -52,6 +58,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -61,6 +68,13 @@
 #if defined(__MUSL__)
 #include <hilog/log.h>
 #endif
+
+// OHOS AudioRenderer NDK. Only the OHOS target compiles this translation unit
+// (app/native/CMakeLists.txt keeps it out of the host target, like the rest of
+// the FreeRDP backend); libohaudio.so is a platform system library.
+#include <ohaudio/native_audiorenderer.h>
+#include <ohaudio/native_audiostreambuilder.h>
+#include <ohaudio/native_audiostream_base.h>
 
 namespace tianguan {
 namespace {
@@ -353,6 +367,572 @@ void gfxChannelDisconnected(void* context,
   if (bridge == nullptr || bridge->context == nullptr) return;
   if (static_cast<void*>(bridge->context) != e->pInterface) return;
   gfxUnbind(attempt);
+}
+
+// ---------------------------------------------------------------------------
+// Audio playback (rdpsnd -> OHOS AudioRenderer)
+//
+// FreeRDP 3.9 has no client-facing rdpsnd callback interface: the channel
+// resolves a "device plugin" through freerdp_load_channel_addin_entry() and
+// this prefix only contains the built-in "fake" null sink. The backend
+// therefore registers a static addin provider (installRdpsndAddinProvider)
+// that answers the channel's "rdpsnd" + "tianguan" subsystem lookup with the
+// device plugin below. preConnect() adds the channel as
+// {"rdpsnd","sys:tianguan","format:1","channel:2"} to both the static and the
+// dynamic channel collection: the arguments select that subsystem and pin
+// rdpsnd's fixed_format to PCM/stereo, so a compressed format is never
+// advertised (this build has neither a decoder nor a resampler). Modern
+// servers (Windows 8.1+) carry the audio over the AUDIO_PLAYBACK_DVC dynamic
+// channels opened by drdynvc, whose instances parse the same arguments; if
+// only the static collection had them, those instances would silently fall
+// back to the built-in fake sink and no audio would ever be negotiated.
+//
+// Call flow: ServerFormatAnnounce() sees the server's format list,
+// FormatSupported() filters it (PCM, 16-bit, stereo), Open() receives the
+// format the server selected, Play() pushes PCM into a ring buffer and Close()
+// stops the renderer. The OHOS NDK has no blocking OH_AudioRenderer_Write;
+// playback is pulled by OH_AudioRenderer_OnWriteDataCallback, which fills the
+// buffer from the ring and writes silence when the server is not sending
+// audio, so a starved stream never stalls. Audio is strictly a side path: no
+// failure in here is turned into a channel error, so it cannot break the
+// picture or input.
+//
+// Threading: rdpsnd dispatches its channel data on its own thread by default
+// (FreeRDP_SynchronousStaticChannels is FALSE), while Close/Free arrive on the
+// session thread during freerdp_disconnect(). The callbacks therefore never
+// dereference the device object: it is only used as a map key into
+// gRdpsndPlayers, and the shared player below owns every mutable field (one
+// small lock for the ring, one for renderer start/stop).
+// ---------------------------------------------------------------------------
+
+// The addin provider below maps RDPSND_CHANNEL_NAME + this subsystem name to
+// the device plugin, bypassing the dlopen() path client-common would take for
+// an unknown subsystem.
+const char kRdpsndSubsystem[] = "tianguan";
+// PCM formats the renderer is allowed to open. The server normally offers
+// 44.1 or 48 kHz 16-bit stereo PCM; other rates are still valid for
+// OH_AudioRenderer, so accept the whole common range instead of narrowing the
+// negotiation. No resampling is available, so the renderer always runs at the
+// exact rate the server selected.
+const int kAudioMinRate = 8000;
+const int kAudioMaxRate = 192000;
+// Ring capacity = half a second of PCM, clamped. Dropping the oldest bytes when
+// the ring is full keeps playback close to real time instead of accumulating
+// latency when the server bursts (older Windows servers do not throttle).
+const size_t kAudioRingMinBytes = 32 * 1024;
+const size_t kAudioRingMaxBytes = 256 * 1024;
+// "audio: N bytes played, underrun=X" is logged at most once per 5 s and at
+// most 10 times per connection (plus one final line when audio did play).
+const UINT64 kAudioStatsIntervalMs = 5000;
+const int kAudioStatsMaxLines = 10;
+
+struct RdpsndPlayer;
+
+OH_AudioData_Callback_Result audioWriteData(OH_AudioRenderer* renderer,
+                                            void* userData, void* audioData,
+                                            int32_t audioDataSize);
+
+// One negotiated PCM renderer (16-bit stereo) and the ring between the rdpsnd
+// channel and the OHOS audio thread. Owned by gRdpsndPlayers through a
+// shared_ptr: the write callback copies the shared_ptr from the registry into
+// its call frame, so releasing the device can never free memory a callback is
+// still using.
+struct RdpsndPlayer {
+  RdpsndPlayer()
+      : readPos(0),
+        writePos(0),
+        used(0),
+        capacity(0),
+        rate(0),
+        channels(0),
+        renderer(nullptr),
+        started(false),
+        bytesPlayed(0),
+        underruns(0),
+        dropped(0),
+        lastStatsMs(0),
+        lastStatsBytes(0),
+        statsLines(0) {}
+
+  ~RdpsndPlayer() { stop(); }
+
+  // Open a renderer for the format rdpsnd selected. Replaces any previous one.
+  void start(int sampleRate, int channelCount);
+  // Stop and release the renderer and drop buffered audio. Idempotent.
+  void stop() {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycle);
+    stopLocked();
+  }
+  // rdpsnd Play: append PCM without ever blocking the channel thread for more
+  // than the ring lock.
+  void push(const uint8_t* data, size_t size);
+  // OHOS write callback: fill out[0,size) with PCM, silence when starved.
+  size_t fill(uint8_t* out, size_t size);
+
+ private:
+  void startRenderer();
+  void stopLocked();
+  void logStats(bool force);
+
+  // Serializes renderer creation against Stop()/Free() on another thread.
+  std::mutex lifecycle;
+  // Guards the ring and the renderer fields the write callback reads.
+  std::mutex lock;
+  std::vector<uint8_t> ring;
+  size_t readPos;
+  size_t writePos;
+  size_t used;
+  size_t capacity;
+  int rate;
+  int channels;
+  OH_AudioRenderer* renderer;
+  bool started;
+  std::atomic<uint64_t> bytesPlayed;
+  std::atomic<uint64_t> underruns;
+  std::atomic<uint64_t> dropped;
+  uint64_t lastStatsMs;
+  uint64_t lastStatsBytes;
+  int statsLines;
+};
+
+OH_AudioData_Callback_Result audioWriteData(OH_AudioRenderer* renderer,
+                                            void* userData, void* audioData,
+                                            int32_t audioDataSize) {
+  (void)renderer;
+  RdpsndPlayer* player = static_cast<RdpsndPlayer*>(userData);
+  if (player == nullptr || audioData == nullptr || audioDataSize <= 0)
+    return AUDIO_DATA_CALLBACK_RESULT_INVALID;
+  player->fill(static_cast<uint8_t*>(audioData),
+               static_cast<size_t>(audioDataSize));
+  // Silence is valid data: never report AUDIO_DATA_CALLBACK_RESULT_INVALID,
+  // which would make the framework skip the buffer and log its own errors.
+  return AUDIO_DATA_CALLBACK_RESULT_VALID;
+}
+
+void RdpsndPlayer::start(int sampleRate, int channelCount) {
+  std::lock_guard<std::mutex> lifecycleLock(lifecycle);
+  // A format change (or a re-open after SNDC_CLOSE) always restarts cleanly.
+  stopLocked();
+  char line[200];
+  if (sampleRate < kAudioMinRate || sampleRate > kAudioMaxRate ||
+      channelCount != 2) {
+    std::snprintf(line, sizeof(line),
+                  "audio: unsupported format %dHz %dch, PCM 16-bit stereo only",
+                  sampleRate, channelCount);
+    diagWarn(line);
+    return;
+  }
+  size_t ringBytes = static_cast<size_t>(sampleRate) *
+                     static_cast<size_t>(channelCount) * 2u / 2u;
+  ringBytes = std::max<size_t>(kAudioRingMinBytes,
+                               std::min<size_t>(kAudioRingMaxBytes, ringBytes));
+  ringBytes &= ~static_cast<size_t>(3);
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    rate = sampleRate;
+    channels = channelCount;
+    capacity = ringBytes;
+    ring.assign(capacity, 0);
+    readPos = 0;
+    writePos = 0;
+    used = 0;
+    lastStatsMs = monotonicMillis();
+    lastStatsBytes = bytesPlayed.load();
+  }
+  startRenderer();
+}
+
+void RdpsndPlayer::stopLocked() {
+  OH_AudioRenderer* previous = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    started = false;
+    previous = renderer;
+    renderer = nullptr;
+  }
+  if (previous != nullptr) {
+    char line[200];
+    OH_AudioStream_Result result = OH_AudioRenderer_Stop(previous);
+    if (result != AUDIOSTREAM_SUCCESS) {
+      std::snprintf(line, sizeof(line),
+                    "audio: OH_AudioRenderer_Stop failed [%d]",
+                    static_cast<int>(result));
+      diagWarn(line);
+    }
+    result = OH_AudioRenderer_Release(previous);
+    if (result != AUDIOSTREAM_SUCCESS) {
+      std::snprintf(line, sizeof(line),
+                    "audio: OH_AudioRenderer_Release failed [%d]",
+                    static_cast<int>(result));
+      diagWarn(line);
+    }
+    // Release() ends the write callback; taking the data lock once waits for a
+    // callback that was already running when the renderer went away.
+    {
+      std::lock_guard<std::mutex> guard(lock);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    ring.clear();
+    capacity = 0;
+    readPos = 0;
+    writePos = 0;
+    used = 0;
+  }
+  logStats(true);
+}
+
+void RdpsndPlayer::push(const uint8_t* data, size_t size) {
+  if (data == nullptr || size == 0) return;
+  std::lock_guard<std::mutex> guard(lock);
+  if (!started || capacity == 0) return;
+  if (size > capacity) {
+    // A single block larger than the ring: keep the newest PCM only.
+    const size_t excess = size - capacity;
+    dropped.fetch_add(excess);
+    data += excess;
+    size = capacity;
+  }
+  const size_t freeBytes = capacity - used;
+  if (size > freeBytes) {
+    // Drop the oldest buffered audio so playback stays close to real time.
+    const size_t dropFront = size - freeBytes;
+    dropped.fetch_add(dropFront);
+    readPos = (readPos + dropFront) % capacity;
+    used -= dropFront;
+  }
+  const size_t first = std::min(size, capacity - writePos);
+  std::memcpy(&ring[writePos], data, first);
+  if (size > first) std::memcpy(&ring[0], data + first, size - first);
+  writePos = (writePos + size) % capacity;
+  used += size;
+}
+
+size_t RdpsndPlayer::fill(uint8_t* out, size_t size) {
+  if (out == nullptr || size == 0) return 0;
+  size_t real = 0;
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (started && used > 0) {
+      real = std::min(size, used);
+      const size_t first = std::min(real, capacity - readPos);
+      std::memcpy(out, &ring[readPos], first);
+      if (real > first) std::memcpy(out + first, &ring[0], real - first);
+      readPos = (readPos + real) % capacity;
+      used -= real;
+      bytesPlayed.fetch_add(real);
+    }
+    if (real < size) std::memset(out + real, 0, size - real);
+  }
+  if (real < size) underruns.fetch_add(1);
+  logStats(false);
+  return real;
+}
+
+void RdpsndPlayer::startRenderer() {
+  int sampleRate = 0;
+  int channelCount = 0;
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    sampleRate = rate;
+    channelCount = channels;
+  }
+  char line[240];
+  OH_AudioStreamBuilder* builder = nullptr;
+  OH_AudioStream_Result result =
+      OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_RENDERER);
+  if (result != AUDIOSTREAM_SUCCESS || builder == nullptr) {
+    std::snprintf(line, sizeof(line),
+                  "audio: OH_AudioStreamBuilder_Create failed [%d]",
+                  static_cast<int>(result));
+    diagWarn(line);
+    return;
+  }
+  // The exact NDK call sequence of the renderer: rate, channels, S16LE, raw
+  // PCM, latency mode, usage, then the pull callback that owns the audio
+  // thread. Every step is checked and logged; a failure only costs audio.
+  struct Step {
+    const char* name;
+    OH_AudioStream_Result result;
+  };
+  const Step steps[] = {
+      {"SetSamplingRate",
+       OH_AudioStreamBuilder_SetSamplingRate(builder, sampleRate)},
+      {"SetChannelCount",
+       OH_AudioStreamBuilder_SetChannelCount(builder, channelCount)},
+      {"SetSampleFormat",
+       OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_S16LE)},
+      {"SetEncodingType", OH_AudioStreamBuilder_SetEncodingType(
+                              builder, AUDIOSTREAM_ENCODING_TYPE_RAW)},
+      {"SetLatencyMode", OH_AudioStreamBuilder_SetLatencyMode(
+                             builder, AUDIOSTREAM_LATENCY_MODE_NORMAL)},
+      {"SetRendererInfo",
+       OH_AudioStreamBuilder_SetRendererInfo(builder, AUDIOSTREAM_USAGE_MUSIC)},
+      {"SetRendererWriteDataCallback",
+       OH_AudioStreamBuilder_SetRendererWriteDataCallback(builder,
+                                                         audioWriteData, this)},
+  };
+  for (const Step& step : steps) {
+    if (step.result == AUDIOSTREAM_SUCCESS) continue;
+    std::snprintf(line, sizeof(line), "audio: OH_AudioStreamBuilder_%s failed [%d]",
+                  step.name, static_cast<int>(step.result));
+    diagWarn(line);
+    (void)OH_AudioStreamBuilder_Destroy(builder);
+    return;
+  }
+  OH_AudioRenderer* created = nullptr;
+  result = OH_AudioStreamBuilder_GenerateRenderer(builder, &created);
+  (void)OH_AudioStreamBuilder_Destroy(builder);
+  if (result != AUDIOSTREAM_SUCCESS || created == nullptr) {
+    std::snprintf(line, sizeof(line),
+                  "audio: OH_AudioStreamBuilder_GenerateRenderer failed [%d]",
+                  static_cast<int>(result));
+    diagWarn(line);
+    if (created != nullptr) (void)OH_AudioRenderer_Release(created);
+    return;
+  }
+  result = OH_AudioRenderer_Start(created);
+  if (result != AUDIOSTREAM_SUCCESS) {
+    std::snprintf(line, sizeof(line), "audio: OH_AudioRenderer_Start failed [%d]",
+                  static_cast<int>(result));
+    diagWarn(line);
+    (void)OH_AudioRenderer_Release(created);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    renderer = created;
+    started = true;
+    lastStatsMs = monotonicMillis();
+    lastStatsBytes = bytesPlayed.load();
+  }
+  std::snprintf(line, sizeof(line), "audio: renderer started %dHz %dch S16LE",
+                sampleRate, channelCount);
+  diagWarn(line);
+}
+
+void RdpsndPlayer::logStats(bool force) {
+  const uint64_t now = monotonicMillis();
+  char line[240];
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (!force && statsLines >= kAudioStatsMaxLines) return;
+    if (!force && now < lastStatsMs + kAudioStatsIntervalMs) return;
+    const uint64_t played = bytesPlayed.load();
+    // Nothing was ever pulled by the renderer: no stats line yet.
+    if (force && played == 0) return;
+    const uint64_t delta = played - lastStatsBytes;
+    const uint64_t elapsed = now > lastStatsMs ? now - lastStatsMs : 0;
+    const uint64_t ratePerSecond = elapsed > 0 ? delta * 1000u / elapsed : 0;
+    const uint64_t under = underruns.load();
+    const uint64_t lost = dropped.load();
+    const unsigned sampleRate = static_cast<unsigned>(rate);
+    const unsigned channelCount = static_cast<unsigned>(channels);
+    lastStatsMs = now;
+    lastStatsBytes = played;
+    ++statsLines;
+    std::snprintf(
+        line, sizeof(line),
+        "audio: %llu bytes played (rate=%llu B/s), underrun=%llu, dropped=%llu, "
+        "%uHz %uch",
+        static_cast<unsigned long long>(played),
+        static_cast<unsigned long long>(ratePerSecond),
+        static_cast<unsigned long long>(under),
+        static_cast<unsigned long long>(lost), sampleRate, channelCount);
+  }
+  diagWarn(line);
+}
+
+// The device object itself carries no state: it is the key the rdpsnd channel
+// hands back to the callbacks. All state lives in the shared player, so a Play
+// racing Free() only ever looks up a key (it never dereferences the freed
+// struct) and finds nothing.
+struct RdpsndDevice {
+  rdpsndDevicePlugin base;
+};
+
+static_assert(offsetof(RdpsndDevice, base) == 0,
+              "RdpsndDevice.base must stay first: Free() casts it back");
+
+std::mutex gRdpsndLock;
+std::map<rdpsndDevicePlugin*, std::shared_ptr<RdpsndPlayer>> gRdpsndPlayers;
+
+std::shared_ptr<RdpsndPlayer> rdpsndPlayerFor(rdpsndDevicePlugin* device) {
+  if (device == nullptr) return nullptr;
+  std::lock_guard<std::mutex> guard(gRdpsndLock);
+  const auto it = gRdpsndPlayers.find(device);
+  if (it == gRdpsndPlayers.end()) return nullptr;
+  return it->second;
+}
+
+BOOL rdpsndFormatSupported(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format) {
+  (void)device;
+  if (format == nullptr) return FALSE;
+  // Only uncompressed 16-bit stereo is played: there is no decoder for the
+  // compressed tags and no resampler. The rate is left to the server.
+  return format->wFormatTag == WAVE_FORMAT_PCM && format->nChannels == 2 &&
+                 format->wBitsPerSample == 16 &&
+                 format->nSamplesPerSec >= static_cast<UINT32>(kAudioMinRate) &&
+                 format->nSamplesPerSec <= static_cast<UINT32>(kAudioMaxRate)
+             ? TRUE
+             : FALSE;
+}
+
+UINT32 rdpsndGetVolume(rdpsndDevicePlugin* device) {
+  (void)device;
+  return 0xFFFFFFFFu;  // TSSNDCAPS_VOLUME capabilities: full volume
+}
+
+BOOL rdpsndSetVolume(rdpsndDevicePlugin* device, UINT32 value) {
+  (void)device;
+  (void)value;
+  return TRUE;  // the OHOS stream follows the system volume
+}
+
+BOOL rdpsndOpen(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format,
+                UINT32 latency) {
+  (void)latency;
+  if (format == nullptr) return FALSE;
+  char line[200];
+  // "rdpsnd format selected: ..." is the acceptance marker for negotiation.
+  std::snprintf(line, sizeof(line),
+                "rdpsnd format selected: %uHz %uch %ubit (PCM %s)",
+                static_cast<unsigned>(format->nSamplesPerSec),
+                static_cast<unsigned>(format->nChannels),
+                static_cast<unsigned>(format->wBitsPerSample),
+                format->wFormatTag == WAVE_FORMAT_PCM ? "yes" : "converted");
+  diagWarn(line);
+  std::shared_ptr<RdpsndPlayer> player = rdpsndPlayerFor(device);
+  if (player != nullptr)
+    player->start(static_cast<int>(format->nSamplesPerSec),
+                  static_cast<int>(format->nChannels));
+  // Audio is a side path: a renderer failure must not fail the channel, so
+  // Open always reports success and the session keeps running silently.
+  return TRUE;
+}
+
+UINT rdpsndPlay(rdpsndDevicePlugin* device, const BYTE* data, size_t size) {
+  std::shared_ptr<RdpsndPlayer> player = rdpsndPlayerFor(device);
+  if (player != nullptr)
+    player->push(reinterpret_cast<const uint8_t*>(data), size);
+  return CHANNEL_RC_OK;
+}
+
+void rdpsndClose(rdpsndDevicePlugin* device) {
+  std::shared_ptr<RdpsndPlayer> player = rdpsndPlayerFor(device);
+  if (player != nullptr) player->stop();
+}
+
+void rdpsndFree(rdpsndDevicePlugin* device) {
+  if (device == nullptr) return;
+  std::shared_ptr<RdpsndPlayer> player;
+  {
+    std::lock_guard<std::mutex> guard(gRdpsndLock);
+    const auto it = gRdpsndPlayers.find(device);
+    if (it != gRdpsndPlayers.end()) {
+      player = it->second;
+      gRdpsndPlayers.erase(it);
+    }
+  }
+  if (player != nullptr) {
+    player->stop();
+    player.reset();  // destroyed here, after the renderer is gone
+  }
+  delete reinterpret_cast<RdpsndDevice*>(device);
+}
+
+BOOL rdpsndDefaultFormat(rdpsndDevicePlugin* device, const AUDIO_FORMAT* desired,
+                         AUDIO_FORMAT* defaultFormat) {
+  (void)device;
+  (void)desired;
+  (void)defaultFormat;
+  // No conversion fallback: only the PCM 16-bit stereo formats above are
+  // opened, so rdpsnd's !FormatSupported path is not taken for them.
+  return FALSE;
+}
+
+UINT rdpsndServerFormatAnnounce(rdpsndDevicePlugin* device,
+                                const AUDIO_FORMAT* formats, size_t count) {
+  (void)device;
+  size_t usable = 0;
+  if (formats != nullptr) {
+    for (size_t index = 0; index < count; ++index) {
+      if (rdpsndFormatSupported(nullptr, &formats[index]) == TRUE) ++usable;
+    }
+  }
+  char line[240];
+  if (count == 0 || formats == nullptr) {
+    std::snprintf(line, sizeof(line),
+                  "rdpsnd: server offered no audio formats, staying silent");
+  } else if (usable == 0) {
+    std::snprintf(line, sizeof(line),
+                  "rdpsnd: no PCM format offered (%zu format(s); first tag=%u "
+                  "%uHz %uch %ubit), staying silent",
+                  count, static_cast<unsigned>(formats[0].wFormatTag),
+                  static_cast<unsigned>(formats[0].nSamplesPerSec),
+                  static_cast<unsigned>(formats[0].nChannels),
+                  static_cast<unsigned>(formats[0].wBitsPerSample));
+  } else {
+    std::snprintf(line, sizeof(line),
+                  "rdpsnd: server offered %zu format(s), %zu usable PCM 16-bit "
+                  "stereo format(s)",
+                  count, usable);
+  }
+  diagWarn(line);
+  return CHANNEL_RC_OK;
+}
+
+// rdpsnd device subsystem entry, returned by the addin provider below. The
+// channel calls this while handling CHANNEL_EVENT_CONNECTED; from here on the
+// channel owns the device pointer and calls the callbacks above.
+extern "C" UINT VCAPITYPE tianguanRdpsndDeviceEntry(
+    PFREERDP_RDPSND_DEVICE_ENTRY_POINTS pEntryPoints) {
+  if (pEntryPoints == nullptr || pEntryPoints->pRegisterRdpsndDevice == nullptr)
+    return CHANNEL_RC_INITIALIZATION_ERROR;
+  RdpsndDevice* device = new (std::nothrow) RdpsndDevice();
+  if (device == nullptr) return CHANNEL_RC_NO_MEMORY;
+  std::memset(&device->base, 0, sizeof(device->base));
+  device->base.FormatSupported = rdpsndFormatSupported;
+  device->base.Open = rdpsndOpen;
+  device->base.GetVolume = rdpsndGetVolume;
+  device->base.SetVolume = rdpsndSetVolume;
+  device->base.Play = rdpsndPlay;
+  device->base.Close = rdpsndClose;
+  device->base.Free = rdpsndFree;
+  device->base.DefaultFormat = rdpsndDefaultFormat;
+  device->base.ServerFormatAnnounce = rdpsndServerFormatAnnounce;
+  std::shared_ptr<RdpsndPlayer> player(new (std::nothrow) RdpsndPlayer());
+  if (player == nullptr) {
+    delete device;
+    return CHANNEL_RC_NO_MEMORY;
+  }
+  {
+    std::lock_guard<std::mutex> guard(gRdpsndLock);
+    gRdpsndPlayers[&device->base] = player;
+  }
+  pEntryPoints->pRegisterRdpsndDevice(pEntryPoints->rdpsnd, &device->base);
+  diagWarn("rdpsnd channel connected");
+  return CHANNEL_RC_OK;
+}
+
+// Static addin provider: client-common installs its resolver
+// (freerdp_channels_load_static_addin_entry) at every client context creation.
+// Replacing it with this thin wrapper lets the rdpsnd channel resolve the
+// "tianguan" device subsystem while every other channel lookup (including
+// rdpsnd itself and the rdpdr addin it drags in) is delegated unchanged.
+PVIRTUALCHANNELENTRY tianguanAddinProvider(LPCSTR name, LPCSTR subsystem,
+                                           LPCSTR type, DWORD flags) {
+  if (name != nullptr && subsystem != nullptr &&
+      std::strcmp(name, RDPSND_CHANNEL_NAME) == 0 &&
+      std::strcmp(subsystem, kRdpsndSubsystem) == 0) {
+    return WINPR_FUNC_PTR_CAST(&tianguanRdpsndDeviceEntry, PVIRTUALCHANNELENTRY);
+  }
+  return freerdp_channels_load_static_addin_entry(name, subsystem, type, flags);
+}
+
+void installRdpsndAddinProvider() {
+  freerdp_register_addin_provider(tianguanAddinProvider, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,16 +1740,50 @@ BOOL preConnect(freerdp* instance) {
       instance->context->settings == nullptr)
     return FALSE;
   rdpSettings* settings = instance->context->settings;
-  // This build contains drdynvc + rdpei + cliprdr client channels. Clipboard
-  // redirection is wanted (the cliprdr addin is in CLIENT_STATIC_ADDIN_TABLE),
-  // so client-common loads it at pre-connect. The other three RDP8 features are
-  // still disabled: NetworkAutoDetect/SupportHeartbeatPdu/SupportMultitransport
-  // pull in rdpdr (and its drive/printer device redirection), which is not part
-  // of this build. (See .work/freerdp-spike for the original failure.)
+  // This build contains drdynvc + rdpei + cliprdr + rdpsnd + rdpdr client
+  // channels. Clipboard redirection is wanted (the cliprdr addin is in
+  // CLIENT_STATIC_ADDIN_TABLE), so client-common loads it at pre-connect.
   if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, TRUE) ||
       !freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) ||
       !freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) ||
       !freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE))
+    return FALSE;
+  // Audio playback (rdpsnd): add the channel *here*, before client-common's
+  // freerdp_client_load_addins() runs right after PreConnect. Several things
+  // depend on that ordering:
+  //  - client-common sees "rdpsnd" in the static channel collection, forces
+  //    DeviceRedirection=TRUE and registers the rdpdr addin (rdpsnd cannot be
+  //    loaded without it). rdpdr is only registered: every device service
+  //    redirection below stays FALSE, so it never announces a drive/printer/
+  //    smartcard to the server. The RDP8 features that also need rdpdr
+  //    (NetworkAutoDetect / heartbeat / multitransport) stay disabled as
+  //    before.
+  //  - the same arguments are registered for the dynamic channel collection,
+  //    exactly like the reference clients' /sound option does. Modern servers
+  //    (Windows 8.1+) play audio over the AUDIO_PLAYBACK_DVC dynamic channels
+  //    that drdynvc opens, not over the static rdpsnd channel, and the DVC
+  //    instances parse their device backend from these same arguments. Without
+  //    this the dynamic instances fall back to the built-in "fake" null sink,
+  //    which accepts every format and silently discards all audio.
+  //  - the arguments select the OHOS renderer device subsystem registered by
+  //    installRdpsndAddinProvider() ("sys:tianguan"), and pin rdpsnd's
+  //    fixed_format to PCM stereo ("format:1"/"channel:2") so the client never
+  //    advertises a compressed format (no decoder) or an odd layout it cannot
+  //    open.
+  static const char* kSoundChannel[] = {
+      RDPSND_CHANNEL_NAME, "sys:tianguan", "format:1", "channel:2"};
+  if (!freerdp_client_add_static_channel(settings, ARRAYSIZE(kSoundChannel),
+                                         kSoundChannel) ||
+      !freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(kSoundChannel),
+                                          kSoundChannel))
+    return FALSE;
+  if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_RedirectDrives, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_RedirectHomeDrive, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_RedirectSerialPorts, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_RedirectSmartCards, FALSE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_RedirectPrinters, FALSE))
     return FALSE;
   if (!kEnableGfx) return TRUE;
   // SupportGraphicsPipeline makes client-common register the "rdpgfx" dynamic
@@ -1637,6 +2251,12 @@ struct Attempt {
     attempt->fingerprintMismatch = false;
     attempt->bitmapUpdate = nullptr;
     attempt->surfaceBits = nullptr;
+    // freerdp_client_context_new() registers client-common's static addin
+    // resolver as the process-wide provider, so (re)install ours afterwards:
+    // it answers only the rdpsnd "tianguan" subsystem lookup and delegates
+    // everything else. Must be in place before freerdp_connect() loads the
+    // channels.
+    installRdpsndAddinProvider();
     // Subscribe before connect: the rdpgfx channel is opened after PostConnect
     // (gdi_init) and its ChannelConnected event is what installs the gdi
     // graphics pipeline. The reference clients (xfreerdp/SDL) subscribe at the

@@ -26,7 +26,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
     "${RDP_DEPS_PREFIX}/include")
   target_link_directories(tianguan_diag PRIVATE "${RDP_DEPS_PREFIX}/lib")
   target_link_libraries(tianguan_diag PRIVATE tigervnc_client ace_napi.z hilog_ndk.z
-    EGL GLESv3 native_window
+    # ohaudio is the OHOS AudioRenderer NDK (libohaudio.so), used by
+    # rdp_backend.cxx for RDP audio playback (rdpsnd). It is a platform system
+    # library, so the shared object gains exactly one more system NEEDED entry.
+    EGL GLESv3 native_window ohaudio
     # Static FreeRDP stack, in link order: client-common, core, WinPR, then the
     # static OpenSSL/zlib and libc dependencies. No shared FreeRDP/OpenSSL.
     freerdp-client3 freerdp3 winpr3 ssl crypto z pthread dl m)

@@ -240,6 +240,23 @@ patch -d "$freerdp_copy" -p1 --batch --forward \
 # It is a dynamic channel and therefore requires CHANNEL_DRDYNVC=ON (already
 # enabled above). CHANNEL_VIDEO stays OFF: the RDPSND/VIDEO H.264 path needs
 # WITH_FFMPEG, which this target build deliberately leaves off.
+# 音频通道（PCM 回放；无 ffmpeg 时不支持压缩音频）: rdpsnd client only,
+#   -DCHANNEL_RDPSND=ON -DCHANNEL_RDPSND_CLIENT=ON -DCHANNEL_RDPSND_SERVER=OFF.
+# rdpsnd is a static channel registered through CLIENT_STATIC_ADDIN_TABLE (like
+# cliprdr), so rdpsnd_main + the built-in null "fake" sink land in
+# libfreerdp-client3.a; it does not depend on CHANNEL_DRDYNVC. WITH_OSS is off
+# because OHOS has no OSS device: only the fake sink is built and the app has to
+# provide the real audio output (WITH_ALSA/WITH_PULSE are off as well).
+# WITH_FFMPEG/WITH_SWSCALE stay off, so only uncompressed formats (PCM) can be
+# decoded; the client answers the server's Activate format list with the formats
+# it supports and the server picks the final one.
+# rdpdr 客户端：rdpsnd 运行期依赖它（client-common 会强制 DeviceRedirection 并加载 rdpdr）。
+# -DCHANNEL_RDPDR=ON -DCHANNEL_RDPDR_CLIENT=ON -DCHANNEL_RDPDR_SERVER=OFF. rdpdr is
+# a static channel: its OBJECT library (irp/devman/rdpdr_main/capabilities) is
+# registered through CLIENT_STATIC_ADDIN_TABLE, so the code lands in
+# libfreerdp-client3.a. The drive/printer/smartcard DeviceServiceEntry
+# sub-channels stay CHANNEL_*_OFF: they are optional runtime subsystems of
+# rdpdr and this client has no device redirection UI.
 cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -255,7 +272,8 @@ cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DOPENSSL_ROOT_DIR="$prefix" -DOPENSSL_USE_STATIC_LIBS=ON \
   -DZLIB_ROOT="$prefix" -DZLIB_USE_STATIC_LIBS=ON \
   -DWITH_CLIENT=ON -DWITH_SERVER=OFF -DWITH_CLIENT_SDL=OFF -DWITH_X11=OFF -DWITH_WAYLAND=OFF \
-  -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_ALSA=OFF -DWITH_PULSE=OFF -DWITH_CUPS=OFF \
+  -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_OSS=OFF -DWITH_ALSA=OFF -DWITH_PULSE=OFF \
+  -DWITH_CUPS=OFF \
   -DWITH_PCSC=OFF -DWITH_FUSE=OFF -DWITH_KRB5=OFF -DWITH_SAMPLE=OFF -DWITH_MANPAGES=OFF \
   -DWITH_UNICODE_BUILTIN=ON -DWITH_CHANNELS=ON -DWITH_CLIENT_CHANNELS=ON \
   -DCHANNEL_DRDYNVC=ON -DCHANNEL_DRDYNVC_CLIENT=ON -DCHANNEL_DRDYNVC_SERVER=OFF \
@@ -264,9 +282,11 @@ cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_DISP=OFF \
   -DCHANNEL_DRIVE=OFF -DCHANNEL_ECHO=OFF -DCHANNEL_ENCOMSP=OFF -DCHANNEL_GEOMETRY=OFF \
   -DCHANNEL_LOCATION=OFF -DCHANNEL_PARALLEL=OFF -DCHANNEL_PRINTER=OFF -DCHANNEL_RAIL=OFF \
-  -DCHANNEL_RDPDR=OFF -DCHANNEL_RDPECAM=OFF -DCHANNEL_RDPEMSC=OFF \
+  -DCHANNEL_RDPDR=ON -DCHANNEL_RDPDR_CLIENT=ON -DCHANNEL_RDPDR_SERVER=OFF \
+  -DCHANNEL_RDPECAM=OFF -DCHANNEL_RDPEMSC=OFF \
   -DCHANNEL_RDPGFX=ON -DCHANNEL_RDPGFX_CLIENT=ON -DCHANNEL_RDPGFX_SERVER=OFF \
-  -DCHANNEL_RDPSND=OFF -DCHANNEL_REMDESK=OFF -DCHANNEL_RDP2TCP=OFF -DCHANNEL_SERIAL=OFF \
+  -DCHANNEL_RDPSND=ON -DCHANNEL_RDPSND_CLIENT=ON -DCHANNEL_RDPSND_SERVER=OFF \
+  -DCHANNEL_REMDESK=OFF -DCHANNEL_RDP2TCP=OFF -DCHANNEL_SERIAL=OFF \
   -DCHANNEL_SMARTCARD=OFF -DCHANNEL_SSHAGENT=OFF -DCHANNEL_TELEMETRY=OFF -DCHANNEL_TSMF=OFF \
   -DCHANNEL_URBDRC=OFF -DCHANNEL_VIDEO=OFF > "$build/freerdp-configure.log" 2>&1 || {
     echo 'FreeRDP configure failed' >&2; tail -60 "$build/freerdp-configure.log" >&2; exit 1
@@ -364,8 +384,8 @@ mkdir -p "$prefix/share"
   printf '\nzlib: 1.3.2\n  configure: --static, CFLAGS="-O2 -fPIC"\n  URL: %s\n  SHA256: %s\n' \
     "${urls[1]}" "${sha256[1]}"
   printf '\nFreeRDP: 3.9.0\n  Commit: %s\n  Source: %s\n' "$freerdp_commit" "$freerdp_src"
-  printf '  CMake: WITH_CLIENT=ON WITH_SERVER=OFF, SDL/X11/Wayland/FFmpeg/ALSA/Pulse/CUPS/PCSC/FUSE/KRB5/SAMPLE/MANPAGES off,\n'
-  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx client channels on,\n'
+  printf '  CMake: WITH_CLIENT=ON WITH_SERVER=OFF, SDL/X11/Wayland/FFmpeg/OSS/ALSA/Pulse/CUPS/PCSC/FUSE/KRB5/SAMPLE/MANPAGES off,\n'
+  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx+rdpsnd+rdpdr client channels on,\n'
   printf '         BUILD_SHARED_LIBS=OFF, CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF, CMAKE_POSITION_INDEPENDENT_CODE=ON,\n'
   printf '         OPENSSL_ROOT_DIR/ZLIB_ROOT=%s, OPENSSL_USE_STATIC_LIBS=ON.\n' "$prefix"
   printf '  Source patch: winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'
