@@ -2,7 +2,8 @@
 
 - 审计日期：2026-10-26
 - 审计基线：`main` @ `b452b67`（工作区干净）
-- 审计方式：只读阅读仓库配置/资源/构建产物 + 查阅华为官方文档（2026-10 更新版本）。**本次未修改任何代码或配置，未提交 git。**
+- 审计方式：只读阅读仓库配置/资源/构建产物 + 查阅华为官方文档（2026-10 更新版本）。**审计当时未修改任何代码或配置，未提交 git。**
+- 图标补齐记录（2026-10-26）：分层图标与 AGC 平面素材已入库，`app.json5`/`module.json5` 已改为 `$media:layered_image`；包内实际图层为 **512×512**（restool 固定上限缩放），推导与实测见 3.3 与 `docs/store/README.md`。
 - 目标：HarmonyOS 应用（.app / HAP），设备 phone + 2in1，发布中国大陆，免费应用。
 - 状态图例：✅ 满足 ｜ ❌ 缺失 ｜ ⚠️ 需确认/需实测 ｜ — 不适用
 
@@ -13,7 +14,7 @@
 ## 0. 结论速览
 
 1. **发布链路为零**：仓库只有调试证书/调试 Profile（且签名材料不在仓库），`app/build-profile.json5` 无 `signingConfigs`，`app/build.sh:27` 只跑 `assembleHap` 产出 **unsigned HAP**；AGC 要求的是用**发布证书 + 发布 Profile** 签名的 **.app**（App Pack）。
-2. **图标必挂上架检测**：包内只有 `app_icon.svg`（128×128 单层，299 字节），官方要求应用图标必须是 **1024×1024、PNG、前后景分层、背景不透明**；AGC 详情页另需 216×216 或 1024×1024 图标。
+2. **图标已补齐**：AppScope 下已有 1024×1024 分层图标（`background.png` 不透明 + `foreground.png` 透明 + `layered_image.json`），`app.json5` 与 `module.json5` 均引用 `$media:layered_image`；AGC 详情页 216/1024 平面图在 `docs/store/`。包内实际图层为 **512×512**（restool 固定上限，属编译期优化，非素材缺失），详见 3.3 与 `docs/store/README.md`。
 3. **隐私合规是最大缺口**：仓库和应用内**都没有隐私政策**，也没有首启隐私弹窗/显著提示；官方明确要求在开发者中心**和应用内**都提供可便捷查看的隐私政策链接，且收集/使用前须取得用户同意。
 4. **`READ_PASTEBOARD` 在手机上大概率被拒**：该受限权限对 PC/2in1「应用均可申请」，但手机只允许列举场景（银行/口令/文档/输入法/开源框架），**远程桌面不在列**；发布 Profile 还必须包含该权限、并提供权限使用理由 + 使用场景视频。
 5. **`compatibleSdkVersion: 26.0.0` 把可安装范围锁到 HarmonyOS 7.0+**（官方定义：低于该版本的设备不能安装），与「适配华为主流终端」的审核要求存在张力；当前主流设备仍在 6.1.x（API 23/24）。
@@ -53,15 +54,15 @@
 | # | 要求 | 官方依据 | 天关现状 | 判定 |
 |---|---|---|---|---|
 | 12 | 应用名称 ≤15 个汉字或 30 个其他语言字符；不得为泛词；不得与他人重名；须与软著名称/简称一致 | [审核指南 1.1–1.5](https://developer.huawei.com/consumer/cn/doc/app/50104)；[软著证书说明 Q3](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/50111-02) | 「天关」2 字，非泛词；AppGallery 站内搜索未见同名应用（[检索页](https://appgallery.huawei.com/search/%E5%A4%A9%E5%85%B3)，2026-10-26）；无软著 | ⚠️ 名称本身可，软著一致性待办 |
-| 13 | AGC 详情页应用图标 216×216 或 1024×1024 PNG（≤3MB），须与安装后图标一致 | [素材规范](https://developer.huawei.com/consumer/cn/doc/app/agc-help-app-visual-asset-spec-0000002277607976)；[配置名称/图标](https://developer.huawei.com/consumer/cn/doc/App/agc-help-release-app-nameicon-0000002306265009) | 无 1024/216 PNG；包内仅 128×128 SVG | ❌ 缺失 |
-| 14 | 包内应用图标必须是 **1024×1024 分层图标**：前景图 + 背景图，PNG，正方形，无圆角，背景不得含透明像素 | [图标资源规范](https://developer.huawei.com/consumer/cn/doc/doccenter-ux-design/application-icon-0000001953444009)；[配置应用图标和名称](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/layered-image) | 单层 SVG（`app/AppScope/resources/base/media/app_icon.svg`、`entry/.../media/app_icon.svg`），无 `layered_image.json` | ❌ 缺失 |
+| 13 | AGC 详情页应用图标 216×216 或 1024×1024 PNG（≤3MB），须与安装后图标一致 | [素材规范](https://developer.huawei.com/consumer/cn/doc/app/agc-help-app-visual-asset-spec-0000002277607976)；[配置名称/图标](https://developer.huawei.com/consumer/cn/doc/App/agc-help-release-app-nameicon-0000002306265009) | 已补齐：`docs/store/icon-1024.png`（1024×1024 RGB，20,709 B）与 `docs/store/icon-216.png`（216×216，7,443 B）；1024 与源两层合成结果逐像素一致 | ✅ 已补齐 |
+| 14 | 包内应用图标必须是 **1024×1024 分层图标**：前景图 + 背景图，PNG，正方形，无圆角，背景不得含透明像素 | [图标资源规范](https://developer.huawei.com/consumer/cn/doc/doccenter-ux-design/application-icon-0000001953444009)；[配置应用图标和名称](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/layered-image) | 已补齐：`app/AppScope/resources/base/media/{background.png,foreground.png,layered_image.json}`，源 1024×1024；entry 不再重复放置。构建后 HAP 内两图层为 512×512（restool 固定上限），背景源文件为 RGB、无 alpha 通道 | ✅ 已补齐（包内 512 属编译期优化，见 3.3） |
 | 15 | 应用截图：手机 3–10 张（16:9 1920×1080 或 9:16 1080×1920）；PC/2in1 3–10 张（16:9 1920×1080）；不得重复/模糊/拉伸 | [素材规范](https://developer.huawei.com/consumer/cn/doc/app/agc-help-app-visual-asset-spec-0000002277607976)；[审核指南 1.9](https://developer.huawei.com/consumer/cn/doc/app/50104) | 仓库无上架截图（`.work` 下的设备截图不是素材） | ❌ 缺失 |
 | 16 | 应用介绍视频（可选）；但本应用依赖外部服务器，须提供**演示视频** | [审核指南 1.21](https://developer.huawei.com/consumer/cn/doc/app/50104)：需连接设备/特殊运行环境才可使用的应用须提供演示视频 | 无演示视频、无公开测试服务器 | ❌ 缺失 |
 | 17 | 应用分类/标签须与实际功能相符 | [鸿蒙应用分类](https://developer.huawei.com/consumer/cn/doc/app/classify-0000001960172909)；[配置分类、标签](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/agc-help-release-app-class-tag-0000002271695234) | 官方分类表无「远程桌面/远程控制」二级类目；先例（ToDesk/向日葵/时代云远程桌面）归入 Tools | ⚠️ 需确认具体二级类目 |
 | 18 | 内容分级（年龄分级问卷） | [配置内容分级](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/agc-help-release-app-rating-0000002313511005)；[审核指南 1.10](https://developer.huawei.com/consumer/cn/doc/app/50104) | 未做 | ❌ 缺失 |
 | 19 | 一句话简介、应用介绍、新版本特性，须与实际一致，不得含「测试/demo/beta」等词 | [审核指南 1.14](https://developer.huawei.com/consumer/cn/doc/app/50104)；[审核 Checklist](https://developer.huawei.com/consumer/cn/doc/app/50170) | 无上架文案；README 中「计划/未实现」等表述不能直接当介绍 | ❌ 缺失 |
 | 20 | 应用内须有真实有效的开发者联系信息 | [审核指南 11.2](https://developer.huawei.com/consumer/cn/doc/app/50104) | 应用内只有连接列表与远程页（`pages/Index.ets`、`pages/Remote.ets`），无关于/联系入口 | ❌ 缺失 |
-| 21 | 提交的名称、图标须与安装后一致 | [配置名称/图标](https://developer.huawei.com/consumer/cn/doc/App/agc-help-release-app-nameicon-0000002306265009)；[审核指南 1.20](https://developer.huawei.com/consumer/cn/doc/app/50104) | 当前包内 label=天关、icon=单层 SVG；改分层图标后需保证 AGC 图标 = 合成效果 | ⚠️ 待做完图标后核验 |
+| 21 | 提交的名称、图标须与安装后一致 | [配置名称/图标](https://developer.huawei.com/consumer/cn/doc/App/agc-help-release-app-nameicon-0000002306265009)；[审核指南 1.20](https://developer.huawei.com/consumer/cn/doc/app/50104) | 包内 label=天关、`icon=$media:layered_image`（`bm dump` iconId=16777237）；PC `install -r` 后 Dock 图标与 `docs/store/icon-1024.png` 同形，证据 `.work/icon-evidence/` | ✅ 已核对（上架前用最终 AGC 素材再复核一次） |
 
 ### 1.4 隐私与权限
 
@@ -213,15 +214,17 @@
 - **验收**：`hap-sign-tool verify-app` 通过且 Profile 类型为「发布」；AGC 合法性检测「已达标」；AGC 能解析出 `versionName/versionCode/deviceTypes`。
 - **注意**：Profile 分发类型为 `app_gallery` 且证书为 release 的包**不能用 `bm` 安装到本地设备**（官方 bm 文档错误码 9568402，[bm 工具](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/bm-tool)）；release 包的真机验证只能走 AGC 内部测试/邀请测试或商店安装，不能把「hdc 装不上」当成失败。
 
-### 3.3 分层图标（上架硬门槛）
+### 3.3 分层图标（已补齐，2026-10-26）
 
-- **改动**：
-  - 新增 `app/AppScope/resources/base/media/foreground.png`、`background.png`（均 1024×1024，PNG，正方形，无圆角；背景不得有透明像素）；
-  - 新增 `app/AppScope/resources/base/media/app_layered_image.json`：`{"layered-image":{"background":"$media:background","foreground":"$media:foreground"}}`；
-  - `app/AppScope/app.json5:2` 的 `icon` 改为 `$media:app_layered_image`；
-  - 入口 UIAbility 的 `icon` 优先级高于 app.json5（[配置应用图标和名称](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/layered-image)）：要么在 `entry/.../media` 放同样三层资源并把 `module.json5:29,48` 的 `icon` 指过去，要么**删除两个 ability 的 `icon`/`label`** 让 app.json5 生效（推荐后者，少一份重复资源）；
-  - `startWindowIcon`（`module.json5:30,49`）改为单独的非分层启动图标（避免把分层 json 当启动图标）。
-- **验收**：AGC 合法性检测/上架自检不再报「未配置前景图/背景图」；真机桌面、Dock、设置列表图标正常；`unzip -l` 能看到 2 张 PNG + `app_layered_image.json`；AGC 详情页 1024 图标与合成效果一致。
+- **已落地**：
+  - `app/AppScope/resources/base/media/background.png`（1024×1024 RGB，不透明）、`foreground.png`（1024×1024 RGBA，前景透明）、`layered_image.json`（`{"layered-image":{"background":"$media:background","foreground":"$media:foreground"}}`）；
+  - `app/AppScope/app.json5` 的 `icon` 与 `app/entry/src/main/module.json5` 两个 ability 的 `icon`/`startWindowIcon` 均为 `$media:layered_image`；
+  - entry 下不再放同名三件套：AppScope 资源构建时会合入模块资源目录，模块清单可直接引用，同时消除 restool 的 `'...' is defined repeatedly` 警告（官方说明重名时 AppScope 覆盖模块副本）；
+  - AGC 平面素材：`docs/store/icon-1024.png`（1024×1024 不透明 RGB）、`docs/store/icon-216.png`（216×216，由 1024 用 Lanczos 缩小），两张都与源两层合成结果逐像素一致。
+- **包内实际尺寸**：源图层 1024×1024；`bash app/build.sh` 后 HAP 内 `resources/base/media/background.png`、`foreground.png` 均为 **512×512 RGBA**（背景 alpha 254）。这是 restool 对 `icon` 引用资源的固定 512 上限缩放（`CompressionParser::ScaleImage` 硬编码 `{512,512}`），属编译期正常优化；`layered_image.json` 与引用关系保留。
+- **告警判读**：restool 的 `iconCheck` 对 base 目录按 sdpi-phone 的常规尺寸（`icon=41`、`startWindowIcon=144`）告警，1024 源图必然触发；该检查仅告警不失败，hvigor 默认日志级别不显示。另有一条与图标无关的 `app_name conflict`（AppScope/entry 各有一份 `string.json`），属既存字符串重复，不在本项处理。
+- **依据**：[图标资源规范](https://developer.huawei.com/consumer/cn/doc/doccenter-ux-design/application-icon-0000001953444009)（1024×1024、分层、PNG、无圆角、背景不透明）；[配置应用图标和名称](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/layered-image)（AppScope 资源合入模块、重名覆盖）；restool 源码 [developtools_global_resource_tool](https://gitee.com/openharmony/developtools_global_resource_tool) 的 `resource_check.cpp`、`resource_data.h`、`compression_parser.cpp`、`config_parser.cpp`。本地实测与复现命令见 `docs/store/README.md`。
+- **验收**：`bash app/build.sh` 退出 0；解包确认 2 张 PNG + `layered_image.json`；`bm dump -n cn.alfadb.tianguan` 的 `iconId=16777237`、`iconPath=$media:layered_image`；PC `hdc install -r` 后 Dock 图标正常（`.work/icon-evidence/desktop-dock-appscope-d1-20261026.jpeg`、`dock-icon-appscope-zoom-20261026.png`）。AGC 合法性检测/上架自检仍需真实上传后确认。
 
 ### 3.4 应用内隐私政策与「关于」入口
 
@@ -361,7 +364,7 @@
 - 鸿蒙应用是否有「最低 targetSdkVersion」硬性数值（发布准备只写 API Level ≥10）。
 - 远程桌面类目在 AGC 下拉中的确切二级分类。
 - 华为对 GPL 作为 EULA 的明确接受度。
-- 启动页 `startWindowIcon` 的官方尺寸规范（设计指南只规定「图标 + 背景色」，未找到像素要求）。
+- 启动页 `startWindowIcon` 的官方尺寸规范（设计指南只规定「图标 + 背景色」，未找到像素要求）；仅从 restool 源码查到 base 目录的告警阈值为 144 px，不是硬性上限。
 - HAP 是否必须提供 x86_64 版本（当前只打 arm64-v8a；未找到 2in1 x86 设备的官方要求）。
 - 个人开发者上架远程桌面类应用是否有额外限制（资质清单未列，但账号 FAQ 提到部分类目限制，未见远程桌面）。
 
@@ -387,13 +390,15 @@
 
 | 证据 | 位置 | 结论 |
 |---|---|---|
-| 应用元信息 | `app/AppScope/app.json5:2` | bundleName `cn.alfadb.tianguan`；`versionCode 1`；`versionName 0.0.1`；icon `$media:app_icon`；label `$string:app_name` |
+| 应用元信息 | `app/AppScope/app.json5:2` | bundleName `cn.alfadb.tianguan`；`versionCode 1`；`versionName 0.0.1`；icon `$media:layered_image`；label `$string:app_name` |
 | 工程构建配置 | `app/build-profile.json5:3-4` | 无 `signingConfigs`；compile/compatible/target 均 `26.0.0`；`buildModeSet: debug/release` |
 | 模块构建配置 | `app/entry/build-profile.json5:1` | `buildOption: {}`（无 arkOptions/混淆）；deviceType `['2in1','phone']` |
 | 模块清单 | `app/entry/src/main/module.json5:8-19` | deviceTypes 2in1+phone；INTERNET / PREPARE_APP_TERMINATE / READ_PASTEBOARD（reason 复用 `module_desc`，usedScene inuse） |
-| 能力/启动图 | `module.json5:30,49`（startWindowIcon）、`:35,54`（orientation auto_rotation）、`:56`（multiton） | 启动图标复用应用图标；两个 UIAbility 都显式设置 icon/label |
+| 能力/启动图 | `module.json5` 两个 ability 的 `icon`/`startWindowIcon`、`:35,54`（orientation auto_rotation）、`:56`（multiton） | 两个 UIAbility 的 `icon` 与 `startWindowIcon` 均引用 `$media:layered_image` |
 | 字符串 | `app/entry/src/main/resources/base/element/string.json:2-3` | 仅 `app_name=天关`、`module_desc=用于在本机复制内容后自动同步到远程会话` |
-| 图标资源 | `app/AppScope/resources/base/media/app_icon.svg`、`entry/.../media/app_icon.svg` | 128×128 单层 SVG；无 `layered_image.json`；无 1024 PNG |
+| 图标资源 | `app/AppScope/resources/base/media/{background.png,foreground.png,layered_image.json}` | 背景/前景 1024×1024；背景为 RGB 无 alpha；entry 不再重复放置 |
+| 图标构建产物 | `app/entry/build/default/outputs/default/entry-default-unsigned.hap` 内 `resources/base/media/*` | background/foreground 均 512×512 RGBA（背景 alpha 254）；`layered_image.json` 保留；restool 固定 512 上限缩放 |
+| 设备图标 | `bm dump -n cn.alfadb.tianguan` | `iconId=16777237`（0x01000015）、`iconPath=$media:layered_image`；PC `install -r` 后 Dock 图标正常 |
 | 构建脚本 | `app/build.sh:27-29` | 只跑 `assembleHap --mode module -p buildMode=release`，输出 unsigned HAP |
 | 构建产物 | `app/entry/build/default/outputs/default/entry-default-unsigned.hap` | 15,263,559 字节；`module.json`：deviceTypes 2in1/phone、installationFree false、无 debug；`pack.info`：releaseType Release、apiVersion 26 |
 | 原生库 | HAP 内 `libs/arm64-v8a/libtianguan_diag.so` | 打包后 13.7MB，`readelf -S` 无 `.debug_*`（已 strip）；源 `app/entry/libs/...` 为 15.9MB 含调试段，未被打入 |
