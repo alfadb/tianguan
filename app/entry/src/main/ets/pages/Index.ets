@@ -35,6 +35,9 @@ import {
 } from '../model/SessionRegistry';
 import type { RuntimeSession } from '../model/SessionRegistry';
 import { closeRemoteWindow, openRemoteWindow } from '../windows/RemoteWindows';
+import {
+  isPrivacyAccepted, loadPrivacyPolicy, readAppVersion, setPrivacyAccepted
+} from '../privacy/PrivacyStore';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -384,6 +387,18 @@ struct Index {
   @State private pwdConnectionId: string = '';
   @State private pwdValue: string = '';
   @State private pwdReason: string = '';
+  // Privacy: first-launch consent, the "关于" panel and the full policy text.
+  // privacyReady stays false until the stored flag has been read, so the
+  // consent overlay also covers the very first frames (the manager must not be
+  // usable before the user has seen the dialog).
+  @State private privacyReady: boolean = false;
+  @State private privacyAccepted: boolean = false;
+  @State private consentError: string = '';
+  @State private aboutVisible: boolean = false;
+  @State private policyVisible: boolean = false;
+  @State private policyLoading: boolean = false;
+  @State private policyText: string = '';
+  @State private appVersion: string = '';
   private started: boolean = false;
   // In-flight connect per connection id: a second click while createSession /
   // openRemoteWindow is still running would create a second session AND a
@@ -405,6 +420,14 @@ struct Index {
 
   aboutToAppear(): void {
     this.viewportWidth = this.initialViewportWidth();
+    this.appVersion = readAppVersion();
+    this.loadPrivacyState().catch((error: Error): void => {
+      hilog.warn(DOMAIN, TAG, '初始化隐私同意状态失败：%{public}s', String(error));
+      this.privacyReady = true;
+    });
+    this.loadPolicyText().catch((error: Error): void => {
+      hilog.warn(DOMAIN, TAG, '预读取隐私政策失败：%{public}s', String(error));
+    });
     if (!this.started) {
       this.started = true;
       this.connections = savedConnections();
@@ -1492,6 +1515,365 @@ struct Index {
     .backgroundColor($r('app.color.card_background'))
   }
 
+  // -------------------------------------------------------------------------
+  // Privacy: first-launch consent, "关于" panel, full policy text.
+  // -------------------------------------------------------------------------
+
+  private async loadPrivacyState(): Promise<void> {
+    const context = this.abilityContext();
+    if (context !== undefined) {
+      try {
+        this.privacyAccepted = await isPrivacyAccepted(context);
+      } catch (error) {
+        // Fail closed: an unreadable flag shows the consent dialog again.
+        hilog.warn(DOMAIN, TAG, '读取隐私同意标记失败，按未同意处理：%{public}s', String(error));
+        this.privacyAccepted = false;
+      }
+    }
+    this.privacyReady = true;
+  }
+
+  private async loadPolicyText(): Promise<void> {
+    if (this.policyLoading || this.policyText.length > 0) {
+      return;
+    }
+    this.policyLoading = true;
+    const context = this.abilityContext();
+    if (context === undefined) {
+      this.policyText = '隐私政策读取失败，请关闭后重试。';
+    } else {
+      try {
+        this.policyText = await loadPrivacyPolicy(context);
+      } catch (error) {
+        hilog.error(DOMAIN, TAG, '读取隐私政策失败：%{public}s', String(error));
+        this.policyText = '隐私政策读取失败，请关闭后重试。';
+      }
+    }
+    this.policyLoading = false;
+  }
+
+  private openPolicy(): void {
+    this.aboutVisible = false;
+    this.policyVisible = true;
+    if (this.policyText.length === 0 && !this.policyLoading) {
+      this.loadPolicyText().catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG, '打开隐私政策失败：%{public}s', String(error));
+      });
+    }
+  }
+
+  /** 同意并继续: only enters the manager after the flag is really persisted. */
+  private acceptPrivacy(): void {
+    const context = this.abilityContext();
+    if (context === undefined) {
+      this.consentError = '保存隐私设置失败，请重试。';
+      return;
+    }
+    this.consentError = '';
+    setPrivacyAccepted(context).then((): void => {
+      this.privacyAccepted = true;
+      hilog.info(DOMAIN, TAG, 'privacy consent accepted');
+    }).catch((error: Error): void => {
+      this.consentError = '保存隐私设置失败，请重试。';
+      hilog.error(DOMAIN, TAG, '保存隐私同意标记失败：%{public}s', String(error));
+    });
+  }
+
+  /** 不同意: the app must not stay usable, so end this ability. */
+  private declinePrivacy(): void {
+    hilog.info(DOMAIN, TAG, 'privacy consent declined, terminating');
+    const context = this.abilityContext();
+    if (context === undefined) {
+      this.consentError = '退出失败，请手动关闭应用。';
+      return;
+    }
+    context.terminateSelf().catch((error: Error): void => {
+      this.consentError = '退出失败，请手动关闭应用。';
+      hilog.error(DOMAIN, TAG, '拒绝隐私政策后退出失败：%{public}s', String(error));
+    });
+  }
+
+  @Builder
+  private aboutEntryButton() {
+    Button('关于')
+      .fontSize(12)
+      .fontColor($r('app.color.text_secondary'))
+      .height(28)
+      .padding({ left: 10, right: 10 })
+      .borderRadius(8)
+      .backgroundColor($r('app.color.chip_background'))
+      .onClick(() => { this.aboutVisible = true; })
+  }
+
+  @Builder
+  private consentOverlay() {
+    Column({ space: 16 }) {
+      if (!this.privacyReady) {
+        Column({ space: 12 }) {
+          LoadingProgress()
+            .width(32)
+            .height(32)
+            .color($r('app.color.brand'))
+          Text('正在读取隐私设置…')
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.Center)
+        .padding({ top: 12, bottom: 12 })
+      } else {
+        Text('欢迎使用天关')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+        Text('使用前请阅读并同意《隐私政策》')
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .width('100%')
+        Column({ space: 6 }) {
+          Text('天关不收集、不上传您的任何个人信息。')
+            .fontSize(13)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          Text('连接配置与证书指纹只保存在本机，密码保存在系统密钥库；远程桌面连接直接连到您指定的服务器，不经过任何中转。')
+            .fontSize(12)
+            .lineHeight(18)
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .padding(12)
+        .borderRadius(10)
+        .backgroundColor($r('app.color.page_background'))
+
+        if (this.consentError.length > 0) {
+          Text(this.consentError)
+            .fontSize(12)
+            .fontColor($r('app.color.danger'))
+            .width('100%')
+        }
+
+        Button('查看隐私政策')
+          .fontSize(14)
+          .fontColor($r('app.color.brand'))
+          .backgroundColor($r('app.color.chip_background'))
+          .height(40)
+          .width('100%')
+          .borderRadius(12)
+          .onClick(() => { this.openPolicy(); })
+
+        Row({ space: 12 }) {
+          Button('不同意')
+            .fontSize(14)
+            .height(40)
+            .layoutWeight(1)
+            .borderRadius(12)
+            .backgroundColor($r('app.color.chip_background'))
+            .fontColor($r('app.color.text_primary'))
+            .onClick(() => { this.declinePrivacy(); })
+          Button('同意并继续')
+            .fontSize(14)
+            .height(40)
+            .layoutWeight(1.4)
+            .borderRadius(12)
+            .backgroundColor($r('app.color.brand'))
+            .fontColor(Color.White)
+            .onClick(() => { this.acceptPrivacy(); })
+        }
+        .width('100%')
+      }
+    }
+    .width('86%')
+    .padding(24)
+    .borderRadius(16)
+    .backgroundColor($r('app.color.card_background'))
+  }
+
+  @Builder
+  private aboutInfoRow(label: string, value: string) {
+    Row({ space: 12 }) {
+      Text(label)
+        .fontSize(13)
+        .fontColor($r('app.color.text_secondary'))
+        .width(72)
+      Text(value)
+        .fontSize(13)
+        .fontColor($r('app.color.text_primary'))
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Top)
+  }
+
+  @Builder
+  private aboutOverlay() {
+    Column({ space: 14 }) {
+      Row() {
+        Text('关于天关')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+        Text('✕')
+          .fontSize(18)
+          .fontColor($r('app.color.text_secondary'))
+          .width(32)
+          .height(32)
+          .textAlign(TextAlign.Center)
+          .borderRadius(8)
+          .onClick(() => { this.aboutVisible = false; })
+      }
+      .width('100%')
+
+      Scroll() {
+        Column({ space: 14 }) {
+          Column({ space: 4 }) {
+            Text('天关')
+              .fontSize(24)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('版本 ' + (this.appVersion.length > 0 ? this.appVersion : '未知'))
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+            Text('HarmonyOS 远程桌面客户端（VNC / RDP）')
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+
+          Divider().color($r('app.color.chip_background'))
+
+          Column({ space: 8 }) {
+            this.aboutInfoRow('开发者', '天关开源项目')
+            this.aboutInfoRow('联系方式', 'support@alfadb.cn')
+            this.aboutInfoRow('应用包名', 'cn.alfadb.tianguan')
+            this.aboutInfoRow('开源许可', 'GPL-3.0-or-later')
+            this.aboutInfoRow('源代码', 'https://github.com/alfadb/tianguan')
+          }
+          .width('100%')
+
+          Text('天关是独立社区项目，不收集、不上传任何用户数据。远程桌面连接直接连接您指定的服务器，不经过任何中转。')
+            .fontSize(12)
+            .lineHeight(18)
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+
+          Row({ space: 8 }) {
+            Text('隐私政策')
+              .fontSize(14)
+              .fontColor($r('app.color.brand'))
+              .layoutWeight(1)
+            Text('查看全文 ›')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .width('100%')
+          .padding(12)
+          .borderRadius(10)
+          .backgroundColor($r('app.color.chip_background'))
+          .onClick(() => { this.openPolicy(); })
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .align(Alignment.Top)
+      .scrollBar(BarState.Auto)
+
+      Row({ space: 12 }) {
+        Button('隐私政策')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor($r('app.color.chip_background'))
+          .fontColor($r('app.color.brand'))
+          .onClick(() => { this.openPolicy(); })
+        Button('关闭')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor($r('app.color.brand'))
+          .fontColor(Color.White)
+          .onClick(() => { this.aboutVisible = false; })
+      }
+      .width('100%')
+    }
+    .width(this.isNarrow() ? '92%' : 520)
+    .height('78%')
+    .padding(20)
+    .borderRadius(16)
+    .backgroundColor($r('app.color.card_background'))
+  }
+
+  @Builder
+  private policyOverlay() {
+    Column({ space: 12 }) {
+      Row() {
+        Text('隐私政策')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+        Text('✕')
+          .fontSize(18)
+          .fontColor($r('app.color.text_secondary'))
+          .width(32)
+          .height(32)
+          .textAlign(TextAlign.Center)
+          .borderRadius(8)
+          .onClick(() => { this.policyVisible = false; })
+      }
+      .width('100%')
+
+      if (this.policyLoading) {
+        Column({ space: 10 }) {
+          LoadingProgress()
+            .width(32)
+            .height(32)
+            .color($r('app.color.brand'))
+          Text('正在读取隐私政策…')
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .justifyContent(FlexAlign.Center)
+      } else {
+        Scroll() {
+          Text(this.policyText.length > 0 ? this.policyText : '隐私政策内容暂不可用。')
+            .fontSize(13)
+            .lineHeight(20)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .align(Alignment.Top)
+        .scrollBar(BarState.Auto)
+      }
+
+      Button('关闭')
+        .fontSize(14)
+        .height(40)
+        .width('100%')
+        .borderRadius(12)
+        .backgroundColor($r('app.color.brand'))
+        .fontColor(Color.White)
+        .onClick(() => { this.policyVisible = false; })
+    }
+    .width(this.isNarrow() ? '94%' : 640)
+    .height('88%')
+    .padding(20)
+    .borderRadius(16)
+    .backgroundColor($r('app.color.card_background'))
+  }
+
   build() {
     Stack() {
       Column() {
@@ -1503,6 +1885,7 @@ struct Index {
               Text('天关').fontSize(20).fontWeight(FontWeight.Bold)
                 .fontColor($r('app.color.text_primary'))
                 .layoutWeight(1)
+              this.aboutEntryButton()
               Button('新建连接')
                 .fontSize(14)
                 .height(40)
@@ -1524,6 +1907,7 @@ struct Index {
           Row({ space: 12 }) {
             Text('天关').fontSize(20).fontWeight(FontWeight.Bold)
               .fontColor($r('app.color.text_primary'))
+            this.aboutEntryButton()
             Row({ space: 8 }) {
               TextInput({ text: this.searchText, placeholder: '搜索名称或 host:port' })
                 .height(40)
@@ -1713,6 +2097,34 @@ struct Index {
           .backgroundColor('rgba(0,0,0,0.45)')
           .onClick(() => { this.cancelPassword(); })
         this.passwordOverlay()
+      }
+
+      // Privacy overlays render last: consent (bottom), about, policy (top).
+      // While the flag is still loading the consent overlay also covers the
+      // manager, so nothing is usable before the dialog has been shown.
+      if (!this.privacyReady || !this.privacyAccepted) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.55)')
+          .onClick(() => {})
+        this.consentOverlay()
+      }
+      if (this.aboutVisible) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.45)')
+          .onClick(() => { this.aboutVisible = false; })
+        this.aboutOverlay()
+      }
+      if (this.policyVisible) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.45)')
+          .onClick(() => { this.policyVisible = false; })
+        this.policyOverlay()
       }
     }
     .width('100%')
