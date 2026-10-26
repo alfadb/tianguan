@@ -1,8 +1,8 @@
-# 天关：原生内核诊断 HAP
+# 天关：HarmonyOS 远程桌面客户端（VNC / RDP）
 
-这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `0.0.1` / code `1`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核诊断库；当前界面提供连接管理与多会话远程桌面（VNC / RDP）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 已于 2026-10-26 随 ACL 审批恢复声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
+这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `1.0.0` / code `100`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核；当前界面提供连接管理与多会话远程桌面（VNC / RDP）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 已于 2026-10-26 随 ACL 审批恢复声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
 
-本轮已把测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）纳入调试范围：`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['2in1', 'phone']`。本轮加入网络测试后重建的 unsigned HAP 内 `module.json` 与 `pack.info` 均同时含 `2in1` 与 `phone`，`requestPermissions` 仅含 `ohos.permission.INTERNET`；此前的纯诊断包没有权限声明。
+本轮已把测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）纳入调试范围：`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['2in1', 'phone']`。当前 unsigned HAP 内 `module.json` 与 `pack.info` 均同时含 `2in1` 与 `phone`，`requestPermissions` 为 `INTERNET`、`PREPARE_APP_TERMINATE` 与 `READ_PASTEBOARD`。
 
 ## 真机验证结果（2026-10-20）
 
@@ -11,13 +11,13 @@
 - **MateBook Fold（SLM-W32，API 26）**：安装成功（`install bundle successfully`），`aa start` 成功，进程存在；从应用私有目录取回 `diag-result.txt`，三项全部 PASS（RA2_256 工厂、内存 RFB 3.8 Raw 2×1 像素、Thread 协作退出）。证据：`.work/device-runs/pc-diag/diag-result.txt`。
 - **手机 PLA-AL10（API 26）**：安装成功；解锁后 `aa start` 成功，进程存在；取回的 `diag-result.txt` 三项同样全部 PASS。证据：`.work/device-runs/phone-diag/diag-result.txt`。
 
-启动页面自动运行一次 `import diag from 'libtianguan_diag.so'; diag.runDiagnostics(): Promise<string>`，按钮可以复跑且执行期间禁用。逐项 PASS/FAIL 文本完全来自真实 native 实现，壳不补造成功结果。native 应覆盖 RA2 对象工厂、内存 Raw 像素和 Thread 协作退出。异常显示为错误。版本、时间和结果/错误写入本应用 `filesDir/diag-result.txt`，同时使用 `TianguanDiag` 标签输出日志；保存失败也会在界面与日志显示。没有用户 Documents 或全局文件写入。
+该轮启动页面曾自动运行一次 `import diag from 'libtianguan_diag.so'; diag.runDiagnostics(): Promise<string>`，按钮可以复跑且执行期间禁用。当前版本启动时不再自动运行诊断，诊断与连接均由用户触发。逐项 PASS/FAIL 文本完全来自真实 native 实现，壳不补造成功结果。native 应覆盖 RA2 对象工厂、内存 Raw 像素和 Thread 协作退出。异常显示为错误。版本、时间和结果/错误写入本应用 `filesDir/diag-result.txt`，同时使用 `TianguanDiag` 标签输出日志；保存失败也会在界面与日志显示。没有用户 Documents 或全局文件写入。
 
 ## 受控网络测试模式（显式测试用）
 
 连接界面已有实时会话，画面渲染与键鼠转发见下文「输入与显示（2026-10-21）」；下面这一段描述的是显式测试用的一次性网络测试模式，它只验证 TCP 连接、认证、首帧解码与键鼠事件已发送，不渲染画面、不验证服务端收到输入。服务端身份采用显式信任：首次连接只展示指纹、不认证；用户确认后写入本机信任库，之后仅当指纹完全一致才继续，不一致直接拒绝。
 
-- 启动时只自动执行内存诊断并写 `diag-result.txt`，不再自动发起网络连接；「连接」按钮由用户在界面手动触发，连接期间禁用。
+- 启动时不会自动发起网络连接或运行诊断；「连接」按钮由用户在界面手动触发，连接期间禁用。
 - 网络测试读取 `filesDir/vnc-test.json`，格式 `{"host":"<server-ip>","port":5901}`，可选 `"security":"RA2_256,RA2"` 指定协商列表（缺省即 `RA2_256,RA2`；显式支持 `RA2ne_256`、`RA2ne`、`VncAuth` 仅用于互通测试，明文类型会被结果如实标注），连接界面还会在已信任该 `host:port` 时自动加入 `"expectedFingerprint"`。文件不存在时返回一行 `SKIP network test: no vnc-test.json`，不算失败；内容无效则报告 FAIL。
 - 读取 `filesDir/vnc-test.pass`：单行密码，允许末尾 LF 或 CRLF，内容 1..512 字节；缺失返回 `SKIP network test: no vnc-test.pass`。空文件、内部换行或 NUL 字节报告 FAIL。连接界面会把输入的密码写入这个应用沙箱内的临时文件供 native 读取，连接结束（成功或失败）后由 ArkTS 删除；密码不打印、不写日志、不写结果文件，也不进入信任库。native 只在内存中使用密码，认证成功或对象析构时擦除。
 - native 使用真实 TigerVNC `TcpSocket` 与 `rfb::CConnection` 子类，安全类型由配置决定（缺省 `RA2_256,RA2`），`setShared(true)`，`setPreferredEncoding(0)`。`getUserPasswd` 在测试模式下接受服务端给出的回调形态（`user` 槽位可空、`secure` 可假，均如实记入结果），密码缺失或为空时抛异常；正式版本必须改为按策略拒绝明文与自动接受。
@@ -124,7 +124,7 @@ PASS input observed: 261108 pixels changed, bbox (107,0)-(1847,864)
 
 ### 指纹确认与连接界面（2026-10-20）
 
-连接界面（`Index.ets`）提供服务器地址、端口、密码与「连接」按钮；地址默认 `192.168.50.62`，端口默认 `5901`。密码输入框使用 `InputType.Password`，不回显；点「连接」时密码只写入应用沙箱的临时文件 `filesDir/vnc-test.pass` 供 native 读取，连接结束（成功或失败）后由 ArkTS 删除，不写入信任库、结果文件或日志。启动时只自动运行内存诊断，不再自动发起网络连接。
+连接界面（`Index.ets`）提供服务器地址、端口、密码与「连接」按钮；地址默认 `192.168.50.62`，端口默认 `5901`。密码输入框使用 `InputType.Password`，不回显；点「连接」时密码只写入应用沙箱的临时文件 `filesDir/vnc-test.pass` 供 native 读取，连接结束（成功或失败）后由 ArkTS 删除，不写入信任库、结果文件或日志。启动时不会自动运行诊断或发起网络连接。
 
 信任库为 `filesDir/vnc-pins.json`，简单 JSON 对象，键为 `host:port`，值为服务端指纹：
 
@@ -263,7 +263,7 @@ bash scripts/smoke-device.sh <serial> --name <连接名>
 - debug profile `.p7b`：bundle 必须为 `cn.alfadb.tianguan`，并包含已登记的 MateBookFold 调试设备；不能默认使用 NetBird profile。
 - 与该 profile 匹配的签名证书及私钥/keystore 的本机路径。密码不要写入聊天、源码或文档。
 
-用户已确认本包 debug profile 尚未创建。后续需在 AGC / DevEco 生成本包的 debug profile，并提供匹配证书与私钥的本机路径。可使用同一个开发者证书另发本包 profile，但本轮尚未验证既有证书可复用。字段要求见已核对的[官方 profile 格式文档](https://raw.githubusercontent.com/openharmony/docs/master/zh-cn/application-dev/security/app-provision-structure.md)（`bundle-info.bundle-name`、`debug-info.device-ids`）。本轮未申请签名或安装，也未读取或验证任何 profile；材料待准备不表示用户拒绝或权限不足。
+用户已确认当时本包 debug profile 尚未创建；该调试 Profile 后续已于 2026-10-20 创建并完成签名安装（见上文真机验证结果）。新环境发版时需在 AGC / DevEco 生成本包的 debug profile，并提供匹配证书与私钥的本机路径。可使用同一个开发者证书另发本包 profile，但既有证书是否可复用取决于 AGC 的设备与 profile 限制。字段要求见已核对的[官方 profile 格式文档](https://raw.githubusercontent.com/openharmony/docs/master/zh-cn/application-dev/security/app-provision-structure.md)（`bundle-info.bundle-name`、`debug-info.device-ids`）。
 
 获授权并准备匹配的调试签名后，通过官方 HAP 安装/`aa start` 路径启动。以下命令仅在应用已调试签名、安装并启动，沙箱已挂载且诊断文件保存成功后有效；`<实际设备标识>` 必须替换为目标设备的真实标识：
 
