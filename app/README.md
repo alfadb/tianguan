@@ -242,7 +242,15 @@ bash scripts/test.sh --arkts    # 只跑 ArkTS 连接逻辑单测
 
 每个阶段打印 `[PASS]/[FAIL] <name>`，结束打印汇总；任一阶段失败脚本以非零状态退出。`ConnectionStore.ets` 只保留文件/密钥库 I/O，纯函数从 `ConnectionCodec.ets` 导入并按原签名再导出，`Index.ets` / `Remote.ets` 的 import 与连接数据格式不变。
 
-未覆盖：真机冒烟（签名安装、真实 VNC/RDP 连接、手势与输入回传）仍按本文其它章节在设备上人工执行；RDP 原生后端（FreeRDP、证书校验）没有 host 单测；`ConnectionStore.ets` 的文件读写与系统密钥库路径仍需真机验证。
+真机冒烟（需要设备在线且已解锁、已装签名包、已保存目标连接凭据；脚本会连接并断开真实会话）：
+
+```sh
+bash scripts/smoke-device.sh <serial> --name <连接名>
+```
+
+可选 `--hap <签名包路径>` 先安装（只 `hdc install -r`，不卸载）、`--timeout <秒>` 调整首帧等待上限、`--keep` 保留设备 `/data/local/tmp` 临时文件；每步 dump、截图与日志写入 `.work/smoke/<timestamp>/`。脚本不修改 `connections.json`、不读取密钥库、不打印凭据。
+
+未覆盖：真机上的手势与输入回传仍按本文其它章节在设备上人工执行；签名安装与真实连接/断开可用上面的 `scripts/smoke-device.sh` 冒烟；RDP 原生后端（FreeRDP、证书校验）没有 host 单测；`ConnectionStore.ets` 的文件读写与系统密钥库路径仍需真机验证。
 
 ## 历史验证记录（2026-10-16，纯诊断轮次）
 
