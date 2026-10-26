@@ -2047,7 +2047,9 @@ struct Index {
               }
               .scrollBar(BarState.Auto)
               .layoutWeight(1)
-              .align(Alignment.Start)
+              // Top-align the list content: Alignment.Start is left-center and
+              // would vertically center a short list inside the viewport.
+              .align(Alignment.TopStart)
             }
           }
           .layoutWeight(1)
