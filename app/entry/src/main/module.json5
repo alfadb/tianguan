@@ -12,17 +12,11 @@
       // there; vetoing once lets the app disconnect all sessions and remove the
       // tray icon before terminateSelf(). normal / system_grant (install-time).
       { name: 'ohos.permission.PREPARE_APP_TERMINATE' },
-      // ohos.permission.READ_PASTEBOARD is intentionally NOT declared here for
-      // now: it is a system_basic / user_grant restricted permission, and a HAP
-      // that declares it while the signing profile's ACL does not allow it is
-      // rejected at INSTALL time (9568289). The ACL is still empty, so the
-      // declaration only made builds uninstallable; the local -> remote
-      // clipboard read is unavailable anyway. Restore the block below together
-      // with the ACL (see README, 自动剪贴板):
-      //
-      //   { name: 'ohos.permission.READ_PASTEBOARD',
-      //     reason: '$string:module_desc',
-      //     usedScene: { abilities: ['EntryAbility','RemoteAbility'], when: 'inuse' } }
+      // system_basic / user_grant restricted permission; allowed by the ACL in
+      // the TianGuanDebugDevicesACLDebug signing profile.
+      { name: 'ohos.permission.READ_PASTEBOARD',
+        reason: '$string:module_desc',
+        usedScene: { abilities: ['EntryAbility','RemoteAbility'], when: 'inuse' } }
     ],
     deliveryWithInstall: true,
     installationFree: false,
