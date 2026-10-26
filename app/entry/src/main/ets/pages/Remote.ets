@@ -103,16 +103,32 @@ const VIEW_SYNC_GUARD_MS: number = 600;
 // Used until the renderer reports its own maxZoom.
 const MAX_VIEW_ZOOM_FALLBACK: number = 4;
 // Touch path only: a single finger does not press the remote button on
-// TouchType.Down. A second finger usually lands within this window and turns
-// the touch into a two-finger view gesture; pressing on Down and releasing
-// when the pinch starts was one complete click on the remote (the reported
-// "pinch clicks the remote desktop" bug). A quick tap (Up before the window
-// expires) still clicks: press + release are sent together on Up.
-const TOUCH_PRESS_DELAY_MS: number = 70;
+// TouchType.Down. The press is deferred until the touch's intent is known:
+//   - Move past TAP_SLOP_VP   -> left-button drag (press, then the moves)
+//   - Up while still pending  -> quick tap (press + release together)
+//   - hold still for LONG_PRESS_MS -> right click, the phone's only way to
+//     open a remote context menu and paste without a physical keyboard
+// A second finger cancels the pending press for the whole gesture (pressing on
+// Down and releasing when the pinch started was one complete click on the
+// remote: the reported "pinch clicks the remote desktop" bug).
+const LONG_PRESS_MS: number = 550;
+// Finger travel (vp) that turns a pending tap into a left-button drag. Below
+// it the touch is still a tap or a long press; the long-press timer re-checks
+// it when it fires, so a drag can never turn into a right click.
+const TAP_SLOP_VP: number = 3;
 // Three or more fingers belong to the system (screenshot, split screen, ...):
 // from a third finger until every finger is up this page neither transforms
 // the view nor sends any remote pointer event.
 const MIN_BLOCKED_FINGERS: number = 3;
+// PC turns one physical mouse action into a real MouseEvent AND a synthetic
+// TouchEvent on the same component; handling both forwarded the click twice.
+// Only that one touch is the mouse's duplicate, so it is dropped when it
+// arrives within this window of the last real MouseEvent and starts no further
+// than MOUSE_TOUCH_DEDUPE_VP (vp) from the mouse point. A real finger on a
+// touchscreen is neither that close nor that close in time to a mouse action,
+// and two or more fingers never have a mouse counterpart at all.
+const MOUSE_TOUCH_DEDUPE_MS: number = 150;
+const MOUSE_TOUCH_DEDUPE_VP: number = 10;
 
 interface RemoteRouterParams {
   sessionId?: string;
@@ -240,9 +256,16 @@ struct Remote {
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
   private viewPointerY: number = -1;
-  // True once a real MouseEvent arrived: the mouse path then owns input and the
-  // synthetic touch events (one per click on PC) are ignored.
+  // True once a real MouseEvent arrived (diagnostics only: the touch path is no
+  // longer disabled by it, single-finger touches are de-duplicated against the
+  // mouse instead, see isMouseDuplicateTouch()).
   private hasMouse: boolean = false;
+  // Last real MouseEvent, used to recognise the synthetic TouchEvent PC derives
+  // from the same mouse action. Time in ms (0 = no mouse event yet) and the
+  // event point in vp, the same coordinate space onTouch reports.
+  private lastMouseEventMs: number = 0;
+  private lastMouseX: number = -1;
+  private lastMouseY: number = -1;
   // --- Rendering timings -------------------------------------------------
   // Rolling accumulators (microseconds / counts). A summary is logged every
   // 2 s; nothing is allocated per frame and no timing call changes behaviour.
@@ -360,17 +383,27 @@ struct Remote {
   // True while two fingers are down: single-finger remote pointer input is
   // frozen (and any held button released) until a fresh one-finger touch.
   private multiTouchActive: boolean = false;
-  // --- Touch press delay / three-finger block ------------------------------
+  // --- Touch press / long press / three-finger block -----------------------
   // Identifier of every finger currently down, maintained from changedTouches
   // (Down adds, Up removes, Cancel clears) and healed from touches on
   // Down/Move. event.touches can be empty on Up/Cancel, so the finger count
   // that gates the deferred press and the three-finger block comes from here.
   private touchFingerIds: Set<number> = new Set<number>();
-  // Deferred single-finger press: armed on Down, fired after
-  // TOUCH_PRESS_DELAY_MS if exactly one finger is still down, and cancelled for
-  // the whole gesture as soon as a second finger lands.
-  private touchPressTimer: number = -1;
-  private touchPressPending: boolean = false;
+  // Deferred single-finger press: armed on Down and resolved by the first Move
+  // past TAP_SLOP_VP (press now, drag), by Up (tap: press + release) or by the
+  // long-press timer (right click). A second finger cancels it.
+  private pressPending: boolean = false;
+  // True once the deferred left press went out; the matching release is sent
+  // on Up.
+  private pressSent: boolean = false;
+  private longPressTimer: number = -1;
+  // True once the timer fired and the right click went out: no pointer event
+  // is sent any more until the finger lifts, so a long press never adds a
+  // stray left click on release.
+  private longPressFired: boolean = false;
+  // Down point in vp; TAP_SLOP_VP is measured from here.
+  private touchDownX: number = -1;
+  private touchDownY: number = -1;
   // True from the third finger until every finger is up: pinch/two-finger pan
   // callbacks return immediately (the transform is frozen where it was) and no
   // remote pointer event is sent.
@@ -467,7 +500,8 @@ struct Remote {
     // timers would otherwise fire against a detached renderer.
     this.cancelViewSendTimer();
     this.cancelGeometryRefresh();
-    this.cancelTouchPress();
+    this.cancelLongPress('teardown');
+    this.resetTouchPressState();
     this.touchFingerIds.clear();
     this.multiTouchBlocked = false;
     this.multiTouchActive = false;
@@ -833,7 +867,8 @@ struct Remote {
 
   private releaseAllInputs(reason: string): void {
     // A touch that has not pressed yet must not press after the release.
-    this.cancelTouchPress();
+    this.cancelLongPress('release-inputs');
+    this.resetTouchPressState();
     this.touchFingerIds.clear();
     this.multiTouchBlocked = false;
     this.multiTouchActive = false;
@@ -1857,45 +1892,177 @@ struct Remote {
     return this.touchFingerIds.size;
   }
 
-  /** Drops the deferred single-finger press without pressing anything. */
-  private cancelTouchPress(): void {
-    if (this.touchPressTimer >= 0) {
-      clearTimeout(this.touchPressTimer);
-      this.touchPressTimer = -1;
+  private static touchTypeName(type: TouchType): string {
+    if (type === TouchType.Down) {
+      return 'down';
     }
-    if (this.touchPressPending) {
-      hilog.debug(DOMAIN, TAG,
-        '触摸按下延迟取消 press 未发送 fingers=%{public}d blocked=%{public}s',
-        this.touchFingerIds.size, String(this.multiTouchBlocked));
+    if (type === TouchType.Up) {
+      return 'up';
     }
-    this.touchPressPending = false;
+    if (type === TouchType.Move) {
+      return 'move';
+    }
+    return 'cancel';
   }
 
   /**
-   * Arms the delayed press for the touch path. If exactly one finger is still
-   * down when the window expires, the press (mask 1) is sent then and the
-   * normal move/release logic takes over; a second finger, a mouse or a
-   * three-finger block cancels it for the rest of the gesture.
+   * True when this TouchEvent is the synthetic touch PC derives from the last
+   * real mouse action (the mouse path already forwarded that action). The
+   * caller must have updated the finger count first: only a one-finger sequence
+   * can be such a duplicate, two or more fingers never have a mouse
+   * counterpart, and the three-finger block has to be entered from the finger
+   * count on every device.
    */
-  private armTouchPress(): void {
-    this.cancelTouchPress();
-    this.touchPressPending = true;
-    this.touchPressTimer = setTimeout((): void => {
-      this.touchPressTimer = -1;
-      if (!this.touchPressPending) {
+  private isMouseDuplicateTouch(event: TouchEvent): boolean {
+    if (this.lastMouseEventMs <= 0 || this.lastMouseX < 0 || this.lastMouseY < 0) {
+      return false;
+    }
+    const elapsed = Date.now() - this.lastMouseEventMs;
+    if (elapsed >= MOUSE_TOUCH_DEDUPE_MS) {
+      return false;
+    }
+    let x = this.lastTouchX;
+    let y = this.lastTouchY;
+    if (event.touches.length > 0) {
+      x = event.touches[0].x;
+      y = event.touches[0].y;
+    } else if (event.changedTouches.length > 0) {
+      x = event.changedTouches[0].x;
+      y = event.changedTouches[0].y;
+    }
+    if (x < 0 || y < 0) {
+      return false;
+    }
+    const dx = x - this.lastMouseX;
+    const dy = y - this.lastMouseY;
+    if (dx * dx + dy * dy >= MOUSE_TOUCH_DEDUPE_VP * MOUSE_TOUCH_DEDUPE_VP) {
+      return false;
+    }
+    hilog.debug(DOMAIN, TAG,
+      '丢弃与鼠标重复的触摸 type=%{public}s x=%{public}d y=%{public}d mouse=%{public}d,%{public}d dtMs=%{public}d fingers=%{public}d',
+      Remote.touchTypeName(event.type), Math.round(x), Math.round(y),
+      Math.round(this.lastMouseX), Math.round(this.lastMouseY), elapsed,
+      this.touchFingerIds.size);
+    return true;
+  }
+
+  /**
+   * Drops the pending single-finger press and its long-press timer. Logged
+   * when a press was still waiting, so the debug trace says why a long press
+   * did not become a right click.
+   */
+  private cancelLongPress(reason: string): void {
+    if (this.longPressTimer >= 0) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = -1;
+    }
+    if (this.pressPending) {
+      hilog.debug(DOMAIN, TAG,
+        '长按取消 reason=%{public}s fingers=%{public}d blocked=%{public}s',
+        reason, this.touchFingerIds.size, String(this.multiTouchBlocked));
+    }
+    this.pressPending = false;
+  }
+
+  /** Forgets every piece of single-finger press state, sending nothing. */
+  private resetTouchPressState(): void {
+    if (this.longPressTimer >= 0) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = -1;
+    }
+    this.pressPending = false;
+    this.pressSent = false;
+    this.longPressFired = false;
+    this.touchDownX = -1;
+    this.touchDownY = -1;
+  }
+
+  /** True when the finger travelled more than TAP_SLOP_VP from its Down point. */
+  private exceedsTapSlop(): boolean {
+    if (this.touchDownX < 0 || this.touchDownY < 0) {
+      return false;
+    }
+    const dx = this.lastTouchX - this.touchDownX;
+    const dy = this.lastTouchY - this.touchDownY;
+    return dx * dx + dy * dy > TAP_SLOP_VP * TAP_SLOP_VP;
+  }
+
+  /**
+   * The touch is a drag, not a tap or a long press: send the deferred left
+   * press now. pointerDown() sends move + press, so the drag starts at the
+   * current point with the left button already down.
+   */
+  private sendDeferredPress(): void {
+    if (!this.pressPending) {
+      return;
+    }
+    this.pressPending = false;
+    if (this.longPressTimer >= 0) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = -1;
+    }
+    hilog.debug(DOMAIN, TAG,
+      '长按取消 reason=move 转为左键拖拽 x=%{public}d y=%{public}d',
+      this.lastTouchX, this.lastTouchY);
+    this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
+    this.pressSent = this.pressedMask !== 0;
+  }
+
+  /**
+   * Sends a right click: move to the point, press the right button, release.
+   * The mask comes from Remote.buttonMask so RFB and RDP receive exactly the
+   * same right-button bit as a mouse right click. Nothing else is sent for
+   * this touch until the finger lifts.
+   */
+  private sendLongPressRightClick(): void {
+    const rightMask = Remote.buttonMask(MouseButton.Right);
+    this.longPressFired = true;
+    this.pressPending = false;
+    hilog.debug(DOMAIN, TAG,
+      '长按触发右键单击 mask=%{public}d x=%{public}d y=%{public}d',
+      rightMask, this.lastTouchX, this.lastTouchY);
+    this.sendPointerReport(this.lastTouchX, this.lastTouchY, 0);
+    this.sendPointerReport(this.lastTouchX, this.lastTouchY, rightMask);
+    this.sendPointerReport(this.lastTouchX, this.lastTouchY, 0);
+  }
+
+  /**
+   * Arms the single-finger long-press timer on Down. If exactly one finger is
+   * still down, no second finger joined and the finger stayed inside the tap
+   * slop when it expires, the touch becomes a right click; every other outcome
+   * is resolved by the move/Up/cancel paths.
+   */
+  private armLongPress(): void {
+    this.resetTouchPressState();
+    this.pressPending = true;
+    this.touchDownX = this.lastTouchX;
+    this.touchDownY = this.lastTouchY;
+    hilog.debug(DOMAIN, TAG, '触摸长按计时开始 x=%{public}d y=%{public}d',
+      this.lastTouchX, this.lastTouchY);
+    this.longPressTimer = setTimeout((): void => {
+      this.longPressTimer = -1;
+      if (!this.pressPending) {
         return;
       }
-      this.touchPressPending = false;
-      if (this.disposed || this.hasMouse || this.multiTouchBlocked ||
+      // hasMouse is deliberately NOT a condition here: a real mouse event in
+      // the past (or hovering) must no longer disable the touch path, otherwise
+      // a touchscreen long press never becomes a right click on PC.
+      if (this.disposed || this.multiTouchBlocked ||
           this.touchFingerIds.size !== 1) {
-        hilog.debug(DOMAIN, TAG, '触摸按下延迟到期但未按下 fingers=%{public}d blocked=%{public}s',
+        this.pressPending = false;
+        hilog.debug(DOMAIN, TAG,
+          '长按到期未触发 fingers=%{public}d blocked=%{public}s',
           this.touchFingerIds.size, String(this.multiTouchBlocked));
         return;
       }
-      hilog.debug(DOMAIN, TAG, '触摸按下延迟到期，发送 press x=%{public}d y=%{public}d',
-        this.lastTouchX, this.lastTouchY);
-      this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
-    }, TOUCH_PRESS_DELAY_MS);
+      if (this.exceedsTapSlop()) {
+        // The timer can win the race against a Move that crossed the slop:
+        // a drag must not turn into a right click.
+        this.sendDeferredPress();
+        return;
+      }
+      this.sendLongPressRightClick();
+    }, LONG_PRESS_MS);
   }
 
   /**
@@ -1911,12 +2078,12 @@ struct Remote {
     }
     this.multiTouchBlocked = true;
     this.multiTouchActive = true;
-    this.cancelTouchPress();
+    this.cancelLongPress('three-fingers');
     // The only remote event that can still go out here is releasing a button
-    // the first finger already pressed. With the press delay that happens only
-    // when one finger was held for > TOUCH_PRESS_DELAY_MS before the others;
-    // leaving the button down would be worse.
+    // the first finger already pressed while dragging. Leaving the button down
+    // would be worse.
     this.abortSingleFingerInput();
+    this.resetTouchPressState();
     this.endGesture();
     hilog.info(DOMAIN, TAG,
       '三指及以上手势屏蔽 session=%{public}s fingers=%{public}d view=%{public}s',
@@ -1934,14 +2101,47 @@ struct Remote {
       this.sessionId, this.viewStateText());
   }
 
+  /**
+   * Path-independent three-finger enforcement for the gesture callbacks. The
+   * recognizers stay registered for two fingers and keep reporting while extra
+   * fingers are down, so a pinch/pan callback is the place where the finger
+   * count must be checked even when the touch path never ran (on PC a touch
+   * that looks like the mouse duplicate is dropped, although two or more
+   * fingers are never dropped). Returns true when this callback must return
+   * without touching zoom/pan or sending anything.
+   */
+  private blockGestureOnExtraFingers(event: GestureEvent | undefined): boolean {
+    if (!USE_GL_RENDER) {
+      return false;
+    }
+    if (this.multiTouchBlocked) {
+      return true;
+    }
+    let listed = 0;
+    if (event !== undefined && event.fingerList !== undefined) {
+      listed = event.fingerList.length;
+    }
+    // fingerList is the GestureEvent's own count; the touch ids are the
+    // fallback (and cover callbacks that carry no event).
+    const fingers = listed > 0 ? listed : this.touchFingerIds.size;
+    if (fingers < MIN_BLOCKED_FINGERS) {
+      return false;
+    }
+    hilog.debug(DOMAIN, TAG,
+      '三指及以上屏蔽 reason=gesture-callback fingers=%{public}d listed=%{public}d view=%{public}s',
+      fingers, listed, this.viewStateText());
+    this.enterMultiTouchBlock();
+    return true;
+  }
+
   private beginGesture(): void {
     if (!USE_GL_RENDER || this.disposed || this.sessionId.length === 0) {
       return;
     }
     // A pinch/pan recognizer has started: this touch can no longer become a
-    // single-finger click, so drop a press that is still inside the delay
-    // window and never press for the rest of the gesture.
-    this.cancelTouchPress();
+    // single-finger click or long press, so drop the pending press and never
+    // press for the rest of the gesture.
+    this.cancelLongPress('pinch');
     if (this.gestureActive) {
       return;
     }
@@ -1962,8 +2162,9 @@ struct Remote {
     this.gesturePanBaseY = 0;
     this.gestureAnchorValid = false;
     // The first of the two fingers may already have pressed a remote button:
-    // release it before the view starts moving.
+    // release it before the view starts moving. Any long-press state is over.
     this.abortSingleFingerInput();
+    this.resetTouchPressState();
     hilog.info(DOMAIN, TAG, '双指手势开始 session=%{public}s view=%{public}s',
       this.sessionId, this.viewStateText());
   }
@@ -2057,6 +2258,9 @@ struct Remote {
 
   private onPinchStart(event: GestureEvent): void {
     // Three or more fingers are the system's: no transform, no pointer event.
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (!USE_GL_RENDER || this.multiTouchBlocked) {
       return;
     }
@@ -2065,6 +2269,9 @@ struct Remote {
   }
 
   private onPinchUpdate(event: GestureEvent): void {
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (!USE_GL_RENDER || this.disposed || this.multiTouchBlocked) {
       return;
     }
@@ -2079,7 +2286,10 @@ struct Remote {
     this.applyGestureView();
   }
 
-  private onPinchEnd(): void {
+  private onPinchEnd(event: GestureEvent): void {
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (this.multiTouchBlocked) {
       return;
     }
@@ -2087,6 +2297,9 @@ struct Remote {
   }
 
   private onTwoFingerPanStart(event: GestureEvent): void {
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (!USE_GL_RENDER || this.multiTouchBlocked) {
       return;
     }
@@ -2101,6 +2314,9 @@ struct Remote {
   }
 
   private onTwoFingerPanUpdate(event: GestureEvent): void {
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (!USE_GL_RENDER || this.disposed || this.multiTouchBlocked) {
       return;
     }
@@ -2113,7 +2329,10 @@ struct Remote {
     this.applyGestureView();
   }
 
-  private onTwoFingerPanEnd(): void {
+  private onTwoFingerPanEnd(event: GestureEvent): void {
+    if (this.blockGestureOnExtraFingers(event)) {
+      return;
+    }
     if (this.multiTouchBlocked) {
       return;
     }
@@ -2665,15 +2884,17 @@ struct Remote {
             this.setHostCursorVisible(!isHover);
           })
           .onTouch((event: TouchEvent) => {
-            // On PC a mouse click also produces a synthetic TouchEvent. Once a
-            // real MouseEvent has been seen, the mouse path owns the input;
-            // handling both forwarded every click twice (single -> double).
-            if (this.hasMouse) {
-              return;
-            }
+            // On PC one physical mouse action also produces a synthetic
+            // TouchEvent. The mouse path keeps that action; only this single
+            // touch is dropped (isMouseDuplicateTouch) so handling both can no
+            // longer forward every click twice. Everything else runs on any
+            // device: the touch path is not disabled by a mouse having been
+            // seen (that is what made the PC touchscreen unable to click or
+            // long-press at all).
             // Track the fingers by identifier: event.touches may be empty on
-            // Up/Cancel, and the count gates the press delay and the
-            // three-finger block below.
+            // Up/Cancel, and the count gates the long press and the
+            // three-finger block below. It is updated before the de-duplication
+            // so three or more fingers always enter the block.
             const fingers = this.updateTouchFingers(event);
             if (USE_GL_RENDER) {
               if (fingers >= MIN_BLOCKED_FINGERS) {
@@ -2685,6 +2906,12 @@ struct Remote {
                 this.leaveMultiTouchBlock();
               }
             }
+            // A mouse never produces a second finger, so only a one-finger
+            // sequence can be its duplicate. The drop happens after the count
+            // above so the block still works on a device with a mouse.
+            if (fingers <= 1 && this.isMouseDuplicateTouch(event)) {
+              return;
+            }
             // Two fingers belong to the view gestures in GL mode: never forward
             // them as a remote pointer, and release a button the first finger
             // may already have pressed before the second one landed. The flag
@@ -2693,10 +2920,12 @@ struct Remote {
             if (USE_GL_RENDER &&
                 (fingers >= 2 || this.multiTouchActive || this.multiTouchBlocked)) {
               this.multiTouchActive = true;
-              // No press for a gesture: a second finger inside the press delay
-              // window cancels it, and a press already sent is released here.
-              this.cancelTouchPress();
+              // No press for a gesture: a second finger cancels the pending
+              // press and long-press timer, and a press already sent is
+              // released here.
+              this.cancelLongPress('multi-finger');
               this.abortSingleFingerInput();
+              this.resetTouchPressState();
               const freshSingleDown = !this.multiTouchBlocked &&
                 event.type === TouchType.Down && fingers === 1;
               if (!freshSingleDown) {
@@ -2718,33 +2947,64 @@ struct Remote {
             }
             if (event.type === TouchType.Down) {
               this.requestViewFocus();
-              // Do not press yet: the second finger of a pinch usually lands
-              // inside TOUCH_PRESS_DELAY_MS. The mask-0 move keeps the remote
-              // pointer (and its hover) where the press will happen.
+              // Do not press yet: this touch may still become a pinch, a tap
+              // or a long press. The mask-0 move keeps the remote pointer (and
+              // its hover) where the press will happen.
               this.sendPointerAt(this.lastTouchX, this.lastTouchY, 0);
-              this.armTouchPress();
+              this.armLongPress();
             } else if (event.type === TouchType.Move) {
+              if (this.longPressFired) {
+                // The right click already went out on the timer: send nothing
+                // at all until the finger lifts (the local cursor above still
+                // follows the finger).
+                return;
+              }
+              if (this.pressPending && this.exceedsTapSlop()) {
+                // The finger travelled: this is a drag, not a tap or a long
+                // press. Press the left button first so the move below drags
+                // with it held.
+                this.sendDeferredPress();
+              }
               this.sendPointerAt(this.lastTouchX, this.lastTouchY, this.pressedMask);
             } else if (event.type === TouchType.Up) {
-              if (this.touchPressPending) {
-                // Quick tap: the finger was lifted inside the delay window, so
-                // the press never went out. Send press + release now so the tap
-                // still clicks exactly once.
-                this.cancelTouchPress();
+              if (this.longPressFired) {
+                // The right click was already sent when the timer expired;
+                // this touch must not add a left click on release.
+                hilog.debug(DOMAIN, TAG, '长按右键抬手，不补发指针事件');
+              } else if (this.pressPending) {
+                // Quick tap: lifted before the long-press timer and never
+                // moved past the slop, so no press went out yet. Send press +
+                // release now so the tap still clicks exactly once.
+                this.cancelLongPress('tap');
                 this.pointerDown(this.lastTouchX, this.lastTouchY, 1);
+                this.pointerUp(this.lastTouchX, this.lastTouchY, true);
+              } else if (this.pressSent) {
+                this.pointerUp(this.lastTouchX, this.lastTouchY, true);
               }
-              this.pointerUp(this.lastTouchX, this.lastTouchY, true);
+              this.resetTouchPressState();
             } else if (event.type === TouchType.Cancel) {
-              // A cancelled touch must not turn into a click.
-              this.cancelTouchPress();
+              // A cancelled touch must not turn into a click or a right click.
+              this.cancelLongPress('cancel');
               this.pointerUp(this.lastTouchX, this.lastTouchY, true);
+              this.resetTouchPressState();
             }
           })
           .onMouse((event: MouseEvent) => {
-            this.hasMouse = true;
-            // A real mouse event means the mouse owns input from now on; any
-            // press still waiting for the touch delay must not fire.
-            this.cancelTouchPress();
+            if (!this.hasMouse) {
+              this.hasMouse = true;
+              hilog.debug(DOMAIN, TAG,
+                '首个真实鼠标事件 action=%{public}d x=%{public}d y=%{public}d：触摸路径不再整体禁用（只按时间/距离丢弃本次合成触摸）',
+                event.action, Math.round(event.x), Math.round(event.y));
+            }
+            // Remember where and when the mouse last acted: the synthetic touch
+            // derived from this action is recognised by these two, see
+            // isMouseDuplicateTouch().
+            this.lastMouseEventMs = Date.now();
+            this.lastMouseX = event.x;
+            this.lastMouseY = event.y;
+            // Any press or long-press still waiting for the touch must not fire
+            // once the mouse owns this action.
+            this.cancelLongPress('mouse');
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
             // The local cursor follows every pointer event; the poll only acts
@@ -2772,8 +3032,9 @@ struct Remote {
           //    the single-finger/mouse remote pointer events: onTouch/onMouse
           //    keep their existing paths.
           //  - three or more fingers are ignored: a recognizer may keep
-          //    reporting while extra fingers are down, so every handler returns
-          //    early while onTouch has multiTouchBlocked set.
+          //    reporting while extra fingers are down, so every handler checks
+          //    multiTouchBlocked AND the finger count itself (blockGestureOnExtraFingers),
+          //    which does not depend on the touch path having run.
           .parallelGesture(
             GestureGroup(GestureMode.Parallel,
               PanGesture({ fingers: 1, distance: 1 })
@@ -2783,13 +3044,13 @@ struct Remote {
               PinchGesture({ fingers: 2, distance: 1 })
                 .onActionStart((event: GestureEvent) => { this.onPinchStart(event); })
                 .onActionUpdate((event: GestureEvent) => { this.onPinchUpdate(event); })
-                .onActionEnd(() => { this.onPinchEnd(); })
-                .onActionCancel(() => { this.onPinchEnd(); }),
+                .onActionEnd((event: GestureEvent) => { this.onPinchEnd(event); })
+                .onActionCancel((event: GestureEvent) => { this.onPinchEnd(event); }),
               PanGesture({ fingers: 2, distance: 1 })
                 .onActionStart((event: GestureEvent) => { this.onTwoFingerPanStart(event); })
                 .onActionUpdate((event: GestureEvent) => { this.onTwoFingerPanUpdate(event); })
-                .onActionEnd(() => { this.onTwoFingerPanEnd(); })
-                .onActionCancel(() => { this.onTwoFingerPanEnd(); })
+                .onActionEnd((event: GestureEvent) => { this.onTwoFingerPanEnd(event); })
+                .onActionCancel((event: GestureEvent) => { this.onTwoFingerPanEnd(event); })
             )
           )
           // Secondary UI only: the Canvas stays mounted underneath while the
