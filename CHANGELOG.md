@@ -4,7 +4,7 @@
 
 ## [1.0.0] - 2026-10-26
 
-首个公开版本。HarmonyOS 手机 / 平板 / 智慧屏 / PC / 2in1 全量发布，API 26（HarmonyOS 7.0+）。
+首个公开版本。HarmonyOS 手机 / 平板 / PC / 2in1 发布，API 26（HarmonyOS 7.0+）。
 
 ### 新增
 

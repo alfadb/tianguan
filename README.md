@@ -1,8 +1,8 @@
 # 天关 / Tianguan（TG）
 
-面向 HarmonyOS 的 VNC + RDP 远程桌面客户端，覆盖手机 / 平板 / 智慧屏 / PC / 2in1，关注友好的界面与连接管理。当前版本 **1.0.0**（versionCode 100），变更见 [CHANGELOG.md](CHANGELOG.md)。
+面向 HarmonyOS 的 VNC + RDP 远程桌面客户端，覆盖手机 / 平板 / PC / 2in1，关注友好的界面与连接管理。当前版本 **1.0.0**（versionCode 100），变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-Tianguan (TG) is a community VNC and RDP client for HarmonyOS, available on phones, tablets, smart screens, PCs and 2-in-1 devices.
+Tianguan (TG) is a community VNC and RDP client for HarmonyOS, available on phones, tablets, PCs and 2-in-1 devices.
 
 ## 当前状态
 
@@ -28,7 +28,7 @@ OHOS 产物为 `.work/vnc-core-ohos-api26/vnc-core`：ELF `Machine: AArch64`，i
 
 ## 产品方向与技术内核
 
-- 平台：HarmonyOS 手机 / 平板 / 智慧屏 / PC / 2in1，API 26（HarmonyOS 7.0+）。
+- 平台：HarmonyOS 手机 / 平板 / PC / 2in1，API 26（HarmonyOS 7.0+）。
 - 体验：提供易用的连接管理、清晰的连接状态与友好的远程桌面界面。
 - VNC：已集成 TigerVNC 1.15.0 内核，支持 RA2、RA2_256 与 VncAuth；X509Vnc 的证书链校验尚未实现。
 - RDP：已集成 FreeRDP 3.9.0 内核，支持 NLA/TLS 连接、画面、键鼠、剪贴板与音频。

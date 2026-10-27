@@ -34,7 +34,7 @@ AppScope 资源在构建时会合入模块的同路径资源目录，模块清�
 
 ### 触发规则
 
-1. **尺寸检查只告警**：hvigor 对 `bundleType=app`、非免安装的 entry/feature 模块自动在 `resConfig.json` 里置 `iconCheck: true`（等价于命令行 `--icon-check`；本工程 `deviceTypes: ['2in1','phone']` 不是 default/phone/tablet 全集，命中该逻辑）。restool 会检查 `icon` 与 `startWindowIcon` 引用到的 PNG，分层图标的 `background`/`foreground` 也通过 `layered_image.json` 被计入 `icon`。检查阈值不是 512，而是按资源目录的屏幕密度/设备档位取「常规尺寸」；`base` 目录等价于 `sdpi-phone`，对应 `icon=41 px`、`startWindowIcon=144 px`。所以 1024 的 base 图层必然打印：
+1. **尺寸检查只告警**：hvigor 对 `bundleType=app`、非免安装的 entry/feature 模块自动在 `resConfig.json` 里置 `iconCheck: true`（等价于命令行 `--icon-check`；本工程 `deviceTypes: ['phone','tablet','2in1']` 不是 default/phone/tablet 全集，命中该逻辑）。restool 会检查 `icon` 与 `startWindowIcon` 引用到的 PNG，分层图标的 `background`/`foreground` 也通过 `layered_image.json` 被计入 `icon`。检查阈值不是 512，而是按资源目录的屏幕密度/设备档位取「常规尺寸」；`base` 目录等价于 `sdpi-phone`，对应 `icon=41 px`、`startWindowIcon=144 px`。所以 1024 的 base 图层必然打印：
    `Warning: The width or height of the png file referenced by the icon exceeds the limit (41 pixels)`。
    该检查只输出警告，不返回错误；hvigor 默认日志级别（非 DEBUG）不会显示这条警告。
 2. **缩放到 512 是硬编码上限**：独立于上面的检查，restool 对所有被 `icon` 引用的图片（含分层图标的两个图层）调用图像转码器，目标尺寸硬编码为 `{512, 512}`；大于 512 的缩到 512，≤512 的保持原尺寸。`layered_image.json` 原样复制，所以 HAP 里仍是分层结构。

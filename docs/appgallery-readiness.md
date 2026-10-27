@@ -5,7 +5,7 @@
 - 审计方式：只读阅读仓库配置/资源/构建产物 + 查阅华为官方文档（2026-10 更新版本）。**审计当时未修改任何代码或配置，未提交 git。**
 - 图标补齐记录（2026-10-26）：分层图标与 AGC 平面素材已入库，`app.json5`/`module.json5` 已改为 `$media:layered_image`；包内实际图层为 **512×512**（restool 固定上限缩放），推导与实测见 3.3 与 `docs/store/README.md`。
 - 目标：HarmonyOS 应用（.app / HAP），设备 phone + 2in1，发布中国大陆，免费应用。
-- 发布决策（2026-10-26 更新）：用户已决定**全量发布**（手机 / 平板 / 智慧屏 / PC / 2in1），版本 `1.0.0 / 100`，API 保持 26；`READ_PASTEBOARD` 在手机侧为已知风险，若审核被拒再拆包或改用系统粘贴控件。本文其余「现状」是审计快照，最新落地见 [release-pipeline.md](release-pipeline.md)。
+- 发布决策（2026-10-27 更新）：用户已决定**支持设备为手机 + 平板 + PC/2in1，不勾智慧屏**（TV 无兼容分发、需遥控器焦点导航与专用素材，后续再加），版本 `1.0.0 / 100`，API 保持 26；`READ_PASTEBOARD` 在手机侧为已知风险，若审核被拒再拆包或改用系统粘贴控件。本文其余「现状」是审计快照，最新落地见 [release-pipeline.md](release-pipeline.md)。
 - 状态图例：✅ 满足 ｜ ❌ 缺失 ｜ ⚠️ 需确认/需实测 ｜ — 不适用
 
 > 重要前提：本文的「官方依据」只覆盖能查到的华为官方页面；查不到的项会明确写「未找到官方依据，需向华为确认」，不替华为下结论。所有「现状」均可在附录 A 的文件/行号或构建产物中核对。
@@ -76,7 +76,7 @@
 | 26 | 若采集个人信息：应用内二级菜单展示「已收集个人信息清单 / 第三方共享清单」 | [审核指南 7.25](https://developer.huawei.com/consumer/cn/doc/app/50104) | 未判定是否构成「收集」（见 4.6） | ⚠️ 需确认 |
 | 27 | 涉及受限权限：需在 AGC 填「应用隐私说明」——权限使用理由 + **使用场景视频**（.mp4/.mov，h.264，≤500MB） | [配置隐私说明](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/agc-help-release-app-privacy-desc-0000002313477969) | 未填；`module.json5:17-19` 只有 `reason`（复用 `module_desc`）与 `usedScene` | ❌ 缺失 |
 | 28 | 软件包声明的受限权限必须同时出现在发布 Profile 中，否则审核驳回；声明的权限若不在 Profile 内会安装失败（9568289） | [配置隐私说明](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/agc-help-release-app-privacy-desc-0000002313477969)；[申请发布Profile](https://developer.huawei.com/consumer/cn/doc/app/agc-help-add-releaseprofile-0000001914714796) | 调试 ACL 已批（`app/README.md:374`）；发布 Profile 未建 | ❌ 缺失 |
-| 29 | `READ_PASTEBOARD` 受限权限：PC/2in1 应用均可申请；手机仅限列出的特殊场景（银行卡号/口令/文档编辑/系统输入法/使用开源框架且无法用粘贴控件） | [受限开放权限](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/restricted-permissions#ohospermissionread_pasteboard) | 同一 HAP 对 phone + 2in1 都声明了该权限（`module.json5:8,17`） | ⚠️ 高风险（见 4.2） |
+| 29 | `READ_PASTEBOARD` 受限权限：PC/2in1 应用均可申请；手机仅限列出的特殊场景（银行卡号/口令/文档编辑/系统输入法/使用开源框架且无法用粘贴控件） | [受限开放权限](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/restricted-permissions#ohospermissionread_pasteboard) | 同一 HAP 对 phone + tablet + 2in1 都声明了该权限（`module.json5:8,17`） | ⚠️ 高风险（见 4.2） |
 | 30 | 权限最小化、按业务场景动态申请、拒绝后不得退出/循环弹窗 | [审核指南 7.17/7.19](https://developer.huawei.com/consumer/cn/doc/app/50104) | `INTERNET`/`PREPARE_APP_TERMINATE` 为 system_grant；`READ_PASTEBOARD` 在打开会话时申请一次（`pages/Remote.ets:474`），未授权则停用读取 | ✅ 满足 |
 | 31 | `PREPARE_APP_TERMINATE` 属开放权限（normal / system_grant，起始 API 10），无需 ACL | [开放权限（系统授权）](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/permissions-for-all) | 已声明（`module.json5:14`） | ✅ 满足 |
 | 32 | 隐私标签：应用详情页展示；不收集个人信息可填「否」 | [配置隐私标签](https://developer.huawei.com/consumer/cn/doc/doccenter-submission/agc-help-release-app-privacy-tag-0000002316420993) | 未填 | ❌ 缺失/待判定 |
@@ -306,9 +306,9 @@
   - 其他设备：仅限银行卡号、口令、文档编辑、系统输入法、使用开源框架且无法用粘贴控件等场景；
   - AGC 审核约 3 个工作日；上架时按使用场景复核，不符则驳回；
   - 支持设备含 Phone，但「可申请场景」不含远程桌面。
-- **天关风险**：同一 HAP 声明 phone+2in1（`module.json5:8,17`），若手机上架，审核员按手机场景判断 → **大概率不符合**；即使调试 ACL 已批，发布审核仍会按场景重审。
+- **天关风险**：同一 HAP 声明 phone+tablet+2in1（`module.json5:8,17`），若手机上架，审核员按手机场景判断 → **大概率不符合**；即使调试 ACL 已批，发布审核仍会按场景重审。
 - **缓解方案（用户已决定全量发布，按此排序）**：
-  1. **全量发布（已决定）**：单包声明 phone + 2in1，AGC 支持设备全选；`READ_PASTEBOARD` 手机侧是已知风险，被拒再拆包或改粘贴控件。发布后只能增加设备、不能删除，因此审核驳回后仍可在原包基础上调整。
+  1. **全量发布（已决定）**：单包声明 `phone` + `tablet` + `2in1`，AGC 支持设备勾选手机 / 平板 / PC/2in1（不勾智慧屏）；`READ_PASTEBOARD` 手机侧是已知风险，被拒再拆包或改粘贴控件。发布后只能增加设备、不能删除，因此审核驳回后仍可在原包基础上调整。
   2. **拆 HAP**：2in1 HAP 声明权限，手机 HAP 不声明（见 3.13），作为被拒后的第一退路。
   3. 手机上架但放弃自动剪贴板：移除手机侧读取，仅保留「远端→本机」写入（写入不需要该权限），本机→远端改为远端粘贴/手动输入。
   4. 坚持手机上架 + 自动剪贴板：提交详尽场景说明 + 使用场景视频，尝试以「使用开源框架（TigerVNC/FreeRDP），无法用粘贴控件实现该转发」为理由申请——**这是解释性尝试，未找到官方明确支持远程桌面场景的依据，不保证通过**。
@@ -373,14 +373,14 @@
 
 ## 5. 下一步建议
 
-**第 1 步已完成（2026-10-26）**：AGC 应用已创建，APP ID `691761958035659012`，包名固定 `cn.alfadb.tianguan`，支持设备全选，默认语言简体中文；首发版本定为 `1.0.0 / 100`，本地发布构建入口 `scripts/build-release.sh` 已落地（详见 [release-pipeline.md](release-pipeline.md)）。
+**第 1 步已完成（2026-10-26）**：AGC 应用已创建，APP ID `691761958035659012`，包名固定 `cn.alfadb.tianguan`，支持设备为手机 / 平板 / PC/2in1（不勾智慧屏），默认语言简体中文；首发版本定为 `1.0.0 / 100`，本地发布构建入口 `scripts/build-release.sh` 已落地（详见 [release-pipeline.md](release-pipeline.md)）。
 
 - **紧接着并行启动（长周期，越早越好）**：
   1. 发布 Profile 的 `READ_PASTEBOARD` 受限 ACL 申请（约 3 个工作日）；
   2. 软著登记（手机必选版权证书，数十个工作日）；
   3. APP 备案（先向接入商确认「无自有服务端的联网客户端」怎么备案）。
 - **已确定的产品决策**（影响 ACL、软著、HAP 拆分、compatibleSdkVersion）：
-  - 全量发布：手机 / 平板 / 智慧屏 / PC / 2in1；不做 2in1 裁剪。
+  - 支持设备：手机 / 平板 / PC/2in1，不勾智慧屏（TV 无兼容分发、需遥控器焦点导航与专用素材，后续再加）；不做 2in1 裁剪。
   - `compatibleSdkVersion` 保持 API 26。
   - `READ_PASTEBOARD` 手机侧为已知风险，若审核被拒再拆包或改用系统粘贴控件。
 

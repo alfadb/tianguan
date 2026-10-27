@@ -5,7 +5,7 @@
     srcEntry: './ets/Application/AbilityStage.ets',
     description: '$string:app_name',
     mainElement: 'EntryAbility',
-    deviceTypes: ['phone', 'tablet', '2in1', 'tv'],
+    deviceTypes: ['phone', 'tablet', '2in1'],
     requestPermissions: [
       { name: 'ohos.permission.INTERNET' },
       // onPrepareToTerminate(): the system tray's mandatory 退出 row arrives

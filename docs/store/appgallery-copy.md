@@ -80,7 +80,7 @@
 
 **标签（5–8 个）**：`远程桌面`、`VNC`、`RDP`、`远程办公`、`多会话`、`开源`、`服务器运维`、`HarmonyOS PC`
 
-**补充**：首发覆盖手机与 2in1 两种形态（`deviceTypes: ['2in1', 'phone']`），建议同时在「平板/PC 应用」专区申请推荐位；详情页首图用 `screenshots/pc-01-main.png`，手机详情页首图用 `screenshots/phone-01-main.png`。
+**补充**：首发覆盖手机 / 平板 / PC/2in1 三种形态（`deviceTypes: ['phone', 'tablet', '2in1']`，不含智慧屏），建议同时在「平板/PC 应用」专区申请推荐位；详情页首图用 `screenshots/pc-01-main.png`，手机详情页首图用 `screenshots/phone-01-main.png`。
 
 ---
 

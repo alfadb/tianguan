@@ -1,8 +1,8 @@
 # 天关：HarmonyOS 远程桌面客户端（VNC / RDP）
 
-这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `1.0.0` / code `100`，API 26，`2in1` 与 `phone` 双设备。它通过正式 HAP 加载原生内核；当前界面提供连接管理与多会话远程桌面（VNC / RDP）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 已于 2026-10-26 随 ACL 审批恢复声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
+这是独立 Stage ArkTS 应用，bundle `cn.alfadb.tianguan`，版本 `1.0.0` / code `100`，API 26，`phone`、`tablet` 与 `2in1` 三种设备。它通过正式 HAP 加载原生内核；当前界面提供连接管理与多会话远程桌面（VNC / RDP）。`module.json5` 当前声明普通权限 `ohos.permission.INTERNET`（网络）与 `ohos.permission.PREPARE_APP_TERMINATE`（托盘退出清理，system_grant），二者都不需要 ACL；受限权限 `ohos.permission.READ_PASTEBOARD` 已于 2026-10-26 随 ACL 审批恢复声明（见「自动剪贴板」）。不申请后台或 VPN 权限。
 
-本轮已把测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）纳入调试范围：`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['2in1', 'phone']`。当前 unsigned HAP 内 `module.json` 与 `pack.info` 均同时含 `2in1` 与 `phone`，`requestPermissions` 为 `INTERNET`、`PREPARE_APP_TERMINATE` 与 `READ_PASTEBOARD`。
+当前调试设备为测试手机 PLA-AL10（HarmonyOS 7.0.0.107 / API 26 / arm64）；`entry/src/main/module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['phone', 'tablet', '2in1']`（2026-10-27 调整，不含智慧屏）。当前 unsigned HAP 内 `module.json` 与 `pack.info` 均含 `phone`、`tablet`、`2in1`，`requestPermissions` 为 `INTERNET`、`PREPARE_APP_TERMINATE` 与 `READ_PASTEBOARD`。
 
 ## 真机验证结果（2026-10-20）
 

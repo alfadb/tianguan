@@ -12,7 +12,7 @@
 | ⚠️ | 材料已有但有已知缺陷，提交前必须处理 |
 | ⬜ | 需要账号持有人在本机/AGC 侧完成，仓库里没有 |
 
-相关文档：[上架差距清单](../appgallery-readiness.md)、[发布链路与签名验证](../release-pipeline.md)、[上架文案与素材说明](appgallery-copy.md)、[隐私政策正文](../privacy-policy.md)
+相关文档：[上架差距清单](../appgallery-readiness.md)、[发布链路与签名验证](../release-pipeline.md)、[上架文案与素材说明](appgallery-copy.md)、[AGC 多设备素材要求](agc-media-requirements.md)、[隐私政策正文](../privacy-policy.md)
 
 ---
 
@@ -43,7 +43,7 @@
 ### 1.3 发布 Profile（含 `READ_PASTEBOARD` ACL）
 
 - [ ] AGC → Profile → 添加 → 选应用/包名 `cn.alfadb.tianguan` → 类型选**「发布」** → 选 1.2 的发布证书
-- [ ] 设备形态按包内实际勾选：**2in1 + phone**（与 `app/entry/src/main/module.json5` 的 `deviceTypes` 一致，见 3.6）
+- [ ] 设备形态按包内实际勾选：**手机 + 平板 + PC/2in1**（与 `app/entry/src/main/module.json5` 的 `deviceTypes: ['phone','tablet','2in1']` 一致，见 3.6；不勾智慧屏）
 - [ ] 「申请权限」里勾「受限 ACL 权限（HarmonyOS API9 及以上）」→ 勾 `ohos.permission.READ_PASTEBOARD` → 填使用场景与理由（可直接用 4.1 的模板）→ 提交
 - [ ] 审批通过后回到 Profile，「已获取权限」里勾上该权限 → 确定 → 下载 `.p7b`（例如 `/path/to/release.p7b`）
 - [ ] 核对 Profile 覆盖包内**全部**权限：`INTERNET`、`PREPARE_APP_TERMINATE`、`READ_PASTEBOARD`
@@ -128,7 +128,7 @@ bash scripts/build-release.sh
 - [ ] 核对包内版本与设备形态，必须与 AGC 填写一致：
   ```bash
   unzip -p .work/release/app-default-signed.app pack.info
-  # 期望：version.code=100、version.name=1.0.0、deviceType=["2in1","phone"]、releaseType="Release"
+  # 期望：version.code=100、version.name=1.0.0、deviceType=["phone","tablet","2in1"]、releaseType="Release"
   ```
 - [ ] 验签（签名包）：
   ```bash
@@ -165,23 +165,25 @@ bash scripts/build-release.sh
 | **应用介绍（详细介绍）** | 第 2 节整段（约 473 汉字）：双协议、多会话、GFX/H.264、音频、剪贴板、TOFU 指纹、手机/PC 适配、**适用范围（需自备服务器）**、GPL-3.0-or-later + 仓库地址、support@alfadb.cn | ✅ [`appgallery-copy.md`](appgallery-copy.md) 第 2 节 |
 | **截图（2in1 / PC）** | 5 张，1920×1080，顺序见 3.2：`pc-01-main` → `pc-02-rdp` → `pc-03-vnc` → `pc-05-form` → `pc-04-about` | ⚠️ `docs/store/screenshots/pc-*.png`；其中 `pc-04-about.png` 版本号仍显示 **0.0.1**，须重拍（见 3.3） |
 | **截图（手机）** | 3 张，1080×1920，顺序见 3.2：`phone-01-main` → `phone-02-session` → `phone-03-about` | ⚠️ `docs/store/screenshots/phone-*.png`；其中 `phone-03-about.png` 版本号仍显示 **0.0.1**，须重拍（见 3.3） |
+| **截图（平板）** | 3 张，1280×1920 或 1920×1280，顺序同手机/PC 逻辑 | ⬜ 尚未拍摄：待平板设备恢复后补拍（当前无平板真机，见 3.6） |
 | **隐私政策 URL** | `https://tianguan.alfadb.cn/privacy-policy.html`（已 200） | ✅ 正文同源：[`docs/privacy-policy.md`](../privacy-policy.md)；应用内入口为「关于」面板 |
 | **开发者联系方式** | `support@alfadb.cn` | ✅ 已写入隐私政策、关于面板与上架文案；AGC 侧按页面要求另填主体名称、客服邮箱/电话（有则填） |
 | **应用分类与标签** | 一级「应用」（非游戏）；二级建议「商务办公」，被指类目不符再改「工具」；标签选 5–8 个：远程桌面、VNC、RDP、远程办公、多会话、开源、服务器运维、HarmonyOS PC | ✅ [`appgallery-copy.md`](appgallery-copy.md) 第 5 节（含三个候选类目的取舍）。注意二级分类只能选一个，设置后不能自行修改 |
 | **版权信息** | 版权证书（软著/电子版权，见 1.5）+ 著作权人（与开发者主体一致）+ 应用名称「天关」；版权声明可写 `Copyright (C) 2026 天关开源项目`，许可 GPL-3.0-or-later | ⬜ 证书来自 1.5；许可与仓库信息见 [`../../LICENSE`](../../LICENSE) 与 [`../licensing.md`](../licensing.md) |
 | **内容分级问卷** | 按 3.4 的答案建议逐条如实勾选 | ✅ 应用事实见 [`appgallery-copy.md`](appgallery-copy.md)、[`../privacy-policy.md`](../privacy-policy.md) |
-| **支持设备** | AGC 侧当前已全选（手机/平板/智慧屏/PC/2in1）；**但包内 `deviceTypes` 只有 `2in1` + `phone`**，见 3.6，提交前必须对齐 | ⚠️ `app/entry/src/main/module.json5:8`、包内 `pack.info` 的 `deviceType` |
+| **支持设备** | 勾选**手机 + 平板 + PC/2in1**，**不勾智慧屏**；包内 `deviceTypes` 已同步为 `['phone','tablet','2in1']`，见 3.6 | ✅ `app/entry/src/main/module.json5:8`、包内 `pack.info` 的 `deviceType`；AGC 页面提交前复核实际勾选 |
 | **演示视频** | 60–90 秒真实录屏，横屏 16:9 为主，另出 9:16 竖屏；8 个分镜按脚本拍 | ⬜ 尚未拍摄；脚本 ✅ [`appgallery-copy.md`](appgallery-copy.md) 第 4 节 |
 | **版本更新说明** | 用 3.5 的摘录（首版说明，约 200 字） | ✅ [`../../CHANGELOG.md`](../../CHANGELOG.md) `[1.0.0]` 条目 |
 
 ### 3.2 截图分组与顺序
 
-AGC 的截图按设备形态分组上传，每组的张数上下限、是否必须给横屏/竖屏，**以页面提示为准**。仓库现有素材可直接覆盖两种形态：
+AGC 的截图按设备形态分组上传，每组的张数上下限、是否必须给横屏/竖屏，**以页面提示为准**。仓库现有素材覆盖手机与 PC/2in1，平板块待补拍：
 
 | 分组 | 张数 | 建议顺序 | 文件 | 尺寸 |
 | --- | --- | --- | --- | --- |
 | 2in1 / PC | 5 | 首图=主界面（宽屏双栏，最能说明产品）→ RDP 会话 → VNC 会话 → 新建连接表单 → 关于面板 | `pc-01-main.png`、`pc-02-rdp.png`、`pc-03-vnc.png`、`pc-05-form.png`、`pc-04-about.png` | 1920×1080 |
 | 手机 | 3 | 首图=主界面（分组标签 + 卡片）→ 远程会话 → 关于面板 | `phone-01-main.png`、`phone-02-session.png`、`phone-03-about.png` | 1080×1920 |
+| 平板 | 3 | 首图=主界面（平板布局）→ 远程会话 → 关于面板 | 待拍：`tablet-01-main.png` 等 | 1280×1920 或 1920×1280 |
 
 顺序理由：首图决定列表页观感，必须一眼看出「这是远程桌面客户端」；会话图证明功能真实可用；表单图证明能自己配置；关于图提供版本、许可与联系方式（审核指南要求应用内有真实有效的联系信息）。
 
@@ -197,7 +199,7 @@ AGC 的截图按设备形态分组上传，每组的张数上下限、是否必�
 - [ ] 重拍 `pc-04-about.png` 与 `phone-03-about.png`，保持原尺寸与打码方式
 - [ ] 逐张确认版本号显示 `1.0.0`，再上传
 
-其余 6 张不受影响。若发版前还改动了主界面布局，`pc-01-main.png` / `phone-01-main.png` 需一并重拍。
+其余 6 张不受影响。若发版前还改动了主界面布局，`pc-01-main.png` / `phone-01-main.png` 需一并重拍。平板组 3 张尚未拍摄（无平板真机），设备恢复后补拍。
 
 ### 3.4 内容分级问卷答案建议
 
@@ -225,18 +227,21 @@ AGC 的截图按设备形态分组上传，每组的张数上下限、是否必�
 说明：本应用为客户端，需自备 VNC / RDP 服务器；GPL-3.0-or-later 开源，源码见 https://github.com/alfadb/tianguan 。
 ```
 
-### 3.6 ⚠️ 支持设备：AGC 勾选与包内 `deviceTypes` 不一致
+### 3.6 支持设备：手机 + 平板 + PC/2in1（不勾智慧屏）
 
 | 事实 | 证据 |
 | --- | --- |
-| AGC 应用信息里支持设备已全选（手机 / 平板 / 智慧屏 / PC / 2in1） | 创建应用时的选择；提交前请在页面上复核当前实际勾选状态 |
-| 包内实际只有两种形态 | `app/entry/src/main/module.json5:8` → `deviceTypes: ['2in1', 'phone']`；包内 `pack.info` 的 `deviceType: ["2in1","phone"]` |
+| AGC 应用信息里支持设备勾选**手机 + 平板 + PC/2in1**，**不勾智慧屏** | 2026-10-27 用户决定；提交前请在 AGC 页面上复核当前实际勾选状态 |
+| 包内声明三种形态 | `app/entry/src/main/module.json5:8` → `deviceTypes: ['phone', 'tablet', '2in1']`；`app/entry/build-profile.json5` 的 `config.deviceType` 同为三项；包内 `pack.info` / `module.json` 的 `deviceType` 亦为三项（2026-10-27 构建核对） |
 
-后果：平板、智慧屏用户能在商店看到应用但装不上（或分发被平台判为不支持），属「实际不可用」风险。
+智慧屏不勾选（原因：TV 无兼容分发、需遥控器焦点导航与专用素材，后续加设备）。官方《配置支持设备》要求包内声明范围 ≥ AGC 勾选范围；当前两者一致，无缺口。
 
-- [ ] 在 AGC「支持设备」里把平板 / 智慧屏取消勾选，只留手机与 PC/2in1（**发布后升级只能加设备、不能删设备，现在改成本最低**）
-- [ ] 若确实要覆盖平板/智慧屏：改 `module.json5` 的 `deviceTypes` 后重新走第 2 节构建（属代码改动，不在本文档范围），并补这两种形态的截图与真机验证
-- [ ] 重新核对 `pack.info` 的 `deviceType` 与 AGC 勾选完全一致后再提交
+**平板**：勾选平板后必须配 3 张 1280×1920 或 1920×1280 的平板截图；当前无平板真机，该组素材待设备恢复后补拍（见 3.2 / 3.3）。
+
+- [ ] AGC「支持设备」只勾手机、平板、PC/2in1，**取消智慧屏**
+- [ ] 上传软件包后确认 AGC 解析出的设备形态为 `phone` + `tablet` + `2in1`（见 5.1）
+- [ ] 平板截图补拍完成后再提交（发布后升级只能加设备、不能删设备）
+- [ ] 复核 `pack.info` 的 `deviceType` 与 AGC 勾选完全一致后再提交
 
 ---
 
@@ -291,7 +296,7 @@ AGC 的截图按设备形态分组上传，每组的张数上下限、是否必�
 ### 5.1 提交动作清单
 
 - [ ] 软件包管理上传 2.3 的 `.app`（签名包），等待合法性检测
-- [ ] 合法性检测「已达标」，页面能解析出版本名/版本号/设备形态（`1.0.0` / `100` / `2in1`+`phone`）
+- [ ] 合法性检测「已达标」，页面能解析出版本名/版本号/设备形态（`1.0.0` / `100` / `phone` + `tablet` + `2in1`）
 - [ ] 跑一遍上架自检，逐条处理红色项
 - [ ] 版本信息：应用名称、图标、简介、介绍、截图、隐私政策 URL、联系方式、分类标签、版权信息、内容分级、备案信息、版本更新说明（对照第 3 节逐项填）
 - [ ] 支持设备与包内 `deviceTypes` 对齐（3.6）
@@ -365,7 +370,7 @@ AGC 的截图按设备形态分组上传，每组的张数上下限、是否必�
 1. ⬜ 发布证书 + 发布 Profile（含 `READ_PASTEBOARD` ACL）——没有就签不出可上架的包；仓里现有的已签名 `.app` 是调试 Profile 签的，不能直接上传；
 2. ⬜ APP 备案 + 软著/电子版权——没有就填不完版本信息；
 3. ⚠️ 两张「关于」截图版本号还是 0.0.1——须用 1.0.0 重装重拍；
-4. ⚠️ AGC 支持设备已全选，但包内只支持 2in1 + phone——提交前对齐或改包；
+4. ⚠️ 平板截图 3 张未拍——勾选平板后必须配 1280×1920 / 1920×1280 截图，待设备恢复后补拍；
 5. ⬜ 演示视频未拍——自备服务器类应用的必备材料。
 
 上面列出的前置依赖与素材待办都清掉后，按第 5 节从上往下打勾即可提交。
