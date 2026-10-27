@@ -1,1 +1,1 @@
-{ apiType: 'stageMode', buildOption: {}, targets: [{ name: 'default', runtimeOS: 'HarmonyOS', config: { deviceType: ['2in1', 'phone'] } }] }
+{ apiType: 'stageMode', buildOption: {}, targets: [{ name: 'default', runtimeOS: 'HarmonyOS', config: { deviceType: ['phone', 'tablet', '2in1', 'tv'] } }] }
