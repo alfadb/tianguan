@@ -1,10 +1,10 @@
-# 天关 AppGallery 发布构建与签名方案（手机 / 平板 / PC/2in1）
+# 天关 AppGallery 发布构建与签名方案（首发 PC/2in1）
 
-> 状态：2026-10-27。本文只写方案、配置片段与命令，**不包含任何密钥或口令**；所有签名材料必须留在仓库外。
+> 状态：2026-10-28。本文只写方案、配置片段与命令，**不包含任何密钥或口令**；所有签名材料必须留在仓库外。
 >
-> 适用对象：`cn.alfadb.tianguan`，API 26，用户已决定**支持设备为手机 / 平板 / PC/2in1，不勾智慧屏**（TV 无兼容分发、需遥控器焦点导航与专用素材，后续再加），不做 2in1 裁剪。
+> 适用对象：`cn.alfadb.tianguan`，API 26。**AGC「支持设备」首发只勾 PC/2in1**（2026-10-28 用户决定，取代 2026-10-27 的「手机 + 平板 + PC/2in1」）；包内 `deviceTypes` 保持 `['phone','tablet','2in1']`（包内范围 ≥ 勾选范围），不做 2in1 裁剪、不拆包；以后可加设备、不能删设备。
 >
-> 本轮已落地版本号 `1.0.0 / 100` 与 `scripts/build-release.sh`；2026-10-27 设备声明改为 `['phone','tablet','2in1']` 并重新构建核对；真实发布证书签名与 AGC 上传仍需等待外部材料。
+> 本轮已落地版本号 `1.0.0 / 100` 与 `scripts/build-release.sh`；2026-10-27 设备声明改为 `['phone','tablet','2in1']` 并重新构建核对（2026-10-28 决定不改包）；真实发布证书签名与 AGC 上传仍需等待外部材料。
 
 ## 0. 现状核查
 
@@ -13,7 +13,7 @@
 | 构建入口 | `app/build.sh` 只跑 `assembleHap --mode module`，产物 `entry-default-unsigned.hap`；`scripts/build-release.sh` 跑 `assembleApp --mode project`，产物 `app-default-unsigned.app` | 已有 `.app` 构建入口 |
 | 签名配置 | `app/build-profile.json5` 无 `signingConfigs`，产品上无 `signingConfig` | 构建产物未签名；靠仓外 `HapSignLauncher.java` 手工签名 |
 | 签名材料 | 只有调试证书 + 调试 ACL Profile（在 `$HOME/harmonyos-signing/tianguan/`） | 无发布证书 / 发布 Profile |
-| 设备类型 | `module.json5` 与 `entry/build-profile.json5` 都是 `['phone', 'tablet', '2in1']` | 2026-10-27 调整；全量发布（不含智慧屏） |
+| 设备类型 | `module.json5` 与 `entry/build-profile.json5` 都是 `['phone', 'tablet', '2in1']` | 2026-10-27 调整；包内声明三项，AGC 首发只勾 PC/2in1（2026-10-28） |
 | 版本 | `app.json5` 与 `build-profile.json5` 的 `default` product 均为 `versionCode 100` / `versionName 1.0.0` | 已同步，见第 4 节 |
 | 上架包 | `scripts/build-release.sh` 已能产出未签名 `.app` | AGC 要签名的 `.app`，见第 1、2 节 |
 
@@ -217,18 +217,18 @@ export default {
 - 仓库 `.gitignore` 已覆盖密钥/证书扩展名；仍需保证 `build-profile.json5` 中不出现密文口令。若采用 2.4，`TIANGUAN_RELEASE_SIGNING` 指向的 JSON 必须在仓库外且权限 0600。
 - 发布证书的私钥丢失后**无法更换签名**（官方 FAQ：HarmonyOS 应用不支持更换签名），`.p12` 要长期备份；换证书只能重新申请发布证书与 Profile，且更新版本时要用同一个 CSR 生成的证书。
 
-## 3. 发布范围：手机 / 平板 / PC/2in1，不做 2in1 裁剪
+## 3. 发布范围：AGC 首发只勾 PC/2in1，包内声明维持三项
 
-**结论（用户决策 2026-10-27）**：支持设备为手机 / 平板 / PC/2in1，**不勾智慧屏**（TV 无兼容分发、需遥控器焦点导航与专用素材，后续再加）；**不需要 2in1 裁剪**，也不新增 2in1 target/product。
+**结论（用户决策 2026-10-28）**：AGC「支持设备」**首发只勾 PC/2in1**，不勾手机、平板、智慧屏；包内 `deviceTypes` 保持 `['phone','tablet','2in1']`。**不需要改包、不拆包、不做 2in1 裁剪**。
 
-- `module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['phone', 'tablet', '2in1']`（2026-10-27 由四项改为三项）。
+- `module.json5` 的 `deviceTypes` 与 `entry/build-profile.json5` 的 `config.deviceType` 均为 `['phone', 'tablet', '2in1']`（2026-10-27 由四项改为三项，2026-10-28 决定保持不变）。
 - 当前只有 `default` 一个 product；发布构建用 `-p product=default`，包内 `module.json` 与 `pack.info` 声明 `phone` + `tablet` + `2in1`。
-- AGC 的「支持设备」勾选手机 / 平板 / PC/2in1，不勾智慧屏；官方要求包内声明范围 ≥ AGC 勾选范围，当前包声明与勾选范围一致。
-- `READ_PASTEBOARD` 在手机侧是已知审核风险：保留单包全量发布，若审核被拒再拆包或改用系统粘贴控件（见 [appgallery-readiness.md](appgallery-readiness.md) 4.2）。
+- AGC 的「支持设备」只勾 PC/2in1；官方要求包内声明范围 ≥ AGC 勾选范围（3 ≥ 1，满足）。分发范围由 AGC 勾选决定，手机/平板用户不会拿到应用。
+- `READ_PASTEBOARD`：PC/2in1 上均可申请、首次默认允许，手机侧「场景不符」风险首发不涉及；发布 Profile 仍要勾该 ACL，AGC 隐私说明仍要理由 + 使用场景视频（约 3 个工作日）。
 
 ### 3.1 为什么不再走 target 收窄
 
-上一轮方案曾计划新增只含 `2in1` 的 target 和 `appstore2in1` product，用 `targets[].config.deviceType` 把包内设备收窄为 `2in1`。用户已决定全量发布，因此该方案**搁置不实施**：
+上一轮方案曾计划新增只含 `2in1` 的 target 和 `appstore2in1` product，用 `targets[].config.deviceType` 把包内设备收窄为 `2in1`。现在首发只勾 PC/2in1、包内保留三项即可满足「包内范围 ≥ 勾选范围」，因此该方案**搁置不实施**：
 
 - `module.json5` 的 `deviceTypes` 是模块级唯一声明，不能按 product 直接覆盖；
 - target 的 `config.deviceType` 只能是 `module.json5` 的子集；
@@ -272,9 +272,9 @@ unzip -p build/outputs/default/app-default-unsigned.app pack.info
 
 ### 3.4 风险与边界
 
-- **AGC 设备勾选不能超过包内声明**：官方要求「软件包内声明的设备范围 ≥ AGC 最终勾选的设备范围」。当前包声明 `phone` + `tablet` + `2in1`，与 AGC 勾选范围一致。
-- **`READ_PASTEBOARD` 是手机侧最大风险**：单包全量发布把该权限同时带给手机，审核可能按手机场景拒绝；被拒后的退路是拆 HAP 或改用系统粘贴控件，见 [appgallery-readiness.md](appgallery-readiness.md)。
-- **平板截图缺口**：勾选平板后必须配 3 张 1280×1920 / 1920×1280 截图，当前无平板真机，待设备恢复后补拍。
+- **AGC 设备勾选不能超过包内声明**：官方要求「软件包内声明的设备范围 ≥ AGC 最终勾选的设备范围」。当前包声明 `phone` + `tablet` + `2in1`，AGC 只勾 PC/2in1，满足。
+- **`READ_PASTEBOARD` 首发不涉手机侧风险**：只勾 PC/2in1 时该权限在 PC 上「均可申请」，但仍须发布 Profile 的 ACL、隐私说明理由与使用场景视频；以后加手机时才会回到「手机场景不符」的审核风险（见 [appgallery-readiness.md](appgallery-readiness.md) 4.2）。
+- **首发无平板截图缺口**：平板不勾选，不需要平板素材；以后加平板时再补 3 张 1280×1920 / 1920×1280。
 - **版本号两处同步**：`app.json5` 与 `default` product 都写了版本；只改一处不生效（product 会覆盖）。当前两处均为 `100 / '1.0.0'`。
 - **构建命令已固化**：`scripts/build-release.sh` 用 `product=default` + `buildMode=release`；`app/build.sh` 仍只出未签名 HAP，不受影响。
 
@@ -354,7 +354,7 @@ unzip -p build/outputs/default/app-default-unsigned.app pack.info
 
 ## 6. 不依赖 AGC 的验证路径（上线前自测）
 
-目标：用现有**调试证书 + 调试 ACL Profile**，验证「release 模式 + 全量设备包 + 打包路径 + 签名流程」都正确。发布证书/发布 Profile 的真实签名只能等 AGC 下发后再验。
+目标：用现有**调试证书 + 调试 ACL Profile**，验证「release 模式 + 三项设备声明包 + 打包路径 + 签名流程」都正确。发布证书/发布 Profile 的真实签名只能等 AGC 下发后再验。
 
 > 为什么必须用 `TianGuanDebugDevicesACLDebug.p7b`：包内声明了 `ohos.permission.READ_PASTEBOARD`，如果 Profile 的 ACL 列表不含它，安装会失败（9568289）。不带 ACL 的 `TianGuanDebugDevicesDebug.p7b` 只适用于不声明该权限的包。已核对：ACL Profile 的 `allowed-acls` 为 `["ohos.permission.READ_PASTEBOARD"]`，且绑定 `cn.alfadb.tianguan` 与两台设备。
 
@@ -377,7 +377,7 @@ export PATH="$SDK/tool/node/bin:$SDK/bin:$SDK/ohpm/bin:$PATH"
 mkdir -p "$OUTDIR"
 cd "$APP_ROOT"
 
-# 1) 构建 release 模式的全量设备 HAP（不签名）
+# 1) 构建 release 模式的三项设备声明 HAP（不签名）
 "$SDK/bin/hvigorw" --no-daemon assembleHap --mode module \
   -p product=default -p buildMode=release
 
@@ -459,7 +459,7 @@ java -jar "$JAR" verify-app -inFile "$SIGNED_APP" \
 能证明：
 
 - release 模式构建成功，包内 `debug=false`、`releaseType=Release`；
-- 全量设备包生效，包内 `deviceTypes` 为 `phone` + `tablet` + `2in1`；
+- 包内三项设备声明生效，`deviceTypes` 为 `phone` + `tablet` + `2in1`（AGC 首发只勾 PC/2in1，属包范围 ≥ 勾选范围的正常状态）；
 - 未签名 HAP / `.app` 可被 `hap-sign-tool` 正确签名并通过 `verify-app`（HAP 路径已在既有流程中验证；`.app` 首次执行时按 6.2 验证）；
 - 调试 ACL Profile 能覆盖包内受限权限，PC 真机可安装、启动、冒烟。
 
@@ -468,12 +468,12 @@ java -jar "$JAR" verify-app -inFile "$SIGNED_APP" \
 - 发布证书 + 发布 Profile 的签名链是否被 AGC 接受；
 - 发布 Profile 是否包含 `READ_PASTEBOARD` ACL（需要在 AGC 新建发布 Profile 时勾选「受限 ACL 权限」）；
 - AGC 合法性检测/上架自检结果、云端重签、按设备类型分发；
-- 审核对全量发布（尤其手机侧 `READ_PASTEBOARD`）的判定。
+- 审核对首发只发 PC/2in1 的判定（含 PC 侧 `READ_PASTEBOARD` 的理由与使用场景视频是否被接受）。
 
 ## 7. 上线顺序建议
 
-1. **AGC 侧（已完成应用创建）**：应用已创建，APP ID `691761958035659012`，包名 `cn.alfadb.tianguan`，支持设备勾选手机 / 平板 / PC/2in1（不勾智慧屏）。准备发布证书（CSR 用长期保存的新 `.p12` 生成，发布证书有效期 3 年）；申请发布 Profile 时勾选「受限 ACL 权限（HarmonyOS API9 及以上）」中的 `ohos.permission.READ_PASTEBOARD`，下载 `.cer`/`.p7b`。
-2. **配置落地（本轮已完成）**：`versionCode 100 / versionName 1.0.0` 已同步到 `app.json5` 与 `default` product；新增 `scripts/build-release.sh`、`CHANGELOG.md`，README 与发布文档已同步；不新增 `2in1` target/product，`deviceTypes` 为 `['phone', 'tablet', '2in1']`（2026-10-27 调整）；首发不开启混淆。
+1. **AGC 侧（已完成应用创建）**：应用已创建，APP ID `691761958035659012`，包名 `cn.alfadb.tianguan`，**支持设备首发只勾 PC/2in1**（2026-10-28 决定，不勾手机/平板/智慧屏）。准备发布证书（CSR 用长期保存的新 `.p12` 生成，发布证书有效期 3 年）；申请发布 Profile 时勾选「受限 ACL 权限（HarmonyOS API9 及以上）」中的 `ohos.permission.READ_PASTEBOARD`，下载 `.cer`/`.p7b`。
+2. **配置落地（本轮已完成）**：`versionCode 100 / versionName 1.0.0` 已同步到 `app.json5` 与 `default` product；新增 `scripts/build-release.sh`、`CHANGELOG.md`，README 与发布文档已同步；不新增 `2in1` target/product，`deviceTypes` 为 `['phone', 'tablet', '2in1']`（2026-10-27 调整，2026-10-28 决定保持不变）；首发不开启混淆。
 3. **本地验证**：`bash scripts/test.sh` 全通过；`bash scripts/build-release.sh` 产出未签名 `.app`；`bash app/build.sh` 仍产出未签名 HAP。需要装机时用第 6 节调试签名 HAP 路径。
 4. **发布日**：构建 unsigned `.app` → 用发布材料签名 → `verify-app` → AGC 软件包管理「测试和正式上架」上传 → 合法性检测 → 上架自检 → 提交审核。
 5. **每次发版**：`versionCode` 递增；复用同一 `.p12`（签名不能换）；如换证书需同步换 Profile；重新跑第 6 节。
@@ -487,7 +487,7 @@ java -jar "$JAR" verify-app -inFile "$SIGNED_APP" \
 | `scripts/build-release.sh` | 新增发布构建脚本（`assembleApp --mode project -p product=default -p buildMode=release`） | 默认未签名 `.app`；可选外部签名 |
 | `CHANGELOG.md` | 新增，首个条目 `1.0.0 / 2026-10-26` | 已完成 |
 | `README.md` / `app/README.md` | 版本、RDP / ACL / 启动诊断等过期描述订正，补「构建发布包」 | 已完成 |
-| `docs/release-pipeline.md` | 全量发布、版本号、脚本命令与产物路径 | 本文 |
+| `docs/release-pipeline.md` | 首发只勾 PC/2in1、三项设备声明、版本号、脚本命令与产物路径 | 本文 |
 | `app/entry/src/main/module.json5` | `deviceTypes` 改为 `['phone', 'tablet', '2in1']`（2026-10-27），权限保持现状 | 支持设备不含智慧屏 |
 | `app/build.sh` | 不改，仍只跑 `assembleHap` 出未签名 HAP | 日常调试流程不受影响 |
 | `app/hvigorfile.ts` | 不改（不配置 hvigor 签名） | 签名在仓外完成 |
@@ -495,10 +495,10 @@ java -jar "$JAR" verify-app -inFile "$SIGNED_APP" \
 ## 8. 需要向华为确认 / 首次执行需实测的点
 
 1. AGC 网页上传是否接受未签名 `.app`（26.0.0+ 的云端重签是否覆盖非 DevEco Studio 上传路径）。
-2. 发布包（`phone` + `tablet` + `2in1`）在 AGC 合法性检测中的设备类型校验细节（官方文字是「包内声明范围 ≥ 勾选范围」，当前包声明与勾选范围一致）。
+2. 发布包（包内 `phone` + `tablet` + `2in1`，AGC 只勾 PC/2in1）在 AGC 合法性检测中的设备类型校验细节（官方文字是「包内声明范围 ≥ 勾选范围」，当前 3 ≥ 1）。
 3. `HapSignLauncher` 对 `.app` 的 `signCode`/`compatibleVersion` 参数行为（官方说 APP 包可签；首次执行以 `verify-app` 为准）。
-4. 发布 Profile 的 `READ_PASTEBOARD` ACL 在手机侧全量发布下是否会被要求「使用场景视频」等隐私说明材料（审核指南与 AGC 隐私说明的要求；调试 ACL 已批不等于发布审核已批，详见 [appgallery-readiness.md](appgallery-readiness.md) 的 2.5 与 3.6）。
-5. 若手机侧 `READ_PASTEBOARD` 审核被拒，拆 HAP 或改用系统粘贴控件的成本（见 appgallery-readiness 4.2 与 3.13）。
+4. 发布 Profile 的 `READ_PASTEBOARD` ACL 在首发 PC/2in1 下是否会被要求「使用场景视频」等隐私说明材料（PC 侧权限「均可申请」不等于免材料；详见 [appgallery-readiness.md](appgallery-readiness.md) 的 2.5 与 3.6）。
+5. 若以后加手机，手机侧 `READ_PASTEBOARD` 被拒时拆 HAP 或改用系统粘贴控件的成本（见 appgallery-readiness 4.2 与 3.13）。
 6. `module.targets` 若将来新增 target 复用 `src/main` 的行为是否随工具链升级变化（本文按 26.0.0.821 核对；升级后重跑第 6 节的产物检查）。
 
 ## 9. 参考
