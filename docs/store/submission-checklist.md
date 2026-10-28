@@ -12,7 +12,7 @@
 | ⚠️ | 材料已有但有已知缺陷，提交前必须处理 |
 | ⬜ | 需要账号持有人在本机/AGC 侧完成，仓库里没有 |
 
-相关文档：[上架差距清单](../appgallery-readiness.md)、[发布链路与签名验证](../release-pipeline.md)、[上架文案与素材说明](appgallery-copy.md)、[AGC 多设备素材要求](agc-media-requirements.md)、[只发 PC/2in1 的上架要求](pc-only-publishing.md)、[隐私政策正文](../privacy-policy.md)
+相关文档：[上架差距清单](../appgallery-readiness.md)、[发布链路与签名验证](../release-pipeline.md)、[上架文案与素材说明](appgallery-copy.md)、[AGC 多设备素材要求](agc-media-requirements.md)、[只发 PC/2in1 的上架要求](pc-only-publishing.md)、[隐私政策正文](../privacy-policy.md)、[最终用户协议](eula.md)
 
 ---
 
@@ -167,6 +167,7 @@ bash scripts/build-release.sh
 | **截图（2in1 / PC）** | 5 张，1920×1080，顺序见 3.2：`pc-01-main` → `pc-02-rdp` → `pc-03-vnc` → `pc-05-form` → `pc-04-about` | ⚠️ `docs/store/screenshots/pc-*.png`；其中 `pc-01-main`（顶部对齐前的布局）与 `pc-04-about`（版本号仍显示 **0.0.1**）须用 1.0.0 重拍（见 3.3） |
 | **截图（手机）** | 首发不需要；以后加手机时再补 3–10 张 1080×1920 或 1920×1080 | 现有 `phone-*.png` 保留在仓库作参考，**不作为首发上架素材**（见 3.2） |
 | **截图（平板）** | 首发不需要；以后加平板时再补 3 张 1280×1920 或 1920×1280 | 当前无平板真机，后续加设备再拍（见 3.6） |
+| **最终用户协议（EULA）** | 填 [`eula.md`](eula.md) 的正文，或托管为链接（GPL-3.0-or-later 兼容，含第三方组件与源码获取方式，生效日期 2026-10-28） | ✅ [`eula.md`](eula.md) |
 | **隐私政策 URL** | `https://tianguan.alfadb.cn/privacy-policy.html`（已 200） | ✅ 正文同源：[`docs/privacy-policy.md`](../privacy-policy.md)；应用内入口为「关于」面板 |
 | **开发者联系方式** | `support@alfadb.cn` | ✅ 已写入隐私政策、关于面板与上架文案；AGC 侧按页面要求另填主体名称、客服邮箱/电话（有则填） |
 | **应用分类与标签** | 一级「应用」（非游戏）；二级建议「商务办公」，被指类目不符再改「工具」；标签选 5–8 个：远程桌面、VNC、RDP、远程办公、多会话、开源、服务器运维、HarmonyOS PC | ✅ [`appgallery-copy.md`](appgallery-copy.md) 第 5 节（含三个候选类目的取舍）。注意二级分类只能选一个，设置后不能自行修改 |
@@ -297,6 +298,7 @@ AGC 的截图按设备形态分组上传，每组的张数上下限、是否必�
 - [ ] 合法性检测「已达标」，页面能解析出版本名/版本号/设备形态（`1.0.0` / `100` / 包内三项 `phone` + `tablet` + `2in1`；AGC 勾选只有 PC/2in1）
 - [ ] 跑一遍上架自检，逐条处理红色项
 - [ ] 版本信息：应用名称、图标、简介、介绍、截图、隐私政策 URL、联系方式、分类标签、版权信息、内容分级、备案信息、版本更新说明（对照第 3 节逐项填）
+- [ ] 最终用户协议已填写或托管为链接（3.1，用 `docs/store/eula.md` 正文；确认无与 GPL 冲突的限制）
 - [ ] 支持设备只勾 PC/2in1，包内声明三项（3.6）
 - [ ] 用 1.0.0 重拍 `pc-01-main` 与 `pc-04-about` 两张（3.3）
 - [ ] 上传演示视频

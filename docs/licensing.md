@@ -10,7 +10,7 @@
 
 ## 候选上游与兼容边界
 
-TigerVNC 已进入隔离实验评估，使用官方 v1.15.0，固定 commit 为 `8bdf8734ce12c8ed3c232496fc8a4ccdb04636b8`。[源码获取脚本](../scripts/fetch-tigervnc.sh)将原始源码保留在 `.work/sources` 外部 checkout，未将上游代码 vendor 入仓库；依赖与构建产物置于 `.work` 本地缓存。原始 checkout 保持 clean，host 正式目标使用原源码；OHOS 目标编译的是含明确变更的 `Thread.cxx` 构建副本，不能称为完全未修改上游实现。此评估尚不构成最终内核选型或 HarmonyOS 应用集成。FreeRDP 仍为候选，尚未引入。
+TigerVNC 已进入隔离实验评估，使用官方 v1.15.0，固定 commit 为 `8bdf8734ce12c8ed3c232496fc8a4ccdb04636b8`。[源码获取脚本](../scripts/fetch-tigervnc.sh)将原始源码保留在 `.work/sources` 外部 checkout，未将上游代码 vendor 入仓库；依赖与构建产物置于 `.work` 本地缓存。原始 checkout 保持 clean，host 正式目标使用原源码；OHOS 目标编译的是含明确变更的 `Thread.cxx` 构建副本，不能称为完全未修改上游实现。此评估尚不构成最终内核选型或 HarmonyOS 应用集成。FreeRDP 已集成，版本 3.9.0，以静态链接方式编译进应用。
 
 唯一平台补丁为 [experiments/vnc-core/ohos-thread.patch](../experiments/vnc-core/ohos-thread.patch)：官方 `Thread` 析构引用 SDK 缺失的 `pthread_cancel`，构建副本以 `TG_OHOS_NO_PTHREAD_CANCEL` 将仍在运行时的析构分支改为 trap；正常 `DecodeThread` 的 `stop()` / `wait()` 协作退出保持。该宏仅用于 OHOS 正式构建及 host 专用适配测试，原版权声明保留。分发相应二进制时，须按适用许可提供与实际编译内容对应的源码，包括此补丁、编译源变更及所需构建材料，并保留适用的版权、许可与 NOTICE 声明。
 
