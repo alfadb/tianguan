@@ -33,10 +33,26 @@
 
 ### 1.2 发布证书（`.p12` / `.csr` → `.cer`）
 
-- [ ] DevEco Studio → Build → Generate Key and CSR，生成 `.p12`（密钥库）与 `.csr`；记下**密码**与 **key alias**
+- [ ] 生成 `.p12`（密钥库）与 `.csr`，并记下**密码**与 **key alias**。两种方式任选：
+  - 有 DevEco Studio：Build → Generate Key and CSR；
+  - 纯命令行（本仓库没有 IDE）：`bash scripts/gen-release-csr.sh`，默认输出到仓外 `$HOME/harmonyos-signing/tianguan/release/`（目录 `0700`），生成 `<alias>.p12` 与 `<alias>.csr`，并用 `openssl` 打印 CSR subject 与自签名校验结果
+- [ ] 脚本可用环境变量覆盖默认值：`TIANGUAN_RELEASE_DIR`（输出目录）、`ALIAS`（默认 `tianguan-release`）、`DN`（默认 `CN=tianguan release,O=AlfaDB,C=CN`）、`VALIDITY`（默认 `3650` 天）
+- [ ] 口令输入（keytool 生成密钥时用，**不走命令行参数**）：优先设 `TIANGUAN_RELEASE_P12_PASS_FILE=/path/to/release.p12.pass`（单行明文、`0600`、仓外），脚本把它交给 keytool 的 `-storepass:file`/`-keypass:file`；不设置时脚本用 `read -s` 提示**两次**交互输入（不回显），再把口令经标准输入喂给 keytool。口令不打印、不写日志；同名 `.p12` 或 `.csr` 已存在时脚本拒绝覆盖
 - [ ] 密钥材料只存在仓外（例如 `/path/to/release.p12`、`/path/to/release.csr`），**不入库**（仓库 `.gitignore` 已忽略 `*.p12/*.cer/*.p7b/*.csr`）
 - [ ] AGC → 证书管理 → 新增证书 → 类型「发布证书」→ 上传 `.csr` → 下载 `.cer`（例如 `/path/to/release.cer`）
 - [ ] 记录证书名称、有效期（每账号最多 3 个发布证书，有效期 3 年；换证书必须同步换 Profile）
+
+脚本用法：
+
+```bash
+# 默认输出目录（$HOME/harmonyos-signing/tianguan/release/）+ 交互输入口令两次
+bash scripts/gen-release-csr.sh
+
+# 指定输出目录与口令文件（文件单行、0600、仓外）
+TIANGUAN_RELEASE_DIR=/path/to/release-dir \
+TIANGUAN_RELEASE_P12_PASS_FILE=/path/to/release.p12.pass \
+bash scripts/gen-release-csr.sh
+```
 
 **没有会卡在**：第 2 节签名步骤（`scripts/build-release.sh` 认不出发布材料就只出未签名包）→ AGC 上传的包不是发布证书签名，无法分发。
 

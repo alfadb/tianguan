@@ -174,6 +174,7 @@ java -cp "$JAR:$CLASSES" HapSignLauncher \
 - 口令只以文件路径传入，`HapSignLauncher` 把口令读成 `char[]`，不经过 argv/环境变量/日志；这是仓库既有的安全约定。
 - `scripts/build-release.sh` 已按同样方式内置可选签名：环境变量 `TIANGUAN_RELEASE_P12`、`TIANGUAN_RELEASE_CER`、`TIANGUAN_RELEASE_PROFILE`、`TIANGUAN_RELEASE_P12_PASS_FILE`、`TIANGUAN_RELEASE_ALIAS` 全部给出时，调用仓外 `HapSignLauncher.java`（可用 `TIANGUAN_HAP_SIGN_LAUNCHER` 指定路径）把未签名 `.app` 签到 `.work/release/`；缺任意一个就只产出未签名包。
 - 正式发布时只替换材料目录、证书、Profile、alias：`tianguan-release.p12`、发布 `.cer`、发布 `.p7b`、release alias；`compatibleVersion` 仍为 `26`。
+- 发布密钥与 CSR 用 `scripts/gen-release-csr.sh` 生成：默认输出仓外 `$HOME/harmonyos-signing/tianguan/release/`（`0700`），`ALIAS` / `DN` / `VALIDITY` / `TIANGUAN_RELEASE_DIR` 可覆盖，口令经 `TIANGUAN_RELEASE_P12_PASS_FILE`（`-storepass:file`）或交互 `read -s` 两次输入；把脚本产出的 `.csr` 上传 AGC 换 `.cer` 后，再按本节用五个 `TIANGUAN_RELEASE_*` 变量签名。
 - 官方文档明确「如果要对 APP 进行签名，只需将 `inFile` 和 `outFile` 参数修改为 APP 包即可」，即 `hap-sign-tool` 的 `sign-app` 同样可签 `.app`。本仓库的启动器封装的是同一个 `HapSignTool.signApp` API；本轮已实际构建未签名 `.app`，签名路径尚未用发布材料实测，首次使用时应按第 6 节做一次 `verify-app`。
 - 如果启动器在 `.app` 上因 `signCode` 参数报错，退回官方 CLI 的交互式口令模式（口令不落 argv）：
 
