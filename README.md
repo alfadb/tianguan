@@ -50,7 +50,7 @@ RDP 经 rdpsnd 输出 PCM 音频，实测 44.1 kHz 立体声；VNC 协议不包�
 
 ## 当前状态
 
-真机验证使用的是 1.0.0 之前的构建（PC 上现装的是 0.0.1 调试包），1.0.0 的覆盖安装尚未执行。尚未上架、未提交审核，发布证书与 Profile、APP 备案尚未办理；首发仅 PC/2in1 时不申请软著，以后加入手机再办。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+1.0.0 已覆盖安装到 PC 与手机（`install -r`，连接与密钥库保留）；PC 上 VNC 与 RDP、手机上 VNC 各一条连接均已复测连通。尚未上架、未提交审核，发布证书与 Profile、APP 备案尚未办理；首发仅 PC/2in1 时不申请软著，以后加入手机再办。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 已验证：
 
