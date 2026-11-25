@@ -217,6 +217,23 @@ napi_value RequestFullFrame(napi_env env, napi_callback_info info) {
   }
   return MakeString(env, tianguan::requestFullFrame());
 }
+// VNC and RDP: requestDesktopSize(sessionId, width, height) -> boolean. True
+// means the request was accepted and queued for the session thread (which owns
+// the socket); the server's verdict is reported by sessionStatus().resizeSupport.
+napi_value RequestDesktopSize(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  std::string id;
+  int width = 0, height = 0;
+  bool accepted = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok &&
+      argc >= 3 && GetStringArg(env, argv[0], 256, id) &&
+      GetIntArg(env, argv[1], width) && GetIntArg(env, argv[2], height))
+    accepted = tianguan::requestDesktopSize(id, width, height);
+  napi_value result = nullptr;
+  if (napi_get_boolean(env, accepted, &result) != napi_ok) return nullptr;
+  return result;
+}
 napi_value CreateSession(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -421,6 +438,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"sendPointer", nullptr, SendPointer, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"sendKey", nullptr, SendKey, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"requestFullFrame", nullptr, RequestFullFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"requestDesktopSize", nullptr, RequestDesktopSize, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"copyRegion", nullptr, CopyRegion, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"copyCursor", nullptr, CopyCursor, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeRegion", nullptr, TakeRegion, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -439,7 +457,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 25, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 26, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

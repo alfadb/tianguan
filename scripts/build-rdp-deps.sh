@@ -326,6 +326,14 @@ patch -d "$freerdp_copy" -p1 --batch --forward \
 # libfreerdp-client3.a. The drive/printer/smartcard DeviceServiceEntry
 # sub-channels stay CHANNEL_*_OFF: they are optional runtime subsystems of
 # rdpdr and this client has no device redirection UI.
+# Dynamic resolution (DISP, MS-RDPEDISP): the disp dynamic channel is what the
+# client needs to ask the server to change the remote resolution. Built with
+#   -DCHANNEL_DISP=ON -DCHANNEL_DISP_CLIENT=ON -DCHANNEL_DISP_SERVER=OFF.
+# disp is a DVC plugin (it needs CHANNEL_DRDYNVC=ON, already enabled above). Its
+# client code is archived into libfreerdp-client3.a and loaded at runtime when
+# FreeRDP_SupportDisplayControl is set; the client installs SendMonitorLayout
+# from the DispClientContext published on the ChannelConnected event. The
+# server side stays OFF (this is a client-only app).
 # FFmpeg discovery: FreeRDP 3.9's cmake/FindFFmpeg.cmake has no FFMPEG_ROOT_DIR
 # variable. It runs find_path/find_library for AVCODEC/AVUTIL/SWSCALE/SWRESAMPLE
 # under CMAKE_FIND_ROOT_PATH (mode ONLY) and CMAKE_PREFIX_PATH and caches
@@ -357,7 +365,8 @@ cmake -S "$freerdp_copy" -B "$freerdp_build" -G "Unix Makefiles" \
   -DCHANNEL_DRDYNVC=ON -DCHANNEL_DRDYNVC_CLIENT=ON -DCHANNEL_DRDYNVC_SERVER=OFF \
   -DCHANNEL_RDPEI=ON -DCHANNEL_RDPEI_CLIENT=ON -DCHANNEL_RDPEI_SERVER=OFF \
   -DCHANNEL_CLIPRDR=ON -DCHANNEL_CLIPRDR_CLIENT=ON -DCHANNEL_CLIPRDR_SERVER=OFF \
-  -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF -DCHANNEL_DISP=OFF \
+  -DCHANNEL_AINPUT=OFF -DCHANNEL_AUDIN=OFF \
+  -DCHANNEL_DISP=ON -DCHANNEL_DISP_CLIENT=ON -DCHANNEL_DISP_SERVER=OFF \
   -DCHANNEL_DRIVE=OFF -DCHANNEL_ECHO=OFF -DCHANNEL_ENCOMSP=OFF -DCHANNEL_GEOMETRY=OFF \
   -DCHANNEL_LOCATION=OFF -DCHANNEL_PARALLEL=OFF -DCHANNEL_PRINTER=OFF -DCHANNEL_RAIL=OFF \
   -DCHANNEL_RDPDR=ON -DCHANNEL_RDPDR_CLIENT=ON -DCHANNEL_RDPDR_SERVER=OFF \
@@ -457,6 +466,26 @@ for define in WITH_DSP_FFMPEG WITH_VIDEO_FFMPEG WITH_SWSCALE WITH_GFX_H264 SWRES
     echo "FreeRDP config.h does not define $define" >&2; exit 1
   }
 done
+
+# The DISPLAY_CONTROL (disp) dynamic channel is what requestDesktopSize() uses
+# for RDP; make sure a future dependency rebuild cannot silently drop it again.
+"$llvm_ar" t "$prefix/lib/libfreerdp-client3.a" > "$evidence/libfreerdp-client3.members.txt"
+for member in disp_main.c.o disp_common.c.o; do
+  grep -qx "$member" "$evidence/libfreerdp-client3.members.txt" || {
+    echo "libfreerdp-client3.a is missing $member (DISPLAY_CONTROL disabled?)" >&2
+    exit 1
+  }
+done
+for define in CHANNEL_DISP CHANNEL_DISP_CLIENT; do
+  grep -qx "#define $define" "$freerdp_build/include/freerdp/config.h" || {
+    echo "FreeRDP config.h does not define $define (DISPLAY_CONTROL disabled?)" >&2
+    exit 1
+  }
+done
+if grep -qx "#define CHANNEL_DISP_SERVER" "$freerdp_build/include/freerdp/config.h"; then
+  echo 'FreeRDP config.h unexpectedly enables CHANNEL_DISP_SERVER' >&2
+  exit 1
+fi
 
 if find "$prefix" -type f \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) | grep -q .; then
   echo 'Unexpected shared object installed in the static prefix:' >&2
@@ -564,7 +593,7 @@ mkdir -p "$prefix/share"
   printf '         FFmpeg components discovered by FindFFmpeg.cmake via CMAKE_PREFIX_PATH/\n'
   printf '         CMAKE_FIND_ROOT_PATH=%s (that module has no FFMPEG_ROOT_DIR; pkg-config\n' "$prefix"
   printf '         is not used by the cross build),\n'
-  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx+rdpsnd+rdpdr client channels on,\n'
+  printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx+rdpsnd+rdpdr+disp client channels on,\n'
   printf '         BUILD_SHARED_LIBS=OFF, CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF, CMAKE_POSITION_INDEPENDENT_CODE=ON,\n'
   printf '         OPENSSL_ROOT_DIR/ZLIB_ROOT=%s, OPENSSL_USE_STATIC_LIBS=ON.\n' "$prefix"
   printf '  Source patch: winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'

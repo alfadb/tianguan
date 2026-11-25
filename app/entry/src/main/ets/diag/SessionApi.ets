@@ -62,6 +62,13 @@ export interface SessionStatus {
   fingerprint?: string;
   pixelBytes?: number;
   clipboardTruncated?: boolean;
+  /**
+   * Verdict on the most recent requestDesktopSize() call. 'unknown' (nothing
+   * asked yet / after reconnect / RDP server has not applied it), 'ok' (the
+   * server confirmed at least one client resize request), 'rejected' (VNC: the
+   * server refused one; RDP has no reject answer).
+   */
+  resizeSupport?: string;
 }
 
 /** takeFrame metadata JSON (docs/napi-contract.md §画面). */
@@ -301,6 +308,25 @@ export function requestFullFrame(sessionId: string): string {
   } catch (error) {
     warn('requestFullFrame', error);
     return '';
+  }
+}
+
+/**
+ * Asks the server to resize the remote desktop to width x height: VNC uses
+ * ExtendedDesktopSize, RDP uses the DISPLAY_CONTROL (MS-RDPEDISP) monitor
+ * layout. Returns true as soon as the native side accepted and queued the
+ * request for the session thread; the server's actual verdict and the resulting
+ * geometry arrive asynchronously in sessionStatus() (resizeSupport / width /
+ * height). False means the session is unknown, not connected, not VNC/RDP, or
+ * the size is out of range (VNC [1, 4096]; RDP [200, 4096]).
+ */
+export function requestDesktopSize(sessionId: string, width: number,
+  height: number): boolean {
+  try {
+    return diag.requestDesktopSize(sessionId, width, height);
+  } catch (error) {
+    warn('requestDesktopSize', error);
+    return false;
   }
 }
 

@@ -124,6 +124,21 @@ struct RdpHost {
   // the whole desktop.
   void (*consumeFullRequest)(void* user) = nullptr;
 
+  // Client-initiated dynamic resolution (requestDesktopSize) for RDP.
+  // takeDesktopSizeRequest() is called on the session thread every event-loop
+  // tick. It returns true and fills *width/*height with the newest queued size
+  // only when no request is already in flight, and marks that size in flight
+  // (the same one-request-at-a-time rule as the VNC path). False means "nothing
+  // to send right now".
+  bool (*takeDesktopSizeRequest)(void* user, int* width, int* height) = nullptr;
+  // Finish the in-flight request: applied == true when a DesktopResize arrived
+  // for this attempt (the server applied a client layout request; RDP has no
+  // accept/reject PDU, so this is the only positive acknowledgement and sets
+  // resizeSupport="ok"). applied == false rolls the in-flight flag back after
+  // a PDU that could not be sent, keeping resizeSupport "unknown".
+  void (*finishDesktopSizeRequest)(void* user, int generation, int width,
+                                   int height, bool applied) = nullptr;
+
   // Remote clipboard text received through cliprdr (CF_UNICODETEXT), already
   // converted to UTF-8 and NUL-free. `length` may be 0. Invoked on the session
   // thread; the pointer is only valid for the duration of the call. The adapter

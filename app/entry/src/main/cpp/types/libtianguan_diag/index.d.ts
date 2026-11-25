@@ -23,6 +23,14 @@ export const setClipboard: (sessionId: string, text: string) => string;
 export const takeClipboard: (sessionId: string) => string;
 export function requestFullFrame(): string;
 export function requestFullFrame(sessionId: string): string;
+// VNC and RDP: ask the server to resize the remote desktop (VNC
+// ExtendedDesktopSize / RDP DISPLAY_CONTROL). Synchronous boolean: true when
+// the request was accepted and queued for the session thread, false for an
+// unknown/disconnected/other-protocol session or an out-of-range size
+// (VNC [1, 4096]; RDP [200, 4096]). The server's verdict is
+// sessionStatus().resizeSupport.
+export const requestDesktopSize: (sessionId: string, width: number,
+  height: number) => boolean;
 export function copyCursor(buffer: ArrayBuffer): string;
 export function copyCursor(sessionId: string, buffer: ArrayBuffer): string;
 

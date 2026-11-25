@@ -534,6 +534,176 @@ int resizeTest(const TestConfig& config, const std::string& pin) {
   return 1;
 }
 
+// Client-initiated resize (requestDesktopSize). Unlike resizeTest, the server
+// is not touched from outside: the client asks for 1024x768 (inside Xvnc's
+// RandR range) and must get resizeSupport="ok" plus a complete 1024x768 frame
+// without a reconnect. It then asks for 16x16 (below Xvnc's 32x32 RandR
+// minimum): the server must refuse it, resizeSupport must become "rejected",
+// and the connection must stay on the 1024x768 framebuffer and remain usable.
+int requestResizeTest(const TestConfig& config, const std::string& pin) {
+  bool passed = true;
+  const std::string id =
+      tianguan::createSession(makeOptions(config, pin, "request-resize"));
+  std::cout << "create: " << id << std::endl;
+  if (id.empty() || id[0] == 'E') {
+    std::cout << "FAIL createSession" << std::endl;
+    return 1;
+  }
+  const std::string connected = waitForState(id, "connected", 20000);
+  std::cout << "status: " << connected << std::endl;
+  int width = jsonInt(connected, "width", 0);
+  int height = jsonInt(connected, "height", 0);
+  if (connected.find("\"state\":\"connected\"") == std::string::npos ||
+      width <= 0 || height <= 0) {
+    std::cout << "FAIL session did not connect" << std::endl;
+    tianguan::closeSession(id);
+    return 1;
+  }
+  if (jsonString(connected, "resizeSupport") != "unknown") {
+    std::cout << "FAIL resizeSupport is not unknown before any request" << std::endl;
+    passed = false;
+  }
+  std::vector<unsigned char> buffer(static_cast<size_t>(width) * height * 4);
+  std::string baseline;
+  const auto baselineDeadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < baselineDeadline) {
+    baseline = tianguan::takeFrame(id, buffer.data(), buffer.size(), -1, true);
+    if (!baseline.empty() && baseline[0] == '{') break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (baseline.empty() || baseline[0] != '{') {
+    std::cout << "FAIL no baseline full frame" << std::endl;
+    tianguan::closeSession(id);
+    return 1;
+  }
+  const int versionBefore = jsonInt(baseline, "version", 0);
+  const int generationBefore = jsonInt(baseline, "generation", 0);
+  std::cout << "baseline size=" << width << "x" << height
+            << " version=" << versionBefore << " generation=" << generationBefore
+            << " resizeSupport=" << jsonString(connected, "resizeSupport")
+            << std::endl;
+
+  // Contract rejections that never touch the server.
+  const bool rejectUnknown = !tianguan::requestDesktopSize("no-such-session", 1024, 768);
+  const bool rejectLow = !tianguan::requestDesktopSize(id, 0, 768);
+  const bool rejectHigh = !tianguan::requestDesktopSize(id, 1024, 4097);
+  std::cout << "requestDesktopSize unknownSession=" << rejectUnknown
+            << " zeroWidth=" << rejectLow << " height4097=" << rejectHigh
+            << std::endl;
+  if (!rejectUnknown || !rejectLow || !rejectHigh) passed = false;
+
+  // 1024x768 is a mode Xvnc can create (32..32768 RandR range).
+  const bool accepted = tianguan::requestDesktopSize(id, 1024, 768);
+  std::cout << "requestDesktopSize 1024x768 -> "
+            << (accepted ? "true" : "false") << std::endl;
+  if (!accepted) passed = false;
+  std::string resizedStatus;
+  const auto resizeDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(20);
+  while (std::chrono::steady_clock::now() < resizeDeadline) {
+    resizedStatus = tianguan::sessionStatus(id);
+    if (jsonString(resizedStatus, "resizeSupport") == "ok" &&
+        jsonInt(resizedStatus, "width", 0) == 1024 &&
+        jsonInt(resizedStatus, "height", 0) == 768)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  std::cout << "after 1024x768: " << resizedStatus << std::endl;
+  const int resizeGeneration = jsonInt(resizedStatus, "generation", 0);
+  const bool resizeOk =
+      jsonString(resizedStatus, "resizeSupport") == "ok" &&
+      jsonInt(resizedStatus, "width", 0) == 1024 &&
+      jsonInt(resizedStatus, "height", 0) == 768 &&
+      jsonString(resizedStatus, "state") == "connected" &&
+      resizeGeneration == generationBefore;
+  if (!resizeOk) passed = false;
+
+  // The rebuilt mirror must hand out a complete, non-black 1024x768 frame at a
+  // newer version, on the same connection (generation unchanged).
+  std::vector<unsigned char> resized(static_cast<size_t>(1024) * 768 * 4);
+  std::string resizedMeta;
+  bool frameOk = false;
+  const auto frameDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < frameDeadline) {
+    resizedMeta = tianguan::takeFrame(id, resized.data(), resized.size(),
+                                      versionBefore, false);
+    if (!resizedMeta.empty() && resizedMeta[0] == '{') {
+      const int w = jsonInt(resizedMeta, "w", 0);
+      const int h = jsonInt(resizedMeta, "h", 0);
+      const int version = jsonInt(resizedMeta, "version", 0);
+      const int generation = jsonInt(resizedMeta, "generation", 0);
+      const bool full = resizedMeta.find("\"full\":true") != std::string::npos;
+      size_t nonBlack = 0;
+      for (size_t i = 0; i + 3 < resized.size(); i += 4)
+        if (resized[i] != 0 || resized[i + 1] != 0 || resized[i + 2] != 0) ++nonBlack;
+      std::cout << "resized takeFrame: " << resizedMeta
+                << " nonBlackPixels=" << nonBlack << std::endl;
+      if (w == 1024 && h == 768 && full && version > versionBefore &&
+          generation == generationBefore && nonBlack > 0) {
+        frameOk = true;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (!frameOk) {
+    std::cout << "FAIL no complete non-black 1024x768 frame after resize"
+              << std::endl;
+    passed = false;
+  }
+
+  // 16x16 is below Xvnc's RandR minimum (32x32): the server answers the client
+  // request with an error result. The client must record the refusal without
+  // resizing, keep the connection, and stay usable at 1024x768.
+  const bool acceptedBad = tianguan::requestDesktopSize(id, 16, 16);
+  std::cout << "requestDesktopSize 16x16 -> "
+            << (acceptedBad ? "true" : "false") << std::endl;
+  if (!acceptedBad) passed = false;
+  std::string rejectedStatus;
+  const auto rejectDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(20);
+  while (std::chrono::steady_clock::now() < rejectDeadline) {
+    rejectedStatus = tianguan::sessionStatus(id);
+    if (jsonString(rejectedStatus, "resizeSupport") == "rejected") break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  std::cout << "after 16x16: " << rejectedStatus << std::endl;
+  const bool rejectOk =
+      jsonString(rejectedStatus, "resizeSupport") == "rejected" &&
+      jsonString(rejectedStatus, "state") == "connected" &&
+      jsonInt(rejectedStatus, "width", 0) == 1024 &&
+      jsonInt(rejectedStatus, "height", 0) == 768 &&
+      jsonInt(rejectedStatus, "generation", 0) == generationBefore;
+  if (!rejectOk) passed = false;
+
+  // Still usable: a forced full handoff returns the unchanged geometry.
+  std::vector<unsigned char> after(static_cast<size_t>(1024) * 768 * 4);
+  const std::string afterMeta =
+      tianguan::takeFrame(id, after.data(), after.size(), -1, true);
+  size_t afterNonBlack = 0;
+  for (size_t i = 0; i + 3 < after.size(); i += 4)
+    if (after[i] != 0 || after[i + 1] != 0 || after[i + 2] != 0) ++afterNonBlack;
+  const bool stillUsable =
+      afterMeta.find("\"full\":true") != std::string::npos &&
+      jsonInt(afterMeta, "w", 0) == 1024 && jsonInt(afterMeta, "h", 0) == 768 &&
+      jsonInt(afterMeta, "generation", 0) == generationBefore &&
+      afterNonBlack > 0;
+  std::cout << "after rejection takeFrame: " << afterMeta
+            << " nonBlackPixels=" << afterNonBlack << std::endl;
+  if (!stillUsable) {
+    std::cout << "FAIL session not usable after rejected resize" << std::endl;
+    passed = false;
+  }
+
+  std::cout << "final status: " << tianguan::sessionStatus(id) << std::endl;
+  tianguan::closeSession(id);
+  std::cout << (passed ? "REQUEST RESIZE TEST PASS" : "REQUEST RESIZE TEST FAIL")
+            << std::endl;
+  return passed ? 0 : 1;
+}
+
 // Two sessions on one server, each with its own framebuffer; close one and
 // prove the other keeps working. This is the required acceptance smoke.
 int multiSessionTest(const TestConfig& config, const std::string& pin) {
@@ -982,6 +1152,18 @@ int main(int argc, char** argv) {
       return 1;
     }
     return resizeTest(config, resolvePin(config.host, config.port, pinSpec));
+  }
+  if ((argc == 3 || argc == 4) &&
+      std::strcmp(argv[1], "--request-resize-test") == 0) {
+    const std::string dir(argv[2]);
+    const std::string pinSpec = argc == 4 ? argv[3] : "";
+    TestConfig config;
+    std::string error;
+    if (!loadConfig(dir, config, error)) {
+      std::cout << "FAIL " << error << std::endl;
+      return 1;
+    }
+    return requestResizeTest(config, resolvePin(config.host, config.port, pinSpec));
   }
   if (argc >= 3 && argc <= 4 && std::strcmp(argv[1], "--frame-gap-test") == 0) {
     const std::string dir(argv[2]);

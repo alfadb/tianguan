@@ -23,12 +23,14 @@
 #include <freerdp/addin.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/cliprdr.h>
+#include <freerdp/channels/disp.h>
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/rdpsnd.h>
 #include <freerdp/client.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/cmdline.h>
+#include <freerdp/client/disp.h>
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/rdpsnd.h>
 #include <freerdp/codec/audio.h>
@@ -148,6 +150,13 @@ struct RdpAttemptContext {
   // the wrappers can forward unchanged and count what actually paints.
   pBitmapUpdate bitmapUpdate;
   pSurfaceBits surfaceBits;
+  // DISPLAY_CONTROL (disp) dynamic channel, client-initiated dynamic
+  // resolution. Attempt::create() subscribes to ChannelConnected before the
+  // connection; the DispClientContext arrives there and the server capability
+  // PDU sets dispCaps afterwards, both on the session thread.
+  DispClientContext* disp;
+  bool dispCaps;
+  UINT32 dispMaxMonitors;
   // Certificate pinning outcome of this attempt. Set by the FreeRDP
   // certificate callbacks and read by runRdpSession() after a failed connect to
   // decide how the attempt is reported instead of guessing from the error code.
@@ -384,6 +393,128 @@ void gfxChannelDisconnected(void* context,
   if (bridge == nullptr || bridge->context == nullptr) return;
   if (static_cast<void*>(bridge->context) != e->pInterface) return;
   gfxUnbind(attempt);
+}
+
+// ---------------------------------------------------------------------------
+// Display control (disp -> MS-RDPEDISP dynamic resolution)
+//
+// The reference clients' /dynamic-resolution is exactly two settings
+// (client/common/cmdline.c, parse_dynamic_resolution_options()):
+// FreeRDP_SupportDisplayControl=TRUE lets client-common add the "disp" dynamic
+// channel, and FreeRDP_DynamicResolutionUpdate=TRUE makes the client install
+// the DisplayControlCaps callback. Once the server opens
+// "Microsoft::Windows::RDS::DisplayControl", FreeRDP publishes DispClientContext
+// on ChannelConnected and the server then sends its capability PDU; only after
+// that caps callback may SendMonitorLayout() be called (the plugin's channel
+// callback does not exist earlier). This mirrors xf_disp_init() /
+// xf_disp_sendResize() (client/X11/xf_disp.c) and sdlDispContext::init() /
+// sendResize() (client/SDL/SDL2/sdl_disp.cpp), including the single-monitor
+// layout shape and physical size = pixel size. Width/Height are normalised by
+// the plugin itself to the MS-RDPEDISP range 200..8192 (and even width); the
+// backend only ever hands it values already validated by requestDesktopSize().
+// ---------------------------------------------------------------------------
+
+UINT dispCaps(DispClientContext* context, UINT32 maxNumMonitors,
+              UINT32 maxMonitorAreaFactorA, UINT32 maxMonitorAreaFactorB) {
+  if (context == nullptr || context->custom == nullptr) return CHANNEL_RC_OK;
+  RdpAttemptContext* attempt =
+      static_cast<RdpAttemptContext*>(context->custom);
+  attempt->dispCaps = true;
+  attempt->dispMaxMonitors = maxNumMonitors;
+  diagWarn("disp: DisplayControlCaps maxMonitors=" +
+           std::to_string(maxNumMonitors) + " maxArea=" +
+           std::to_string(maxMonitorAreaFactorA) + "x" +
+           std::to_string(maxMonitorAreaFactorB));
+  return CHANNEL_RC_OK;
+}
+
+void dispChannelConnected(void* context, const ChannelConnectedEventArgs* e) {
+  if (context == nullptr || e == nullptr || e->name == nullptr) return;
+  if (std::strcmp(e->name, DISP_DVC_CHANNEL_NAME) != 0) return;
+  RdpAttemptContext* attempt = attemptOf(static_cast<rdpContext*>(context));
+  if (attempt == nullptr || e->pInterface == nullptr) return;
+  // One binding per attempt; a repeated event must not re-install the callback.
+  if (attempt->disp != nullptr) return;
+  DispClientContext* disp = static_cast<DispClientContext*>(e->pInterface);
+  attempt->disp = disp;
+  attempt->dispCaps = false;
+  attempt->dispMaxMonitors = 0;
+  disp->custom = attempt;
+  // Same guard as the reference clients: the caps callback is only installed
+  // when dynamic resolution is on. preConnect() always turns it on.
+  if (freerdp_settings_get_bool(attempt->common.context.settings,
+                                FreeRDP_DynamicResolutionUpdate))
+    disp->DisplayControlCaps = dispCaps;
+  diagWarn("disp: dynamic resolution channel connected");
+}
+
+void dispChannelDisconnected(void* context,
+                             const ChannelDisconnectedEventArgs* e) {
+  if (context == nullptr || e == nullptr || e->name == nullptr) return;
+  if (std::strcmp(e->name, DISP_DVC_CHANNEL_NAME) != 0) return;
+  RdpAttemptContext* attempt = attemptOf(static_cast<rdpContext*>(context));
+  if (attempt == nullptr) return;
+  if (attempt->disp != nullptr &&
+      static_cast<void*>(attempt->disp) != e->pInterface)
+    return;
+  attempt->disp = nullptr;
+  attempt->dispCaps = false;
+  attempt->dispMaxMonitors = 0;
+}
+
+// Session thread only. One layout request at a time: takeDesktopSizeRequest()
+// hands out a size only when nothing is in flight, and the in-flight state is
+// finished either by desktopResize() (applied) or by the failure branch below.
+void sendPendingDesktopSize(RdpAttemptContext* attempt) {
+  if (attempt == nullptr || attempt->disp == nullptr || !attempt->dispCaps ||
+      attempt->dispMaxMonitors == 0)
+    return;
+  int width = 0, height = 0;
+  if (!attempt->host->takeDesktopSizeRequest(attempt->host->user, &width,
+                                             &height))
+    return;
+  // requestDesktopSize() already enforces this; keep the PDU legal even if a
+  // future caller bypasses it instead of writing an invalid layout.
+  if (width < static_cast<int>(DISPLAY_CONTROL_MIN_MONITOR_WIDTH) ||
+      height < static_cast<int>(DISPLAY_CONTROL_MIN_MONITOR_HEIGHT) ||
+      width > kMaxDesktopSide || height > kMaxDesktopSide) {
+    attempt->host->finishDesktopSizeRequest(
+        attempt->host->user, attempt->generation, width, height, false);
+    return;
+  }
+  DISPLAY_CONTROL_MONITOR_LAYOUT layout;
+  std::memset(&layout, 0, sizeof(layout));
+  layout.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
+  layout.Left = 0;
+  layout.Top = 0;
+  layout.Width = static_cast<UINT32>(width);
+  layout.Height = static_cast<UINT32>(height);
+  // Same as sdlDispContext::sendResize(): physical millimetres follow the
+  // pixel size (within the MS-RDPEDISP 10..10000 range for our 200..4096 sizes).
+  layout.PhysicalWidth = static_cast<UINT32>(width);
+  layout.PhysicalHeight = static_cast<UINT32>(height);
+  rdpSettings* settings = attempt->common.context.settings;
+  if (settings != nullptr) {
+    layout.Orientation =
+        freerdp_settings_get_uint16(settings, FreeRDP_DesktopOrientation);
+    layout.DesktopScaleFactor =
+        freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
+    layout.DeviceScaleFactor =
+        freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor);
+  }
+  const UINT rc = IFCALLRESULT(CHANNEL_RC_OK, attempt->disp->SendMonitorLayout,
+                               attempt->disp, 1, &layout);
+  if (rc != CHANNEL_RC_OK) {
+    attempt->host->finishDesktopSizeRequest(
+        attempt->host->user, attempt->generation, width, height, false);
+    diagWarn("disp: SendMonitorLayout failed [" + std::to_string(rc) + "]");
+    return;
+  }
+  diagWarn("disp: requested " + std::to_string(width) + "x" +
+           std::to_string(height) + " (orientation " +
+           std::to_string(layout.Orientation) + ", scale " +
+           std::to_string(layout.DesktopScaleFactor) + "/" +
+           std::to_string(layout.DeviceScaleFactor) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,6 +2041,14 @@ BOOL desktopResize(rdpContext* context) {
   attempt->host->resizeFrame(attempt->host->user, attempt->generation,
                              static_cast<int>(width),
                              static_cast<int>(height));
+  // RDP has no accept/reject answer to a monitor-layout PDU. A DesktopResize
+  // while this attempt has a client layout request in flight is the server's
+  // confirmation: the bridge clears the in-flight flag and marks
+  // resizeSupport="ok". An ignored request gets no such callback, so the status
+  // stays "unknown" and the UI applies its own timeout.
+  attempt->host->finishDesktopSizeRequest(
+      attempt->host->user, attempt->generation, static_cast<int>(width),
+      static_cast<int>(height), true);
   return TRUE;
 }
 
@@ -1929,6 +2068,26 @@ BOOL preConnect(freerdp* instance) {
       !freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) ||
       !freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) ||
       !freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE))
+    return FALSE;
+  // Dynamic resolution (MS-RDPEDISP). This is exactly what the reference
+  // clients' /dynamic-resolution sets (client/common/cmdline.c):
+  // SupportDisplayControl makes client-common's freerdp_client_load_addins()
+  // add the "disp" dynamic channel, DynamicResolutionUpdate tells the disp
+  // addin to install DispClientContext::DisplayControlCaps. Orientation and
+  // the two scale factors are the values sendPendingDesktopSize() copies into
+  // the monitor-layout PDU; MS-RDPEDISP requires orientation 0/90/180/270 and
+  // scale factors 100..500, so pin the neutral defaults explicitly (settings
+  // are zero-initialised otherwise) instead of sending 0.
+  if (!freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl,
+                                 TRUE) ||
+      !freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate,
+                                 TRUE) ||
+      !freerdp_settings_set_uint16(settings, FreeRDP_DesktopOrientation,
+                                   ORIENTATION_LANDSCAPE) ||
+      !freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor,
+                                   100) ||
+      !freerdp_settings_set_uint32(settings, FreeRDP_DeviceScaleFactor,
+                                   100))
     return FALSE;
   // Audio playback (rdpsnd): add the channel *here*, before client-common's
   // freerdp_client_load_addins() runs right after PreConnect. Several things
@@ -2438,6 +2597,9 @@ struct Attempt {
     attempt->fingerprintMismatch = false;
     attempt->bitmapUpdate = nullptr;
     attempt->surfaceBits = nullptr;
+    attempt->disp = nullptr;
+    attempt->dispCaps = false;
+    attempt->dispMaxMonitors = 0;
     // freerdp_client_context_new() registers client-common's static addin
     // resolver as the process-wide provider, so (re)install ours afterwards:
     // it answers only the rdpsnd "tianguan" subsystem lookup and delegates
@@ -2458,6 +2620,17 @@ struct Attempt {
         return false;
     } else {
       attempt->gfx = nullptr;
+    }
+    // The "disp" dynamic channel publishes its DispClientContext through the
+    // same ChannelConnected event. Subscribe before connect for the same
+    // reason: the server may open the channel as soon as the connection is
+    // active, and its caps PDU arrives right after the event.
+    if (context->pubSub != nullptr) {
+      if (PubSub_SubscribeChannelConnected(context->pubSub,
+                                           dispChannelConnected) < 0 ||
+          PubSub_SubscribeChannelDisconnected(context->pubSub,
+                                              dispChannelDisconnected) < 0)
+        return false;
     }
     // A fresh connection starts with no clipboard ownership; the text queued
     // by ArkTS is drained again by eventLoop() and re-announced.
@@ -2604,6 +2777,9 @@ struct Attempt {
       if (!freerdp_check_event_handles(context)) break;
       // requestFullFrame(): treat the next update as a full-screen commit.
       host.consumeFullRequest(host.user);
+      // requestDesktopSize(): a size queued from the NAPI thread is turned into
+      // a DISPLAY_CONTROL monitor-layout PDU here, on the socket-owning thread.
+      sendPendingDesktopSize(attempt);
       host.drainInput(host.user, &sink, &bridge.appliedRelease);
       if (freerdp_shall_disconnect_context(context)) break;
     }
@@ -2651,6 +2827,19 @@ struct Attempt {
       PubSub_UnsubscribeChannelDisconnected(context->pubSub,
                                             gfxChannelDisconnected);
     }
+    if (context->pubSub != nullptr) {
+      PubSub_UnsubscribeChannelConnected(context->pubSub, dispChannelConnected);
+      PubSub_UnsubscribeChannelDisconnected(context->pubSub,
+                                            dispChannelDisconnected);
+    }
+    // The disp plugin's DispClientContext is freed with the channel; do not
+    // leave a dangling pointer in an attempt that may still be inspected by a
+    // late callback before the context is freed.
+    if (attempt != nullptr) {
+      attempt->disp = nullptr;
+      attempt->dispCaps = false;
+      attempt->dispMaxMonitors = 0;
+    }
     // The credentials are copied into the settings by configure(); clear the
     // password copy before the settings are freed.
     if (context->settings != nullptr)
@@ -2677,8 +2866,11 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       host.commitFrame == nullptr || host.setCursor == nullptr ||
       host.setCursorBlank == nullptr || host.setCursorPos == nullptr ||
       host.prepareInput == nullptr || host.drainInput == nullptr ||
-      host.consumeFullRequest == nullptr || host.sinkClipboard == nullptr ||
-      host.currentPin == nullptr || host.setTrustRequired == nullptr) {
+      host.consumeFullRequest == nullptr ||
+      host.takeDesktopSizeRequest == nullptr ||
+      host.finishDesktopSizeRequest == nullptr ||
+      host.sinkClipboard == nullptr || host.currentPin == nullptr ||
+      host.setTrustRequired == nullptr) {
     return;  // bridge not fully wired: fail closed instead of crashing
   }
   int lastApplied = 0;

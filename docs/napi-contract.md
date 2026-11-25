@@ -45,11 +45,13 @@
   "width": 1920, "height": 1200, "generation": 3,
   "version": 118, "cursor": {"w":16,"h":23,"hotX":2,"hotY":0,"blank":false,"version":4},
   "clipboard": { "version": 7 },
-  "retryInMs": 4000, "fingerprint": "84-64-…", "pixelBytes": 9216000 }
+  "retryInMs": 4000, "fingerprint": "84-64-…", "pixelBytes": 9216000,
+  "resizeSupport": "unknown" }
 ```
 
 - `state=trust-required` 时附带 `fingerprint`，界面据此展示确认；确认写入 ArkTS 侧信任库后由界面调用 `reconnectSession`。
 - `errorCode` 是枚举；`error` 只用于辅助显示。
+- `resizeSupport` 按会话独立维护，重连后复位为 `"unknown"`：`"ok"` 表示服务端已按客户端请求确认/应用过至少一次（VNC：收到 `reasonClient` 的成功答复；RDP：收到与在途请求对应的 `DesktopResize`）；`"rejected"` 只可能来自 VNC（服务端明确拒绝）。RDP 协议没有拒绝应答，请求被忽略时保持 `"unknown"`，界面必须自行超时并停用该会话的自动跟随。
 
 ## 画面
 
@@ -74,6 +76,20 @@ requestFullFrame(sessionId: string): string
 ```
 
 请求一次非增量整屏更新（空闲桌面不会主动推全帧，界面就绪后必须调用一次）。
+
+### 远端分辨率（VNC ExtendedDesktopSize / RDP DISPLAY_CONTROL）
+
+```
+requestDesktopSize(sessionId: string, width: number, height: number): boolean
+```
+
+- **同步**返回。`true`：已受理并交给会话线程发送；`false`：会话不存在、未连接、不是 VNC/RDP，或尺寸非法。尺寸范围：VNC 为 `[1, 4096]`；RDP 为 `[200, 4096]`（MS-RDPEDISP 的 `Width`/`Height` 允许 `200..8192`，会话镜像沿用 4096 上限，低于 200 的请求直接拒绝，不产生非法 PDU）。
+- 原生不在 NAPI 线程写 socket：只记录待发尺寸，由各自会话线程消费。
+- **同一时刻只挂起一个未决请求**（两种协议一致）：上一个请求还没得到结果时，新的调用只覆盖「尚未发出」的尺寸，不会并发写出两个请求；重连后待发/在途状态与 `resizeSupport` 一起复位。
+- **VNC**：会话线程在协议状态 `NORMAL` 时调用 `CMsgWriter::writeSetDesktopSize()`。ScreenSet 固定为一个屏幕：`id=0`、矩形 `(0,0,width,height)`、`flags=0`。服务端是否支持由 `resizeSupport` 异步报告；若服务端从未宣告 ExtendedDesktopSize，请求会留在待发状态并保持 `"unknown"`。服务端也可能给出近似模式（例如偶数化/最接近的可用模式），`width`/`height` 与交付帧以服务端实际采用的几何为准。
+- **RDP**：`PreConnect` 打开 `FreeRDP_SupportDisplayControl` 与 `FreeRDP_DynamicResolutionUpdate`（等同参照客户端的 `/dynamic-resolution`），client-common 加载 `disp` 动态通道；服务端打开 `Microsoft::Windows::RDS::DisplayControl` 并下发 caps 后，会话线程构造单个显示器的 `DISPLAY_CONTROL_MONITOR_LAYOUT`（`Flags=PRIMARY`、`Left=Top=0`、`Width/Height=请求值`、`PhysicalWidth/Height=请求值`、orientation/scale 取协商设置）并调用 `DispClientContext::SendMonitorLayout`。FreeRDP 的 disp 插件会把宽度规整为偶数并夹到 `200..8192`，所以奇数宽度可能以相邻偶数值生效。
+- **RDP 的判定**：没有接受/拒绝应答。只有收到 `DesktopResize`（服务端应用了新的桌面尺寸）才把 `resizeSupport` 置 `"ok"`；请求被忽略则一直保持 `"unknown"`，由界面超时判定。`"rejected"` 不会由 RDP 产生。
+- VNC 与 RDP 都用同一个 `resizeSupport` 字段，因此页面无需按协议分支读取。
 
 ### 视图变换（缩放/平移）
 

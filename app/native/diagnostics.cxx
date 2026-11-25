@@ -14,6 +14,7 @@
 #include <rfb/CSecurityRSAAES.h>
 #include <rfb/Exception.h>
 #include <rfb/PixelBuffer.h>
+#include <rfb/screenTypes.h>
 #include <network/Socket.h>
 #include <network/TcpSocket.h>
 #include <rdr/Exception.h>
@@ -1124,6 +1125,16 @@ void emitDiagWarn(const std::string& line) {
 #endif
 }
 
+// Client-initiated desktop resize verdict, per session (VNC
+// ExtendedDesktopSize / RDP DISPLAY_CONTROL). "unknown" until the server
+// confirms or refuses a request this client sent; beginAttempt() resets it, so
+// a reconnect starts over.
+enum ResizeSupport {
+  ResizeSupportUnknown = 0,
+  ResizeSupportOk = 1,
+  ResizeSupportRejected = 2
+};
+
 // One session. The session thread is the only writer of the framebuffer mirror,
 // region and cursor buffers. Every other thread takes the matching mutex for a
 // short snapshot. Each lock protects one independent piece of state so status,
@@ -1133,6 +1144,8 @@ struct SessionState {
     : port(0), protocol("vnc"), stop(false), forceReconnect(false), running(false),
       generation(1), phase(PhaseConnecting), releaseEpoch(0),
       needFullRequest(false), retryInMs(0), connected(false), errorCode("none"),
+      desktopWidth(0), desktopHeight(0), desktopPending(false),
+      desktopAwaiting(false), resizeSupport(ResizeSupportUnknown),
       fbWidth(0), fbHeight(0), version(0), frameGeneration(0), takenVersion(0),
       pixEpoch(0), takenEpoch(0), rectX(0), rectY(0), rectW(0), rectH(0),
       updAny(false), updX0(0), updY0(0), updX1(0), updY1(0),
@@ -1171,6 +1184,18 @@ struct SessionState {
   std::mutex input;  // queued input + release epoch
   std::mutex pix;    // framebuffer mirror, region, cursor, versions
   std::mutex clip;   // clipboard text
+  // Client-initiated desktop resize. The NAPI thread only records the size; the
+  // session thread is the only one that writes the request (VNC
+  // CMsgWriter::writeSetDesktopSize / RDP SendMonitorLayout). At most one
+  // request is outstanding: desktopPending is the newest size not sent yet,
+  // desktopAwaiting means one was sent and its result has not arrived. A new
+  // call overwrites desktopPending instead of queueing.
+  std::mutex desk;
+  int desktopWidth;         // desk
+  int desktopHeight;        // desk
+  bool desktopPending;      // desk
+  bool desktopAwaiting;     // desk
+  int resizeSupport;        // desk: ResizeSupport*
   PerfStats perf;    // own mutex; timing summaries only
 
   std::atomic<bool> stop;
@@ -1491,6 +1516,66 @@ public:
     // An idle desktop will not volunteer the new geometry as pixels: ask for
     // one non-incremental update once the session loop gets back to its poll.
     state->needFullRequest = true;
+  }
+  // Server answer to a client-initiated ExtendedDesktopSize request. Only
+  // reasonClient is a verdict on the request this session sent; the regular
+  // reasonServer announcements (sent with every non-incremental update) say
+  // nothing about our request and must not flip resizeSupport. Record first,
+  // then delegate so the base class keeps its geometry update, continuous-
+  // updates re-arm and resizeFramebuffer() call unchanged.
+  void setExtendedDesktopSize(unsigned reason, unsigned result,
+                              int newWidth, int newHeight,
+                              const rfb::ScreenSet& layout) override {
+    if (reason == rfb::reasonClient) {
+      std::lock_guard<std::mutex> lock(state->desk);
+      if (state->desktopAwaiting) {
+        state->desktopAwaiting = false;
+        // result is unsigned in TigerVNC 1.15; resultSuccess (=0) is the only
+        // accepted value, every other code (prohibited/no resources/invalid)
+        // is a refusal of the client's request.
+        state->resizeSupport = (result == rfb::resultSuccess)
+                                   ? ResizeSupportOk
+                                   : ResizeSupportRejected;
+      }
+    }
+    rfb::CConnection::setExtendedDesktopSize(reason, result, newWidth,
+                                             newHeight, layout);
+  }
+  // Session thread only: the socket and writer may not be touched from NAPI.
+  // Sends at most one queued request; the reasonClient answer clears
+  // desktopAwaiting in setExtendedDesktopSize(), so the next size is written
+  // only after the previous verdict. A newer request that arrived meanwhile is
+  // still in desktopPending and replaces nothing (it simply wins).
+  void maybeSendDesktopSize() {
+    if (writer() == nullptr ||
+        static_cast<rfb::CConnection&>(*this).state() !=
+            rfb::CConnection::RFBSTATE_NORMAL)
+      return;
+    // A server that never sent ExtendedDesktopSize cannot be asked; keep the
+    // request pending (and resizeSupport "unknown") instead of letting
+    // writeSetDesktopSize() throw "Server does not support SetDesktopSize".
+    if (!server.supportsSetDesktopSize) return;
+    int w = 0, h = 0;
+    {
+      std::lock_guard<std::mutex> lock(state->desk);
+      if (state->desktopAwaiting || !state->desktopPending) return;
+      w = state->desktopWidth;
+      h = state->desktopHeight;
+      state->desktopPending = false;
+      state->desktopAwaiting = true;
+    }
+    rfb::ScreenSet layout;
+    layout.add_screen(rfb::Screen(0, 0, 0, w, h, 0));
+    try {
+      writer()->writeSetDesktopSize(w, h, layout);
+      getOutStream()->flush();
+    } catch (const std::exception&) {
+      // Nothing usable was written (extension vanished or the socket died);
+      // report a refusal instead of leaving the session stuck "awaiting".
+      std::lock_guard<std::mutex> lock(state->desk);
+      state->desktopAwaiting = false;
+      state->resizeSupport = ResizeSupportRejected;
+    }
   }
   bool dataRect(const rfb::Rect& rect, int encoding) override {
     const bool result = rfb::CConnection::dataRect(rect, encoding);
@@ -1898,11 +1983,25 @@ void waitForReconnect(SessionState& state) {
 // already bumped it; only the automatic retry path bumps it here, so exactly one
 // increment happens per new connection attempt.
 int beginAttempt(SessionState& state, int& lastApplied) {
-  std::lock_guard<std::mutex> lock(state.meta);
-  if (state.generation.load() == lastApplied) state.generation++;
-  const int generation = state.generation.load();
-  lastApplied = generation;
-  state.retryInMs = 0;
+  int generation;
+  {
+    std::lock_guard<std::mutex> lock(state.meta);
+    if (state.generation.load() == lastApplied) state.generation++;
+    generation = state.generation.load();
+    lastApplied = generation;
+    state.retryInMs = 0;
+  }
+  {
+    // A request describes the framebuffer of one connection; the new connection
+    // starts from "unknown" again (contract) and any unsent/awaited request of
+    // the old socket is dropped.
+    std::lock_guard<std::mutex> lock(state.desk);
+    state.resizeSupport = ResizeSupportUnknown;
+    state.desktopWidth = 0;
+    state.desktopHeight = 0;
+    state.desktopPending = false;
+    state.desktopAwaiting = false;
+  }
   return generation;
 }
 
@@ -2085,6 +2184,9 @@ void runVncSession(std::shared_ptr<SessionState> state) {
           if (client.getOutStream() != nullptr && client.getOutStream()->length() > 0)
             client.getOutStream()->flush();
           drainSessionInput(*state, client);
+          // Client-initiated resize (requestDesktopSize): writer/socket belong
+          // to this thread, and at most one request is ever in flight.
+          client.maybeSendDesktopSize();
           // A fresh view needs a non-incremental request; otherwise an idle
           // desktop never sends a full frame and the view stays mostly black.
           if (state->needFullRequest.exchange(false)) {
@@ -2510,6 +2612,39 @@ void rdpConsumeFullRequest(void* user) {
   state.wantFull = true;
 }
 
+// requestDesktopSize() adapter for RDP: the FreeRDP session thread (inside its
+// event loop) is the only caller. Same one-request-at-a-time policy as the VNC
+// path: hand out the newest queued size only when nothing is in flight, and
+// mark it in flight under the desk lock.
+bool rdpTakeDesktopSizeRequest(void* user, int* width, int* height) {
+  if (width == nullptr || height == nullptr) return false;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.desk);
+  if (state.desktopAwaiting || !state.desktopPending) return false;
+  state.desktopPending = false;
+  state.desktopAwaiting = true;
+  *width = state.desktopWidth;
+  *height = state.desktopHeight;
+  return true;
+}
+
+// Finish the in-flight RDP layout request. applied == true is the only positive
+// acknowledgement RDP offers (a DesktopResize arrived); applied == false rolls
+// the flag back after a PDU that could not be sent, leaving resizeSupport
+// "unknown". A stale generation returns without touching the new attempt's
+// state (beginAttempt() already reset it).
+void rdpFinishDesktopSizeRequest(void* user, int generation, int width,
+                                int height, bool applied) {
+  (void)width;
+  (void)height;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.desk);
+  if (state.stop || state.generation.load() != generation) return;
+  if (!state.desktopAwaiting) return;
+  state.desktopAwaiting = false;
+  if (applied) state.resizeSupport = ResizeSupportOk;
+}
+
 // Drop a UTF-8 sequence that the 1 MiB cut split in half. The VNC clipboard
 // handler has the same rule; RDP text arrives as UTF-16 and can be cut at the
 // same bound once converted.
@@ -2600,6 +2735,8 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
   bridge.prepareInput = rdpPrepareInput;
   bridge.drainInput = rdpDrainInput;
   bridge.consumeFullRequest = rdpConsumeFullRequest;
+  bridge.takeDesktopSizeRequest = rdpTakeDesktopSizeRequest;
+  bridge.finishDesktopSizeRequest = rdpFinishDesktopSizeRequest;
   bridge.sinkClipboard = rdpSinkClipboard;
 
   tianguan::runRdpSession(bridge, options);
@@ -2897,6 +3034,17 @@ std::string pixelFormatJson(int bpp, int depth, int redMax, int greenMax,
   return out;
 }
 
+const char* resizeSupportName(int value) {
+  switch (value) {
+    case ResizeSupportOk:
+      return "ok";
+    case ResizeSupportRejected:
+      return "rejected";
+    default:
+      return "unknown";
+  }
+}
+
 std::string statusJson(const std::shared_ptr<SessionState>& state) {
   int phase = PhaseFailed;
   int retryInMs = 0;
@@ -2946,6 +3094,11 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
     clipVersion = state->clipVersion;
     clipTruncated = state->clipTruncated;
   }
+  int resizeSupport = ResizeSupportUnknown;
+  {
+    std::lock_guard<std::mutex> lock(state->desk);
+    resizeSupport = state->resizeSupport;
+  }
   const int generation = state->generation.load();
   std::string out = "{\"id\":\"" + jsonEscape(state->id) + "\",\"state\":\"" +
                     phaseName(phase) + "\",\"error\":\"" + jsonEscape(error) +
@@ -2972,7 +3125,12 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   out += ",\"perf\":" + perfJson(state->perf.snapshot());
   out += ",\"pf\":" + pixelFormatJson(pfBpp, pfDepth, pfRedMax, pfGreenMax,
                                      pfBlueMax, pfBigEndian, pfRedShift,
-                                     pfGreenShift, pfBlueShift) + "}";
+                                     pfGreenShift, pfBlueShift);
+  // Additive: verdict on the most recent client-initiated desktop resize
+  // (requestDesktopSize). "unknown" also means "nothing asked/settled yet".
+  out += ",\"resizeSupport\":\"";
+  out += resizeSupportName(resizeSupport);
+  out += "\"}";
   return out;
 }
 
@@ -3155,7 +3313,8 @@ std::string tianguan::sessionStatus(const std::string& sessionId) {
            "\"blank\":true,\"version\":0},\"clipboard\":{\"version\":0},"
            "\"retryInMs\":0,\"fingerprint\":\"\",\"pixelBytes\":0,"
            "\"perf\":" + perfJson(PerfSnapshot()) +
-           ",\"pf\":" + pixelFormatJson(0, 0, 0, 0, 0, false, 0, 0, 0) + "}";
+           ",\"pf\":" + pixelFormatJson(0, 0, 0, 0, 0, false, 0, 0, 0) +
+           ",\"resizeSupport\":\"unknown\"}";
   }
   return statusJson(state);
 }
@@ -3472,6 +3631,35 @@ std::string tianguan::requestFullFrame(const std::string& sessionId) {
   }
   state->needFullRequest = true;
   return "OK";
+}
+
+bool tianguan::requestDesktopSize(const std::string& sessionId, int width,
+                                  int height) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  bool rdp = false;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    // The PDU/write must happen on the session thread; require a live
+    // connection so a queued request can actually reach it.
+    if (!state->connected) return false;
+    if (state->protocol != "vnc" && state->protocol != "rdp") return false;
+    rdp = state->protocol == "rdp";
+  }
+  // RDP (MS-RDPEDISP / DISPLAY_CONTROL): Width and Height are 200..8192; the
+  // session mirror keeps the same 4096 cap as VNC. VNC itself has no lower
+  // bound beyond 1. Refuse instead of writing an invalid monitor layout.
+  const int minSide = rdp ? 200 : 1;
+  if (width < minSide || height < minSide || width > 4096 || height > 4096)
+    return false;
+  std::lock_guard<std::mutex> lock(state->desk);
+  // Coalesce at the source: only the newest size matters while the previous
+  // request is still unsent, and the session thread sends at most one at a
+  // time (desktopAwaiting), so two resize PDUs never overlap.
+  state->desktopWidth = width;
+  state->desktopHeight = height;
+  state->desktopPending = true;
+  return true;
 }
 
 std::string tianguan::startSession(const std::string& dataDir) {

@@ -82,6 +82,17 @@ inline bool keepQueuedInputOnRelease(int kind) {
 std::string setClipboard(const std::string& sessionId, const std::string& text);
 std::string takeClipboard(const std::string& sessionId);
 std::string requestFullFrame(const std::string& sessionId);
+// VNC and RDP: queues a client-initiated resize request asking the server to
+// change the framebuffer to width x height. VNC uses ExtendedDesktopSize,
+// RDP uses the DISPLAY_CONTROL (MS-RDPEDISP) monitor-layout PDU. The write
+// itself happens on the session thread (socket ownership); at most one request
+// is in flight, a newer call replaces a size that has not been sent yet.
+// Returns false when the session does not exist, is not connected, is not VNC
+// or RDP, or the size is out of range: [1, 4096] for VNC, [200, 4096] for RDP
+// (DISPLAY_CONTROL's own minimum is 200). Acceptance is reported by the status
+// JSON field resizeSupport ("unknown" / "ok" / "rejected"; RDP has no reject
+// answer and stays "unknown" when the request is ignored).
+bool requestDesktopSize(const std::string& sessionId, int width, int height);
 
 // Legacy single-session wrappers. They resolve the "default" session that
 // startSession() creates, so the existing ArkTS pages keep compiling until they
