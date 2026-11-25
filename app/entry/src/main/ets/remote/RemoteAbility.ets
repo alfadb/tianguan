@@ -32,7 +32,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { closeSessionById } from '../model/SessionRegistry';
 import {
   REMOTE_QUIT_KEY, clearRemoteWindowRegistry, remoteCloseKeyForSession,
-  remoteWindowKeyForSession, sessionKeyForWindow, titleForSession
+  remoteWindowKeyForSession, sessionKeyForWindow, titleForSession,
+  registerRemoteAbilityContext, unregisterRemoteAbilityContext, remoteReopenKeyForSession
 } from '../windows/RemoteWindows';
 
 const DOMAIN: number = 0x0000;
@@ -145,6 +146,10 @@ export default class RemoteAbility extends UIAbility {
     if (this.sessionId.length > 0 && this.windowName.length > 0) {
       AppStorage.setOrCreate<string>(remoteWindowKeyForSession(this.sessionId), this.windowName);
       AppStorage.setOrCreate<string>(sessionKeyForWindow(this.windowName), this.sessionId);
+      // A phone cannot restore a minimized ability window in process, so the
+      // reopen path in RemoteWindows terminates and restarts this instance; it
+      // needs this instance's own context to call terminateSelf().
+      registerRemoteAbilityContext(this.sessionId, this.context);
       hilog.info(DOMAIN, TAG, 'remote ability window ready session=%{public}s name=%{public}s',
         this.sessionId, this.windowName);
     } else {
@@ -393,14 +398,28 @@ export default class RemoteAbility extends UIAbility {
       this.terminationTimer = -1;
     }
     this.clearRegistry();
+    unregisterRemoteAbilityContext(this.sessionId);
     const quitting: boolean = AppStorage.get<boolean>(REMOTE_QUIT_KEY) === true;
     const closeRequested: boolean = this.sessionId.length > 0 &&
       AppStorage.get<boolean>(remoteCloseKeyForSession(this.sessionId)) === true;
-    if (this.sessionId.length > 0 && !quitting && !closeRequested) {
+    // A reopen request terminates this instance but keeps the session alive for
+    // the fresh instance that is started right after (phone/tablet minimize).
+    const reopenRequested: boolean = this.sessionId.length > 0 &&
+      AppStorage.get<boolean>(remoteReopenKeyForSession(this.sessionId)) === true;
+    if (this.sessionId.length > 0 && !quitting && !closeRequested && !reopenRequested) {
       // The user closed this window: end its session, never the others.
       hilog.info(DOMAIN, TAG, 'remote ability closed, disconnecting session=%{public}s',
         this.sessionId);
       closeSessionById(this.sessionId);
+    }
+    if (reopenRequested) {
+      try {
+        AppStorage.delete(remoteReopenKeyForSession(this.sessionId));
+      } catch (error) {
+        // Key already gone.
+      }
+      hilog.info(DOMAIN, TAG, 'remote ability reopened session=%{public}s window=%{public}s',
+        this.sessionId, this.windowName);
     }
     if (this.sessionId.length > 0) {
       try {

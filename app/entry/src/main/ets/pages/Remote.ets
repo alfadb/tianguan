@@ -12,14 +12,16 @@
  * stays unmounted. There is no "last window", FIFO or "first registry session"
  * fallback.
  *
- * The page is pure picture: no title row, no disconnect button, no overlay and
- * no padding, so nothing covers the remote picture. The connection name belongs
- * to the window title (set by RemoteAbility). On a desktop the window's
- * title-bar X is the disconnect path. A phone has no title bar, so there the
- * system back action (onBackPress) is the disconnect: it ends this session and
- * closes this window instead of merely backgrounding it, through the same
- * programmatic path the connection list uses. Losing the view without a back
- * action (minimise, another window on top) still must NOT disconnect.
+ * The page is the remote picture plus a floating operation bar at the top (pin,
+ * minimise, fullscreen on desktop, disconnect); on touch devices a small centre
+ * handle summons that bar. The bar and the handle are siblings of the picture,
+ * so nothing else covers it. The connection name belongs to the window title
+ * (set by RemoteAbility). On a desktop the window's title-bar X is the disconnect
+ * path. A phone has no title bar, so there the bar's disconnect button and the
+ * system back action both end this session and close this window instead of
+ * merely backgrounding it, through the same programmatic path the connection
+ * list uses. Losing the view without either (backgrounding, another window on
+ * top) still must NOT disconnect.
  *
  * Presentation (USE_GL_RENDER = true): an XComponent(SURFACE) whose surface is
  * attached, per session, to the native EGL/GLES renderer (app/native/render.cxx
@@ -62,15 +64,17 @@
  * (status only) while the page is hidden, and the native renderer is parked
  * for that time.
  */
+import { common } from '@kit.AbilityKit';
+import type { Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { image } from '@kit.ImageKit';
-import { systemDateTime } from '@kit.BasicServicesKit';
+import { deviceInfo, systemDateTime } from '@kit.BasicServicesKit';
 import { KeyCode } from '@ohos.multimodalInput.keyCode';
 import pointer from '@ohos.multimodalInput.pointer';
 import { display, window } from '@kit.ArkUI';
 import {
   copyCursor, parseFrameMeta, reconnectSession, releaseSessionInput, requestFullFrame,
-  sendKey, sendPointer, sessionStatus, takeFrameRaw,
+  requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
   SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
@@ -129,6 +133,45 @@ const MIN_BLOCKED_FINGERS: number = 3;
 // and two or more fingers never have a mouse counterpart at all.
 const MOUSE_TOUCH_DEDUPE_MS: number = 150;
 const MOUSE_TOUCH_DEDUPE_VP: number = 10;
+
+// --- Floating operation bar (the remote "connection bar") ------------------
+// A semi-transparent dark bar floating over the top centre of the picture. It
+// is built from siblings of remote_area inside the outer Stack, never from
+// inside remote_area, so its pointer events cannot reach the remote pointer /
+// key paths. All sizes are vp.
+const TOOLBAR_WIDTH_VP: number = 336;
+const TOOLBAR_HEIGHT_VP: number = 38;
+const TOOLBAR_TOP_VP: number = 6;
+// Mouse: retract ~1 s after the pointer has left both the bar and the top hot
+// zone. Intro: show once for ~3 s after the session resolves.
+const TOOLBAR_HIDE_DELAY_MS: number = 1000;
+const TOOLBAR_INTRO_VISIBLE_MS: number = 3000;
+// Mouse-only hot zone: a thin strip along the window's top edge. Touch devices
+// do NOT get this strip (it would steal touches aimed at the remote top edge);
+// they get the small centre handle instead.
+const TOOLBAR_HOTZONE_HEIGHT_VP: number = 6;
+const TOOLBAR_HANDLE_WIDTH_VP: number = 64;
+const TOOLBAR_HANDLE_HEIGHT_VP: number = 20;
+
+// --- PC remote-resolution follow -------------------------------------------
+// On a 2-in-1 the remote desktop is asked to match the picture area, capped at
+// 1920x1200 physical pixels. Requests are debounced so a drag does not emit
+// one per frame, and a session stops following for good after a refusal /
+// timeout. Phones/tablets never request: their window is the screen and the
+// remote picture is scaled to fit instead.
+const FOLLOW_MAX_WIDTH_PX: number = 1920;
+const FOLLOW_MAX_HEIGHT_PX: number = 1200;
+const FOLLOW_MIN_WIDTH_PX: number = 640;
+const FOLLOW_MIN_HEIGHT_PX: number = 400;
+const FOLLOW_SETTLE_MS: number = 500;
+const FOLLOW_TIMEOUT_MS: number = 3000;
+const FOLLOW_TOLERANCE_PX: number = 2;
+
+// --- Fullscreen -------------------------------------------------------------
+// recover() resolves before the window manager has re-laid out the restored
+// window, so the rect is read again after the restore settles. The fullscreen
+// flag itself still flips as soon as recover() returns.
+const FULLSCREEN_RECT_LOG_DELAY_MS: number = 300;
 
 interface RemoteRouterParams {
   sessionId?: string;
@@ -252,6 +295,62 @@ struct Remote {
   private ownWindowName: string = '';
   private ownWindow: window.Window | undefined = undefined;
   private windowEventCallback: ((event: window.WindowEventType) => void) | undefined = undefined;
+  private windowStatusCallback: ((status: window.WindowStatusType) => void) | undefined = undefined;
+  // --- Fullscreen (per session window) --------------------------------------
+  // Whether THIS window is in full screen. It is page state, not a process-wide
+  // singleton: every session has its own window and its own Remote page, so
+  // toggling one session can never change another session's presentation.
+  @State private fullscreen: boolean = false;
+  // Window rectangle captured immediately before entering full screen. The
+  // system restores the window from its own snapshot in recover(); this copy is
+  // only logged so the real-device run can compare the restored rectangle with
+  // the pre-fullscreen one.
+  private fullscreenRestoreRect: window.Rect | undefined = undefined;
+  // Serialises enter/exit: maximize()/recover() are async and a double toggle
+  // must not interleave two window-state transitions.
+  private fullscreenBusy: boolean = false;
+  // --- Floating operation bar ------------------------------------------------
+  @State private toolbarVisible: boolean = false;
+  // Pinned = no automatic retraction; a second press on "固定" restores it.
+  @State private toolbarPinned: boolean = false;
+  // While the pointer is over the bar / hot zone the locally drawn remote
+  // cursor is unmounted: the system pointer is visible there and a stale
+  // remote cursor image would be left floating over the picture.
+  @State private cursorOverlayHidden: boolean = false;
+  private toolbarHideTimer: number = -1;
+  private toolbarIntroShown: boolean = false;
+  // True while the pointer is over the bar itself: re-arming auto-hide (unpin)
+  // must not retract the bar under the cursor.
+  private toolbarHovered: boolean = false;
+  private disconnectRequested: boolean = false;
+  // Touch-first layout: no mouse hot zone, a centre handle instead. A phone has
+  // no title bar at all, so the fullscreen button is meaningless there.
+  private readonly touchUi: boolean =
+    deviceInfo.deviceType === 'phone' || deviceInfo.deviceType === 'tablet';
+  private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
+  // --- PC remote-resolution follow -------------------------------------------
+  // 2in1 only. resizeDisabled is sticky for this page/window: a refusal, a
+  // timeout or a false return permanently stops automatic requests here, even
+  // across a reconnect (the page instance survives reconnects).
+  private readonly followRemoteSize: boolean = deviceInfo.deviceType === '2in1';
+  private resizeDisabled: boolean = false;
+  private resizeFollowTimer: number = -1;
+  private resizeTimeoutTimer: number = -1;
+  private resizePending: boolean = false;
+  private resizePendingSinceMs: number = 0;
+  // Remote size reported by sessionStatus() at request time / right now.
+  private remoteDesktopW: number = 0;
+  private remoteDesktopH: number = 0;
+  private resizeBaselineW: number = 0;
+  private resizeBaselineH: number = 0;
+  // Last target actually sent. A given target is sent at most once; this is
+  // what prevents "still a few pixels off" request loops.
+  private resizeRequestedW: number = 0;
+  private resizeRequestedH: number = 0;
+  // Latest target seen while a request was in flight, so a window that changed
+  // during settlement can be evaluated once afterwards.
+  private resizeWantedW: number = 0;
+  private resizeWantedH: number = 0;
   private lastTouchX: number = -1;
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
@@ -459,6 +558,14 @@ struct Remote {
     // even before the first connection status arrives.
     this.sessionResolved = true;
     this.startPolling();
+    // Introduce the floating bar once: show it for a few seconds so the user
+    // knows it exists, then let the normal auto-hide timer retract it (unless
+    // the user pins it or moves the pointer into the hot zone meanwhile).
+    if (!this.toolbarIntroShown) {
+      this.toolbarIntroShown = true;
+      this.showToolbar();
+      this.scheduleToolbarHide(TOOLBAR_INTRO_VISIBLE_MS);
+    }
   }
 
   /**
@@ -496,6 +603,15 @@ struct Remote {
     this.tornDown = true;
     this.stopFrameTimer();
     this.stopIdleTimer();
+    this.cancelToolbarHide();
+    if (this.resizeFollowTimer >= 0) {
+      clearTimeout(this.resizeFollowTimer);
+      this.resizeFollowTimer = -1;
+    }
+    if (this.resizeTimeoutTimer >= 0) {
+      clearTimeout(this.resizeTimeoutTimer);
+      this.resizeTimeoutTimer = -1;
+    }
     // Drop pending view-transform work before the surface goes away: the
     // timers would otherwise fire against a detached renderer.
     this.cancelViewSendTimer();
@@ -607,6 +723,20 @@ struct Remote {
       own.on('windowEvent', callback);
       this.ownWindow = own;
       this.windowEventCallback = callback;
+      // The window itself is the authority on whether it is really in
+      // full screen: the system can also enter/leave it without this page
+      // (Esc, system gestures). 'windowStatusChange' reports every transition;
+      // unsupported devices keep the local flag as the only source.
+      const statusCallback = (status: window.WindowStatusType): void => {
+        this.onWindowStatusChange(status);
+      };
+      try {
+        own.on('windowStatusChange', statusCallback);
+        this.windowStatusCallback = statusCallback;
+      } catch (statusError) {
+        hilog.warn(DOMAIN, TAG, '监听窗口状态失败（全屏状态仍由本地标志兜底）：%{public}s',
+          String(statusError));
+      }
     } catch (error) {
       hilog.warn(DOMAIN, TAG, '监听窗口事件失败（改用页面生命周期）：%{public}s', String(error));
     }
@@ -615,13 +745,24 @@ struct Remote {
   private detachWindowEvents(): void {
     const own = this.ownWindow;
     const callback = this.windowEventCallback;
+    const statusCallback = this.windowStatusCallback;
     this.ownWindow = undefined;
     this.windowEventCallback = undefined;
-    if (own === undefined || callback === undefined) {
+    this.windowStatusCallback = undefined;
+    if (own === undefined) {
       return;
     }
     try {
-      own.off('windowEvent', callback);
+      if (callback !== undefined) {
+        own.off('windowEvent', callback);
+      }
+    } catch (error) {
+      // The window may already be destroyed; the listener dies with it.
+    }
+    try {
+      if (statusCallback !== undefined) {
+        own.off('windowStatusChange', statusCallback);
+      }
     } catch (error) {
       // The window may already be destroyed; the listener dies with it.
     }
@@ -638,6 +779,488 @@ struct Remote {
     } else if (event === window.WindowEventType.WINDOW_SHOWN) {
       this.setPageVisible(true);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Fullscreen, one state per session window.
+  //
+  // A remote session is a main window with a system title bar. On a 2-in-1/PC
+  // the documented way to make that window occupy the whole screen with no
+  // title bar, no dock and no status bar is maximize() with
+  // MaximizePresentation.ENTER_IMMERSIVE_DISABLE_TITLE_AND_DOCK_HOVER: the
+  // window enters WindowStatusType.FULL_SCREEN and the title bar/dock stay
+  // hidden even when the cursor reaches the hot zone. recover() is the
+  // documented reverse: it returns the main window from full screen/maximized
+  // to FLOATING with the size and position it had before entering, which is
+  // exactly what the floating-bar button will need.
+  //
+  // Both calls are made on THIS page's own window (ownWindow / the window name
+  // from getUIContext().getWindowName()); there is no cross-window registry.
+  // The page only exists after RemoteAbility's loadContent(), so the window is
+  // already created and shown when a user can invoke the toggle.
+  // -------------------------------------------------------------------------
+
+  /** This page's own window; findWindow() is exact, unlike getLastWindow(). */
+  private fullscreenWindow(): window.Window | undefined {
+    if (this.ownWindow !== undefined) {
+      return this.ownWindow;
+    }
+    if (this.ownWindowName.length === 0) {
+      hilog.warn(DOMAIN, TAG, 'remote fullscreen 无法确定本窗口名，跳过全屏切换');
+      return undefined;
+    }
+    try {
+      return window.findWindow(this.ownWindowName);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote fullscreen 查找本窗口失败：%{public}s', String(error));
+      return undefined;
+    }
+  }
+
+  /** Window status as reported by the window manager, or undefined if unreadable. */
+  private currentWindowStatus(own: window.Window): window.WindowStatusType | undefined {
+    try {
+      return own.getWindowStatus();
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote fullscreen 读取窗口状态失败：%{public}s', String(error));
+      return undefined;
+    }
+  }
+
+  /**
+   * Keeps the page's full-screen flag in line with the window. The operation
+   * bar sets the flag immediately for feedback, but the system can also enter
+   * or leave full screen on its own (Esc / system gesture); this event makes
+   * the window the final authority. MINIMIZE says nothing about full screen (a
+   * minimized full-screen window is restored as it was), and UNDEFINED is not a
+   * real state, so neither changes the flag.
+   */
+  private onWindowStatusChange(status: window.WindowStatusType): void {
+    if (status === window.WindowStatusType.FULL_SCREEN) {
+      if (!this.fullscreen) {
+        this.fullscreen = true;
+        hilog.info(DOMAIN, TAG,
+          'remote fullscreen synced session=%{public}s entered', this.sessionId);
+      }
+      return;
+    }
+    if (status === window.WindowStatusType.MINIMIZE ||
+        status === window.WindowStatusType.UNDEFINED) {
+      return;
+    }
+    if (this.fullscreen) {
+      this.fullscreen = false;
+      hilog.info(DOMAIN, TAG,
+        'remote fullscreen synced session=%{public}s exited status=%{public}d',
+        this.sessionId, status);
+    }
+  }
+
+  /** Enters full screen; safe to call when already full screen. */
+  private async enterFullscreen(): Promise<void> {
+    if (this.fullscreen || this.fullscreenBusy || this.disposed) {
+      return;
+    }
+    const own = this.fullscreenWindow();
+    if (own === undefined) {
+      return;
+    }
+    if (this.currentWindowStatus(own) === window.WindowStatusType.FULL_SCREEN) {
+      // Already full screen (for example the system entered it and this page
+      // has not caught up yet): only sync the flag, do not maximize again.
+      this.fullscreen = true;
+      hilog.info(DOMAIN, TAG, 'remote fullscreen already entered session=%{public}s', this.sessionId);
+      return;
+    }
+    this.fullscreenBusy = true;
+    try {
+      const rect = own.getWindowProperties().windowRect;
+      this.fullscreenRestoreRect = rect;
+      hilog.info(DOMAIN, TAG,
+        'remote fullscreen enter session=%{public}s restore=[%{public}d,%{public}d,%{public}d,%{public}d]',
+        this.sessionId, rect.left, rect.top, rect.width, rect.height);
+      await own.maximize(window.MaximizePresentation.ENTER_IMMERSIVE_DISABLE_TITLE_AND_DOCK_HOVER);
+      this.fullscreen = true;
+      hilog.info(DOMAIN, TAG, 'remote fullscreen entered session=%{public}s', this.sessionId);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote fullscreen 进入失败：%{public}s', String(error));
+    } finally {
+      this.fullscreenBusy = false;
+    }
+  }
+
+  /** Leaves full screen and restores the pre-fullscreen floating geometry. */
+  private async exitFullscreen(): Promise<void> {
+    if (!this.fullscreen || this.fullscreenBusy || this.disposed) {
+      return;
+    }
+    const own = this.fullscreenWindow();
+    if (own === undefined) {
+      return;
+    }
+    const current = this.currentWindowStatus(own);
+    if (current !== undefined && current !== window.WindowStatusType.FULL_SCREEN) {
+      // The system may already have left full screen on its own (Esc / system
+      // gesture) while this page had not caught up. recover() on a window that
+      // is already floating is error 1300001, so never call it: just bring the
+      // page state in line with the window.
+      this.fullscreen = false;
+      hilog.info(DOMAIN, TAG,
+        'remote fullscreen exit session=%{public}s window already status=%{public}d, skip recover',
+        this.sessionId, current);
+      return;
+    }
+    this.fullscreenBusy = true;
+    try {
+      await own.recover();
+      this.fullscreen = false;
+      // recover() returns before the restored geometry has been applied: reading
+      // the rect here still reports the fullscreen rectangle. Log it once the
+      // restore has settled; an unreadable rect is still logged as such.
+      setTimeout((): void => {
+        try {
+          const rect = own.getWindowProperties().windowRect;
+          hilog.info(DOMAIN, TAG,
+            'remote fullscreen exit session=%{public}s rect=[%{public}d,%{public}d,%{public}d,%{public}d]',
+            this.sessionId, rect.left, rect.top, rect.width, rect.height);
+        } catch (rectError) {
+          hilog.info(DOMAIN, TAG,
+            'remote fullscreen exit session=%{public}s rect=unavailable error=%{public}s',
+            this.sessionId, String(rectError));
+        }
+      }, FULLSCREEN_RECT_LOG_DELAY_MS);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote fullscreen 退出失败：%{public}s', String(error));
+    } finally {
+      this.fullscreenBusy = false;
+    }
+  }
+
+  /** Toggle entry point for the in-page floating operation bar. */
+  private async toggleFullscreen(): Promise<void> {
+    if (this.fullscreen) {
+      await this.exitFullscreen();
+    } else {
+      await this.enterFullscreen();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Floating operation bar: show/hide state machine and its window actions.
+  // The bar is a sibling of remote_area, so the pointer handlers below never
+  // reach sendPointer/sendKey (those live only on remote_area / the page root).
+  // -------------------------------------------------------------------------
+
+  private showToolbar(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.cancelToolbarHide();
+    // The pointer is not assumed to be over the bar: the bar's own hover
+    // handler sets this as soon as it actually is.
+    this.toolbarHovered = false;
+    this.toolbarVisible = true;
+  }
+
+  /** Retracts the bar unless it is pinned; delay lets the pointer cross gaps. */
+  private scheduleToolbarHide(delayMs: number = TOOLBAR_HIDE_DELAY_MS): void {
+    if (this.disposed || this.toolbarPinned || this.toolbarHovered) {
+      return;
+    }
+    this.cancelToolbarHide();
+    this.toolbarHideTimer = setTimeout((): void => {
+      this.toolbarHideTimer = -1;
+      if (!this.toolbarPinned) {
+        this.toolbarHovered = false;
+        this.toolbarVisible = false;
+      }
+    }, delayMs);
+  }
+
+  private cancelToolbarHide(): void {
+    if (this.toolbarHideTimer >= 0) {
+      clearTimeout(this.toolbarHideTimer);
+      this.toolbarHideTimer = -1;
+    }
+  }
+
+  /** Explicit close of the bar (touch tap on the picture); pinned ignores it. */
+  private hideToolbar(): void {
+    if (this.toolbarPinned) {
+      return;
+    }
+    this.cancelToolbarHide();
+    this.toolbarHovered = false;
+    this.toolbarVisible = false;
+  }
+
+  private toggleToolbarPinned(): void {
+    this.toolbarPinned = !this.toolbarPinned;
+    if (this.toolbarPinned) {
+      this.cancelToolbarHide();
+      this.toolbarVisible = true;
+    } else if (!this.toolbarHovered) {
+      // Keep the bar under the cursor; leaving it arms the normal timer.
+      this.scheduleToolbarHide();
+    }
+  }
+
+  /** Minimises THIS session window (on a phone: sends it to the background). */
+  private minimizeThisWindow(): void {
+    const own = this.fullscreenWindow();
+    if (own === undefined) {
+      return;
+    }
+    own.minimize().catch((error: Error): void => {
+      hilog.warn(DOMAIN, TAG, 'remote toolbar 最小化失败：%{public}s', String(error));
+    });
+  }
+
+  /**
+   * Disconnect = the same terminal path as the title-bar X.
+   *
+   * That path is: the main window closes -> RemoteAbility.onWindowStageDestroy
+   * clears the window registry -> RemoteAbility.onDestroy calls
+   * closeSessionById(). windowStageClose() itself only logs and returns false
+   * (keep the default close); it contains no disconnect logic. destroyWindow()
+   * is not an option here: its documentation covers system / child / floating /
+   * modal windows, not an ability main window. terminateSelf() ends exactly this
+   * UIAbility instance, so onDestroy runs the same closeSessionById() and the
+   * list + tray observers get their normal notifyChanged() update. No second
+   * disconnect implementation is introduced.
+   */
+  private disconnectThisSession(): void {
+    if (this.disconnectRequested || this.disposed) {
+      return;
+    }
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      hilog.warn(DOMAIN, TAG, 'remote toolbar 断开失败：拿不到 host context');
+      return;
+    }
+    this.disconnectRequested = true;
+    hilog.info(DOMAIN, TAG, 'remote toolbar disconnect session=%{public}s', this.sessionId);
+    const ability: common.UIAbilityContext = context as common.UIAbilityContext;
+    const close: () => void = (): void => {
+      ability.terminateSelf().catch((error: Error): void => {
+        this.disconnectRequested = false;
+        hilog.warn(DOMAIN, TAG, 'remote toolbar 断开失败：%{public}s', String(error));
+      });
+    };
+    // A session window restored from the task switcher leaves the connection
+    // list in the background; raise it before this instance goes away, or the
+    // phone lands on the launcher after disconnecting. 2-in-1 already has the
+    // list visible behind the session window.
+    if (deviceInfo.deviceType === '2in1') {
+      close();
+      return;
+    }
+    const listWant: Want = {
+      bundleName: ability.abilityInfo.bundleName,
+      abilityName: 'EntryAbility'
+    };
+    ability.startAbility(listWant).then((): void => {
+      close();
+    }).catch((error: Error): void => {
+      hilog.warn(DOMAIN, TAG, 'remote toolbar 断开前恢复主列表失败：%{public}s', String(error));
+      close();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Remote resolution follow (PC / 2-in-1 only).
+  //
+  // Target = the XComponent surface in PHYSICAL pixels, proportionally scaled
+  // down to 1920x1200 and rounded to even numbers. A session that is refused,
+  // times out or whose request is not accepted stops following permanently;
+  // a target is sent at most once, so an approximate server answer cannot
+  // trigger a "few pixels off" loop.
+  // -------------------------------------------------------------------------
+
+  /** Target remote size in px, or [] when this session must not request one. */
+  private resizeTarget(): number[] {
+    if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
+      return [];
+    }
+    if (this.viewWidth <= 0 || this.viewHeight <= 0) {
+      return [];
+    }
+    let width = 0;
+    let height = 0;
+    try {
+      // vp2px uses this window's density; the XComponent surface is allocated
+      // at this physical size, so this is the picture area in px (not vp).
+      const ui = this.getUIContext();
+      width = Math.round(ui.vp2px(this.viewWidth));
+      height = Math.round(ui.vp2px(this.viewHeight));
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote resize 读取 surface 物理尺寸失败：%{public}s', String(error));
+      return [];
+    }
+    if (width <= 0 || height <= 0) {
+      return [];
+    }
+    const scale = Math.min(1, FOLLOW_MAX_WIDTH_PX / width, FOLLOW_MAX_HEIGHT_PX / height);
+    // Round, then keep the value even and never above the rounded cap.
+    const targetW = Math.floor(Math.round(width * scale) / 2) * 2;
+    const targetH = Math.floor(Math.round(height * scale) / 2) * 2;
+    if (targetW < FOLLOW_MIN_WIDTH_PX || targetH < FOLLOW_MIN_HEIGHT_PX) {
+      return [];
+    }
+    return [targetW, targetH];
+  }
+
+  /** (Re)starts the debounce; only a real area size change calls this. */
+  private scheduleResizeFollow(delayMs: number = FOLLOW_SETTLE_MS): void {
+    if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
+      return;
+    }
+    if (this.resizeFollowTimer >= 0) {
+      clearTimeout(this.resizeFollowTimer);
+    }
+    this.resizeFollowTimer = setTimeout((): void => {
+      this.resizeFollowTimer = -1;
+      this.maybeRequestRemoteSize();
+    }, delayMs);
+  }
+
+  private maybeRequestRemoteSize(): void {
+    if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
+      return;
+    }
+    if (!this.canvasShown || this.lastState !== SESSION_STATE_CONNECTED) {
+      return;
+    }
+    const target = this.resizeTarget();
+    if (target.length !== 2) {
+      return;
+    }
+    const targetW = target[0];
+    const targetH = target[1];
+    // Remember the newest target even while a request is in flight; the
+    // settle path may re-evaluate it once.
+    this.resizeWantedW = targetW;
+    this.resizeWantedH = targetH;
+    if (this.resizePending) {
+      return;
+    }
+    if (this.remoteDesktopW <= 0 || this.remoteDesktopH <= 0) {
+      hilog.info(DOMAIN, TAG, 'remote resize 尚无远端宽高，跳过本次请求 session=%{public}s',
+        this.sessionId);
+      return;
+    }
+    if (Math.abs(targetW - this.remoteDesktopW) <= FOLLOW_TOLERANCE_PX &&
+        Math.abs(targetH - this.remoteDesktopH) <= FOLLOW_TOLERANCE_PX) {
+      return;
+    }
+    if (targetW === this.resizeRequestedW && targetH === this.resizeRequestedH) {
+      // Same target already sent once: never repeat it for an approximate
+      // server answer. Only a genuinely new target may send again.
+      return;
+    }
+    this.requestRemoteSize(targetW, targetH);
+  }
+
+  private requestRemoteSize(targetW: number, targetH: number): void {
+    const beforeW = this.remoteDesktopW;
+    const beforeH = this.remoteDesktopH;
+    const accepted = requestDesktopSize(this.sessionId, targetW, targetH);
+    this.resizeRequestedW = targetW;
+    this.resizeRequestedH = targetH;
+    if (!accepted) {
+      hilog.warn(DOMAIN, TAG,
+        'remote resize 请求未被受理 session=%{public}s target=%{public}dx%{public}d remote=%{public}dx%{public}d',
+        this.sessionId, targetW, targetH, beforeW, beforeH);
+      this.disableResizeFollow('requestDesktopSize returned false');
+      return;
+    }
+    this.resizePending = true;
+    this.resizePendingSinceMs = Date.now();
+    this.resizeBaselineW = beforeW;
+    this.resizeBaselineH = beforeH;
+    hilog.info(DOMAIN, TAG,
+      'remote resize request session=%{public}s target=%{public}dx%{public}d remoteBefore=%{public}dx%{public}d',
+      this.sessionId, targetW, targetH, beforeW, beforeH);
+    if (this.resizeTimeoutTimer >= 0) {
+      clearTimeout(this.resizeTimeoutTimer);
+    }
+    this.resizeTimeoutTimer = setTimeout((): void => {
+      this.resizeTimeoutTimer = -1;
+      if (!this.resizePending) {
+        return;
+      }
+      // Final look at the status right at the deadline: the poll runs every
+      // 250 ms and a change landing just before 3 s must not be misread as
+      // "no response".
+      const latest = sessionStatus(this.sessionId);
+      if (latest !== undefined && latest.width > 0 && latest.height > 0 &&
+          (latest.width !== this.resizeBaselineW || latest.height !== this.resizeBaselineH)) {
+        this.remoteDesktopW = latest.width;
+        this.remoteDesktopH = latest.height;
+        this.settleResize(true, 'remote-size-changed-at-timeout');
+        return;
+      }
+      hilog.warn(DOMAIN, TAG,
+        'remote resize 无响应 session=%{public}s target=%{public}dx%{public}d waited=%{public}dms',
+        this.sessionId, targetW, targetH, Date.now() - this.resizePendingSinceMs);
+      this.settleResize(false, 'no-size-change-within-timeout');
+    }, FOLLOW_TIMEOUT_MS);
+  }
+
+  /** Called from the status poll: a remote size change settles the request. */
+  private settleResize(success: boolean, reason: string): void {
+    if (!this.resizePending) {
+      return;
+    }
+    this.resizePending = false;
+    if (this.resizeTimeoutTimer >= 0) {
+      clearTimeout(this.resizeTimeoutTimer);
+      this.resizeTimeoutTimer = -1;
+    }
+    const afterW = this.remoteDesktopW;
+    const afterH = this.remoteDesktopH;
+    if (!success) {
+      hilog.warn(DOMAIN, TAG,
+        'remote resize settle session=%{public}s target=%{public}dx%{public}d before=%{public}dx%{public}d' +
+        ' after=%{public}dx%{public}d verdict=disabled reason=%{public}s',
+        this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
+        this.resizeBaselineW, this.resizeBaselineH, afterW, afterH, reason);
+      this.disableResizeFollow(reason);
+      return;
+    }
+    hilog.info(DOMAIN, TAG,
+      'remote resize settled session=%{public}s target=%{public}dx%{public}d before=%{public}dx%{public}d' +
+      ' after=%{public}dx%{public}d verdict=size-changed',
+      this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
+      this.resizeBaselineW, this.resizeBaselineH, afterW, afterH);
+    // The window may have moved on while the request was in flight. Re-check
+    // the latest target once; the same-target guard still applies.
+    if (!this.resizeDisabled &&
+        (this.resizeWantedW !== this.resizeRequestedW ||
+         this.resizeWantedH !== this.resizeRequestedH)) {
+      this.scheduleResizeFollow(200);
+    }
+  }
+
+  /** Sticky for this page/window: no further automatic requests. */
+  private disableResizeFollow(reason: string): void {
+    if (this.resizeDisabled) {
+      return;
+    }
+    this.resizeDisabled = true;
+    this.resizePending = false;
+    if (this.resizeFollowTimer >= 0) {
+      clearTimeout(this.resizeFollowTimer);
+      this.resizeFollowTimer = -1;
+    }
+    if (this.resizeTimeoutTimer >= 0) {
+      clearTimeout(this.resizeTimeoutTimer);
+      this.resizeTimeoutTimer = -1;
+    }
+    hilog.warn(DOMAIN, TAG,
+      'remote resize follow disabled session=%{public}s target=%{public}dx%{public}d remote=%{public}dx%{public}d reason=%{public}s',
+      this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
+      this.remoteDesktopW, this.remoteDesktopH, reason);
   }
 
   // -------------------------------------------------------------------------
@@ -746,6 +1369,9 @@ struct Remote {
     }
     if (stats.frames > 0 && !this.canvasShown) {
       this.canvasShown = true;
+      // First frame on the GL path: give the status one poll to report the
+      // remote size, then issue the PC resolution-follow request once.
+      this.scheduleResizeFollow();
     }
     // Input mapping and cursor placement must follow the PRESENTED geometry
     // (the texture), not the lagging status poll: on a remote resolution
@@ -1116,6 +1742,8 @@ struct Remote {
       this.forceFull = false;
       if (!this.canvasShown) {
         this.canvasShown = true;
+        // First frame on the Canvas path: same one-shot follow request.
+        this.scheduleResizeFollow();
       }
     } catch (error) {
       hilog.error(DOMAIN, TAG, '应用画面失败：%{public}s', String(error));
@@ -1288,6 +1916,22 @@ struct Remote {
   private applyStatus(status: SessionStatus): void {
     const width = status.width === undefined ? 0 : status.width;
     const height = status.height === undefined ? 0 : status.height;
+    // Authoritative "remote current size" for the resolution follow (the
+    // status fields, not the presented texture, which can lag a generation).
+    if (width > 0 && height > 0) {
+      this.remoteDesktopW = width;
+      this.remoteDesktopH = height;
+    }
+    if (this.followRemoteSize && !this.resizeDisabled) {
+      const support = status.resizeSupport;
+      if (support === 'rejected') {
+        this.disableResizeFollow('resizeSupport=rejected');
+      } else if (this.resizePending && width > 0 && height > 0 &&
+          (width !== this.resizeBaselineW || height !== this.resizeBaselineH)) {
+        // ANY remote size change settles the request, exact or approximate.
+        this.settleResize(true, 'remote-size-changed');
+      }
+    }
     if (!USE_GL_RENDER && width > 0 && height > 0 &&
         (width !== this.frameWidth || height !== this.frameHeight)) {
       // Canvas path: the local mirror must be rebuilt for the new size. The
@@ -2831,7 +3475,8 @@ struct Remote {
                     this.canvasReady = true;
                   })
               }
-              if (this.cursorPm !== undefined && this.cursorLeft >= -64) {
+              if (!this.cursorOverlayHidden && this.cursorPm !== undefined &&
+                  this.cursorLeft >= -64) {
                 Image(this.cursorPm)
                   .width(this.cursorDrawW)
                   .height(this.cursorDrawH)
@@ -2872,6 +3517,9 @@ struct Remote {
               if (USE_GL_RENDER) {
                 this.handleViewResize();
               }
+              // PC: ask the remote desktop to match this new picture size once
+              // the drag settles. Fullscreen/maximize go through the same path.
+              this.scheduleResizeFollow();
             }
             this.placeCursor();
           })
@@ -2881,6 +3529,10 @@ struct Remote {
             this.forwardWheel(event);
           })
           .onHover((isHover: boolean) => {
+            // The system pointer is shown outside the picture; the locally
+            // drawn remote cursor must not stay behind as a ghost when the
+            // pointer moves up into the hot zone / operation bar.
+            this.cursorOverlayHidden = !isHover;
             this.setHostCursorVisible(!isHover);
           })
           .onTouch((event: TouchEvent) => {
@@ -2946,6 +3598,12 @@ struct Remote {
               this.placeCursor();
             }
             if (event.type === TouchType.Down) {
+              // A touch on the picture means the pointer is no longer over the
+              // bar: restore the local cursor and retract the bar (unless the
+              // user pinned it). This stays inside the existing touch path;
+              // no pointer event is added or removed by it.
+              this.cursorOverlayHidden = false;
+              this.hideToolbar();
               this.requestViewFocus();
               // Do not press yet: this touch may still become a pinch, a tap
               // or a long press. The mask-0 move keeps the remote pointer (and
@@ -3007,6 +3665,9 @@ struct Remote {
             this.cancelLongPress('mouse');
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
+            // The pointer is back over the picture: show the local cursor again
+            // (it was suppressed while the pointer was on the operation bar).
+            this.cursorOverlayHidden = false;
             // The local cursor follows every pointer event; the poll only acts
             // as the fallback for server-side shape/size changes.
             this.placeCursor();
@@ -3073,6 +3734,163 @@ struct Remote {
             .height('100%')
             .justifyContent(FlexAlign.Center)
             .hitTestBehavior(HitTestMode.None)
+          }
+          // ---- Floating operation bar -------------------------------------
+          // Everything below is a SIBLING of remote_area inside this Stack, so
+          // its mouse/touch events are hit-tested here and never enter the
+          // remote pointer/key paths bound to remote_area or the page root.
+          if (!this.touchUi) {
+            // Mouse: a thin top-edge hot zone summons the bar.
+            Row()
+              .width('100%')
+              .height(TOOLBAR_HOTZONE_HEIGHT_VP)
+              .position({ x: 0, y: 0 })
+              .backgroundColor(Color.Transparent)
+              .onHover((isHover: boolean) => {
+                if (isHover) {
+                  this.cursorOverlayHidden = true;
+                  this.showToolbar();
+                } else {
+                  this.scheduleToolbarHide();
+                }
+              })
+          } else {
+            // Touch: a small centre handle instead of a full-width hot zone, so
+            // touches aimed at the remote top edge are not stolen.
+            Stack({ alignContent: Alignment.Center }) {
+              Row()
+                .width(48)
+                .height(4)
+                .borderRadius(2)
+                .backgroundColor('#66FFFFFF')
+            }
+            .width(TOOLBAR_HANDLE_WIDTH_VP)
+            .height(TOOLBAR_HANDLE_HEIGHT_VP)
+            .position({ x: '50%', y: 0 })
+            .translate({ x: '-50%' })
+            .onClick(() => {
+              this.cursorOverlayHidden = true;
+              this.showToolbar();
+            })
+          }
+          if (this.toolbarVisible) {
+            Row() {
+              Text(this.toolbarPinned ? '取消固定' : '固定')
+                .fontSize(12)
+                .fontColor('#F2F2F2')
+                .textAlign(TextAlign.Center)
+                .layoutWeight(1)
+                .height('100%')
+                .borderRadius(12)
+                .backgroundColor(this.toolbarPinned ? '#33FFFFFF' : Color.Transparent)
+                .onClick(() => {
+                  this.toggleToolbarPinned();
+                })
+                .onHover((isHover: boolean) => {
+                  if (isHover) {
+                    this.toolbarHovered = true;
+                    this.cancelToolbarHide();
+                  } else {
+                    this.toolbarHovered = false;
+                    this.scheduleToolbarHide();
+                  }
+                })
+              Text('最小化')
+                .fontSize(12)
+                .fontColor('#F2F2F2')
+                .textAlign(TextAlign.Center)
+                .layoutWeight(1)
+                .height('100%')
+                .borderRadius(12)
+                .onClick(() => {
+                  this.minimizeThisWindow();
+                  if (this.touchUi) {
+                    this.hideToolbar();
+                  }
+                })
+                .onHover((isHover: boolean) => {
+                  if (isHover) {
+                    this.toolbarHovered = true;
+                    this.cancelToolbarHide();
+                  } else {
+                    this.toolbarHovered = false;
+                    this.scheduleToolbarHide();
+                  }
+                })
+              if (!this.phoneUi) {
+                Text(this.fullscreen ? '退出全屏' : '全屏')
+                  .fontSize(12)
+                  .fontColor('#F2F2F2')
+                  .textAlign(TextAlign.Center)
+                  .layoutWeight(1)
+                  .height('100%')
+                  .borderRadius(12)
+                  .onClick(() => {
+                    this.toggleFullscreen();
+                    if (this.touchUi) {
+                      this.hideToolbar();
+                    }
+                  })
+                  .onHover((isHover: boolean) => {
+                    if (isHover) {
+                      this.toolbarHovered = true;
+                      this.cancelToolbarHide();
+                    } else {
+                      this.toolbarHovered = false;
+                      this.scheduleToolbarHide();
+                    }
+                  })
+              }
+              Text('断开')
+                .fontSize(12)
+                .fontColor('#FFB4AB')
+                .textAlign(TextAlign.Center)
+                .layoutWeight(1)
+                .height('100%')
+                .borderRadius(12)
+                .onClick(() => {
+                  this.disconnectThisSession();
+                })
+                .onHover((isHover: boolean) => {
+                  if (isHover) {
+                    this.toolbarHovered = true;
+                    this.cancelToolbarHide();
+                  } else {
+                    this.toolbarHovered = false;
+                    this.scheduleToolbarHide();
+                  }
+                })
+            }
+            .width('92%')
+            .constraintSize({ maxWidth: TOOLBAR_WIDTH_VP })
+            .height(TOOLBAR_HEIGHT_VP)
+            .padding({ left: 6, right: 6 })
+            .alignItems(VerticalAlign.Center)
+            .backgroundColor('#CC202124')
+            .borderRadius(TOOLBAR_HEIGHT_VP / 2)
+            .position({ x: '50%', y: TOOLBAR_TOP_VP })
+            .translate({ x: '-50%' })
+            .shadow({ radius: 8, color: '#66000000', offsetY: 2 })
+            // Any mouse movement over the bar (including over its buttons)
+            // keeps it alive; the retraction timer only wins once the pointer
+            // has left the bar and the hot zone.
+            .onMouse((event: MouseEvent) => {
+              this.cursorOverlayHidden = true;
+              this.cancelToolbarHide();
+            })
+            .onHover((isHover: boolean) => {
+              if (isHover) {
+                this.toolbarHovered = true;
+                this.cursorOverlayHidden = true;
+                this.cancelToolbarHide();
+              } else {
+                this.toolbarHovered = false;
+                this.scheduleToolbarHide();
+              }
+            })
+            .transition(TransitionEffect.translate({ y: -TOOLBAR_HEIGHT_VP })
+              .combine(TransitionEffect.OPACITY)
+              .animation({ duration: 200, curve: Curve.EaseOut }))
           }
         }
         .width('100%')

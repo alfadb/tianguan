@@ -27,6 +27,7 @@
  * the window.
  */
 import { window } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import type { common, Want } from '@kit.AbilityKit';
 import { closeSessionById, findSession } from '../model/SessionRegistry';
@@ -143,6 +144,141 @@ export function clearRemoteWindowRegistry(sessionId: string, windowName: string)
 }
 
 /**
+ * Context of the UIAbility that hosts each session window, keyed by session id.
+ *
+ * A phone cannot restore a minimized ability main window in-process: on
+ * OpenHarmony 7.0.0.111 (API 26) Window.restore(), show(), showWindow(),
+ * maximize(), recover(), raiseToAppTop() and UIAbilityContext.showAbility() /
+ * startSelf() all fail with 801 or leave the window at MINIMIZE; the documented
+ * restore path is the system dock / recents. The one app-side way that works is
+ * to rebuild the window: terminate that instance WITHOUT closing its session and
+ * start a fresh instance for the same session. Terminating needs the instance's
+ * own context, hence this registry (process-local, like AppStorage).
+ */
+const remoteAbilityContexts: Map<string, common.UIAbilityContext> =
+  new Map<string, common.UIAbilityContext>();
+
+export function registerRemoteAbilityContext(sessionId: string,
+  ctx: common.UIAbilityContext): void {
+  remoteAbilityContexts.set(sessionId, ctx);
+}
+
+export function unregisterRemoteAbilityContext(sessionId: string): void {
+  remoteAbilityContexts.delete(sessionId);
+}
+
+/**
+ * Per-session "reopen" request. RemoteAbility.onDestroy sees it and terminates
+ * without ending the session, so the instance started right afterwards can take
+ * the same session over.
+ */
+export const REOPEN_KEY_PREFIX: string = 'remote.reopen.';
+
+export function remoteReopenKeyForSession(sessionId: string): string {
+  return REOPEN_KEY_PREFIX + sessionId;
+}
+
+/**
+ * A minimized main window is not brought back by show(): restore() is the
+ * documented reverse of minimize() on a 2-in-1. Check the status first so a
+ * window that is not minimized takes exactly the previous show() path, and
+ * treat "cannot read the status" as not minimized rather than as a failure.
+ */
+async function restoreIfMinimized(existing: window.Window, windowName: string): Promise<void> {
+  try {
+    if (existing.getWindowStatus() !== window.WindowStatusType.MINIMIZE) {
+      return;
+    }
+  } catch (statusError) {
+    return;
+  }
+  // Only 2-in-1 windows can be restored in-process; phones/tablets take the
+  // reopen path in openRemoteWindowOnce() and never reach this call.
+  if (deviceInfo.deviceType !== '2in1') {
+    return;
+  }
+  try {
+    await existing.restore();
+    log('restore', windowName);
+  } catch (restoreError) {
+    hilog.warn(DOMAIN, TAG, '最小化的远程窗口还原失败：%{public}s', String(restoreError));
+  }
+}
+
+/** How long a reopen waits for the old window to vanish and the new one to appear. */
+const REOPEN_WAIT_TIMEOUT_MS: number = 3000;
+const REOPEN_POLL_MS: number = 50;
+
+/**
+ * Rebuilds the window of a minimized session on phones/tablets.
+ *
+ * The minimized ability cannot be restored in-process (see
+ * remoteAbilityContexts above), so this terminates the hosting instance with the
+ * reopen request set — onDestroy then keeps the session instead of closing it —
+ * and starts a fresh RemoteAbility instance for the same session. The page of
+ * the new instance attaches to the live session, so the picture comes back
+ * without a reconnect.
+ *
+ * Returns false when anything fails; the caller then falls back to the ordinary
+ * activation attempt and the list keeps showing the session as connected.
+ */
+async function reopenMinimizedWindow(context: common.UIAbilityContext, windowName: string,
+  sessionId: string, displayName?: string): Promise<boolean> {
+  const ownCtx: common.UIAbilityContext | undefined = remoteAbilityContexts.get(sessionId);
+  if (ownCtx === undefined) {
+    return false;
+  }
+  if (AppStorage.get<boolean>(remoteReopenKeyForSession(sessionId)) === true) {
+    // Another reopen for this session is already in flight. Touching the key or
+    // calling terminateSelf() again would make the old instance's onDestroy miss
+    // the request and disconnect the session the user is opening.
+    return false;
+  }
+  AppStorage.setOrCreate<boolean>(remoteReopenKeyForSession(sessionId), true);
+  try {
+    await ownCtx.terminateSelf();
+  } catch (error) {
+    AppStorage.delete(remoteReopenKeyForSession(sessionId));
+    hilog.warn(DOMAIN, TAG, '重开远程窗口失败：终止旧实例失败 %{public}s', String(error));
+    return false;
+  }
+  const goneDeadline: number = Date.now() + REOPEN_WAIT_TIMEOUT_MS;
+  while (Date.now() < goneDeadline && findWindowByName(windowName) !== undefined) {
+    await delay(REOPEN_POLL_MS);
+  }
+  if (findWindowByName(windowName) !== undefined) {
+    // Leave no reopen request behind: if this instance is destroyed later it
+    // must take the normal "window closed = disconnect" path.
+    AppStorage.delete(remoteReopenKeyForSession(sessionId));
+    hilog.warn(DOMAIN, TAG, '重开远程窗口失败：旧实例未退出 window=%{public}s', windowName);
+    return false;
+  }
+  const title: string = titleForSession(sessionId, displayName);
+  const want: Want = {
+    bundleName: context.abilityInfo.bundleName,
+    abilityName: REMOTE_ABILITY_NAME,
+    parameters: { sessionId: sessionId, title: title }
+  };
+  try {
+    await context.startAbility(want);
+  } catch (error) {
+    hilog.warn(DOMAIN, TAG, '重开远程窗口失败：启动新实例失败 %{public}s', String(error));
+    return false;
+  }
+  const startDeadline: number = Date.now() + REOPEN_WAIT_TIMEOUT_MS;
+  while (Date.now() < startDeadline) {
+    const name: string | undefined = AppStorage.get<string>(remoteWindowKeyForSession(sessionId));
+    if (name !== undefined && name.length > 0 && findWindowByName(name) !== undefined) {
+      log('reopen', name + ' session=' + sessionId);
+      return true;
+    }
+    await delay(REOPEN_POLL_MS);
+  }
+  hilog.warn(DOMAIN, TAG, '重开远程窗口失败：新窗口未出现 session=%{public}s', sessionId);
+  return false;
+}
+
+/**
  * Brings an already-running session window forward. show() is the required
  * step; the focus hand-off is best effort and only legal while the source window
  * is focused (window.shiftAppWindowFocus requires it). While the tray menu is
@@ -153,6 +289,7 @@ async function showExisting(existing: window.Window, windowName: string,
   sessionId: string): Promise<boolean> {
   // Re-assert the binding in case the page is reloading this window.
   AppStorage.setOrCreate(sessionKeyForWindow(windowName), sessionId);
+  await restoreIfMinimized(existing, windowName);
   try {
     await existing.show();
     return true;
@@ -274,6 +411,22 @@ async function openRemoteWindowOnce(sessionId: string, displayName?: string,
   if (registered !== undefined && registered.length > 0) {
     const existing = findWindowByName(registered);
     if (existing !== undefined) {
+      // Phones/tablets cannot restore a minimized ability main window in
+      // process; rebuild it while keeping the session. A 2-in-1 keeps the
+      // original activate path (restore() preserves the floating geometry).
+      let minimized: boolean = false;
+      try {
+        minimized = existing.getWindowStatus() === window.WindowStatusType.MINIMIZE;
+      } catch (statusError) {
+        minimized = false;
+      }
+      if (minimized && deviceInfo.deviceType !== '2in1' && context !== undefined) {
+        const reopened: boolean =
+          await reopenMinimizedWindow(context, registered, sessionId, displayName);
+        if (reopened) {
+          return 'opened';
+        }
+      }
       await activateExisting(existing, registered, sessionId);
       return 'activated';
     }
