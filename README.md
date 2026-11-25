@@ -8,7 +8,7 @@ GPL-3.0-or-later · 当前版本 1.0.0 · API 26+ · 包内支持手机 / 平板
 
 天关把每个远程会话做成一个独立窗口，从 Dock 或系统窗口选择器直接切换，主窗口只负责连接管理。它连接运行 VNC 或 RDP 服务的主机，包括 Windows、Linux 与树莓派。
 
-画面经原生 EGL/GLES 渲染，不经过 WebView。VNC 已在鸿蒙 PC 与手机验证，RDP 已在鸿蒙 PC 验证。1.0.0 尚未上架，也还没有预编译安装包。
+画面经原生 EGL/GLES 渲染，不经过 WebView。VNC 已在鸿蒙 PC 与手机验证，RDP 已在鸿蒙 PC 验证。1.0.0 已提交应用市场审核，尚未上架，也还没有预编译安装包。
 
 Tianguan (TG) is a native VNC and RDP client for HarmonyOS. Its name comes from a star gate in the *Jin Shu* (Book of Jin). The first release targets PC and 2-in-1 devices only; it is an independent community project, not affiliated with or endorsed by Huawei.
 
@@ -50,7 +50,7 @@ RDP 经 rdpsnd 输出 PCM 音频，实测 44.1 kHz 立体声；VNC 协议不包�
 
 ## 当前状态
 
-1.0.0 已覆盖安装到 PC 与手机（`install -r`，连接与密钥库保留）；PC 上 VNC 与 RDP、手机上 VNC 各一条连接均已复测连通。尚未上架、未提交审核，发布证书与 Profile、APP 备案尚未办理；首发仅 PC/2in1 时不申请软著，以后加入手机再办。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+1.0.0 已覆盖安装到 PC 与手机（`install -r`，连接与密钥库保留）；PC 上 VNC 与 RDP、手机上 VNC 各一条连接均已复测连通。已提交 AppGallery 审核，状态为审核中（2026-11-05）；发布证书与 Profile 已办，APP 备案尚未办理。首发仅 PC/2in1 时不申请软著，以后加入手机再办。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 已验证：
 
