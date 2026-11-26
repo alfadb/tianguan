@@ -704,6 +704,127 @@ int requestResizeTest(const TestConfig& config, const std::string& pin) {
   return passed ? 0 : 1;
 }
 
+// Server identity reset: a session pinned to a stale fingerprint must be able
+// to go back through the confirmation flow without being recreated.
+//  1. first contact with no pin -> trust-required, remember the fingerprint fp0
+//  2. close that probe session
+//  3. create a session pinned to a deliberately wrong fingerprint -> failed /
+//     fingerprint-mismatch, Chinese error, and fingerprint == fp0 (the value
+//     observed now, not the stale pin)
+//  4. forgetTrustedFingerprint() on that failed session -> trust-required with
+//     the same fp0 and generation + 1
+//  5. reconnectSession() (what the UI does after the user confirms) -> connected
+//     plus a complete, non-black first frame
+int trustResetTest(const TestConfig& config) {
+  bool passed = true;
+  const std::string probe =
+      tianguan::createSession(makeOptions(config, "", "trust-reset-probe"));
+  std::cout << "probe create: " << probe << std::endl;
+  if (probe.empty() || probe[0] == 'E') {
+    std::cout << "FAIL createSession (probe)" << std::endl;
+    return 1;
+  }
+  const std::string first = waitForState(probe, "trust-required", 15000);
+  std::cout << "probe trust-required: " << first << std::endl;
+  const std::string fp0 = jsonString(first, "fingerprint");
+  if (first.find("\"state\":\"trust-required\"") == std::string::npos ||
+      fp0.empty()) {
+    std::cout << "FAIL first contact did not report a fingerprint" << std::endl;
+    tianguan::closeSession(probe);
+    return 1;
+  }
+  std::cout << "fp0: " << fp0 << std::endl;
+  std::cout << "probe close: " << tianguan::closeSession(probe) << std::endl;
+
+  // A stale pin that differs from the server's current identity: flip the first
+  // three hex digits so the mismatch is unambiguous whatever the separator is.
+  std::string wrong = fp0;
+  int changed = 0;
+  for (size_t i = 0; i < wrong.size() && changed < 3; ++i) {
+    const char c = wrong[i];
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+        (c >= 'A' && c <= 'F')) {
+      wrong[i] = (c == '0') ? '1' : '0';
+      ++changed;
+    }
+  }
+  if (changed < 1 || wrong == fp0) {
+    std::cout << "FAIL cannot build a different fingerprint from " << fp0
+              << std::endl;
+    return 1;
+  }
+  std::cout << "wrong pin: " << wrong << std::endl;
+
+  const std::string failing =
+      tianguan::createSession(makeOptions(config, wrong, "trust-reset-mismatch"));
+  std::cout << "mismatch create: " << failing << std::endl;
+  if (failing.empty() || failing[0] == 'E') {
+    std::cout << "FAIL createSession (mismatch)" << std::endl;
+    return 1;
+  }
+  const std::string failed = waitForState(failing, "failed", 15000);
+  std::cout << "mismatch status: " << failed << std::endl;
+  const std::string failedCode = jsonString(failed, "errorCode");
+  const std::string failedText = jsonString(failed, "error");
+  const std::string failedPin = jsonString(failed, "fingerprint");
+  const bool mismatchOk =
+      failed.find("\"state\":\"failed\"") != std::string::npos &&
+      failedCode == "fingerprint-mismatch" &&
+      failedText == "服务端指纹与已信任值不一致，已拒绝连接" && failedPin == fp0;
+  if (!mismatchOk) {
+    std::cout << "FAIL mismatch status: errorCode=" << failedCode
+              << " error=\"" << failedText << "\" fingerprint=" << failedPin
+              << " (want fingerprint-mismatch / Chinese error / " << fp0 << ")"
+              << std::endl;
+    passed = false;
+  }
+  const int failedGeneration = jsonInt(failed, "generation", 0);
+
+  const std::string unknownReset = tianguan::forgetTrustedFingerprint("no-such-session");
+  std::cout << "forget unknown session: " << unknownReset << std::endl;
+  if (unknownReset != "INVALID_SESSION") passed = false;
+
+  const std::string reset = tianguan::forgetTrustedFingerprint(failing);
+  std::cout << "forgetTrustedFingerprint: " << reset << std::endl;
+  if (reset != "OK") passed = false;
+  const std::string retrust = waitForState(failing, "trust-required", 15000);
+  std::cout << "after forget: " << retrust << std::endl;
+  const int resetGeneration = jsonInt(retrust, "generation", 0);
+  const bool retrustOk =
+      retrust.find("\"state\":\"trust-required\"") != std::string::npos &&
+      jsonString(retrust, "fingerprint") == fp0 &&
+      resetGeneration == failedGeneration + 1;
+  if (!retrustOk) {
+    std::cout << "FAIL after forget: state/fingerprint/generation, got generation "
+              << failedGeneration << " -> " << resetGeneration << std::endl;
+    passed = false;
+  }
+
+  const std::string reconnected = tianguan::reconnectSession(failing);
+  std::cout << "reconnect after forget: " << reconnected << std::endl;
+  if (reconnected != "OK") passed = false;
+  const std::string connected = waitForState(failing, "connected", 20000);
+  std::cout << "after confirm: " << connected << std::endl;
+  if (connected.find("\"state\":\"connected\"") == std::string::npos) {
+    std::cout << "FAIL session did not connect after confirmation" << std::endl;
+    passed = false;
+  }
+  tianguan::requestFullFrame(failing);
+  const auto frameDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(15);
+  while (std::chrono::steady_clock::now() < frameDeadline) {
+    if (jsonInt(tianguan::sessionStatus(failing), "version", 0) > 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  int version = 0;
+  if (!takeFullFrame(failing, "after trust reset", version)) passed = false;
+  std::cout << "close mismatch: " << tianguan::closeSession(failing) << std::endl;
+
+  std::cout << (passed ? "TRUST RESET TEST PASS" : "TRUST RESET TEST FAIL")
+            << std::endl;
+  return passed ? 0 : 1;
+}
+
 // Two sessions on one server, each with its own framebuffer; close one and
 // prove the other keeps working. This is the required acceptance smoke.
 int multiSessionTest(const TestConfig& config, const std::string& pin) {
@@ -1164,6 +1285,16 @@ int main(int argc, char** argv) {
       return 1;
     }
     return requestResizeTest(config, resolvePin(config.host, config.port, pinSpec));
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--trust-reset-test") == 0) {
+    const std::string dir(argv[2]);
+    TestConfig config;
+    std::string error;
+    if (!loadConfig(dir, config, error)) {
+      std::cout << "FAIL " << error << std::endl;
+      return 1;
+    }
+    return trustResetTest(config);
   }
   if (argc >= 3 && argc <= 4 && std::strcmp(argv[1], "--frame-gap-test") == 0) {
     const std::string dir(argv[2]);

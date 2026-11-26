@@ -89,6 +89,12 @@ struct RdpHost {
   // lock, ignores the call when stop is set or generation no longer matches.
   void (*setTrustRequired)(void* user, int generation,
                            const char* fingerprint) = nullptr;
+  // A presented certificate differs from the trusted pin: publish the observed
+  // fingerprint so sessionStatus() can report it with
+  // errorCode=fingerprint-mismatch. Same lock/generation policy as
+  // setTrustRequired(); the attempt is still refused.
+  void (*observeFingerprint)(void* user, int generation,
+                             const char* fingerprint) = nullptr;
   // Same policy as the VNC loop's beginAttempt(): bump the generation when an
   // automatic retry starts an attempt. *lastApplied is owned by the backend.
   int (*beginAttempt)(void* user, int* lastApplied) = nullptr;

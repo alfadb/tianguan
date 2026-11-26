@@ -286,6 +286,24 @@ export function reconnectSession(sessionId: string): void {
   }
 }
 
+/**
+ * Clears this session's expected/observed server fingerprint and reconnects
+ * through the same trigger as reconnectSession(). The next attempt therefore
+ * has no pin: it stops at trust-required with the fingerprint the server
+ * presents now, and the user must confirm again. This never writes the ArkTS
+ * trust store and never trusts a fingerprint by itself. Returns 'OK' or an
+ * error string ('INVALID_SESSION' for an unknown session); '' if the native
+ * call throws.
+ */
+export function forgetTrustedFingerprint(sessionId: string): string {
+  try {
+    return diag.forgetTrustedFingerprint(sessionId);
+  } catch (error) {
+    warn('forgetTrustedFingerprint', error);
+    return '';
+  }
+}
+
 /** Raw takeFrame result: 'NONE', 'ERROR:…', or frame metadata JSON. */
 export function takeFrameRaw(sessionId: string, buffer: ArrayBuffer, afterVersion: number,
   forceFull: boolean): string {

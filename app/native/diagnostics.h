@@ -25,6 +25,13 @@ size_t pendingCloses();
 std::string listSessions();
 std::string sessionStatus(const std::string& sessionId);
 std::string reconnectSession(const std::string& sessionId);
+// Drops this session's expected/observed fingerprint and reconnects through the
+// same generation-bumping trigger as reconnectSession(): the next attempt runs
+// with no pin, stops at state=trust-required and reports the fingerprint the
+// server presents now. Allowed in any phase; returns "OK" or "INVALID_SESSION".
+// It trusts nothing and never touches the ArkTS trust store: the user still has
+// to confirm, and the UI still saves the pin and calls reconnectSession().
+std::string forgetTrustedFingerprint(const std::string& sessionId);
 // Writes the pending region or a full BGRA_8888 frame into dst. Returns JSON
 // metadata, "NONE" when there is nothing newer than afterVersion, or
 // "ERROR:BUFFER_TOO_SMALL" without touching dst.

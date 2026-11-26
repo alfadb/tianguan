@@ -1337,6 +1337,12 @@ std::string pinFromPrompt(const char* title, const char* text) {
   return line;
 }
 
+// The single user-facing text for a rejected server identity. Both backends
+// report it, and the VNC exception classifier below matches on it, so the
+// status error and the classified phase cannot drift apart.
+const char* const kFingerprintMismatchMessage =
+    "服务端指纹与已信任值不一致，已拒绝连接";
+
 void setPhase(SessionState& state, int phase, const std::string& error,
               const std::string& errorCode, int retryInMs) {
   std::lock_guard<std::mutex> lock(state.meta);
@@ -1392,7 +1398,16 @@ public:
     const std::string pin = pinFromPrompt(title, text);
     if (expectedPin.empty())
       throw std::runtime_error("server not trusted yet: " + pin);
-    if (pin != expectedPin) throw std::runtime_error("fingerprint mismatch: got " + pin);
+    if (pin != expectedPin) {
+      // Publish what the server presented even though this attempt is refused:
+      // sessionStatus() reports it next to errorCode=fingerprint-mismatch so
+      // the user can compare it with the trusted value.
+      {
+        std::lock_guard<std::mutex> lock(state->meta);
+        state->fingerprint = pin;
+      }
+      throw std::runtime_error(kFingerprintMismatchMessage);
+    }
     {
       std::lock_guard<std::mutex> lock(state->meta);
       state->fingerprint = pin;
@@ -2256,7 +2271,7 @@ void runVncSession(std::shared_ptr<SessionState> state) {
         waitForReconnect(*state);
         continue;
       }
-      if (message.compare(0, 19, "fingerprint mismatch") == 0) {
+      if (message == kFingerprintMismatchMessage) {
         setPhase(*state, PhaseFailed, message, "fingerprint-mismatch", 0);
         waitForReconnect(*state);
         continue;
@@ -2384,6 +2399,18 @@ void rdpHostSetTrustRequired(void* user, int generation, const char* fingerprint
   state.retryInMs = 0;
   state.connected = false;
   state.running = false;
+}
+
+// A certificate that does not match the pin is still the identity the server
+// presents right now. Publish it next to errorCode=fingerprint-mismatch (the
+// same meta lock and generation guard as the trust-required path) so the UI can
+// show what was seen instead of only that something differed.
+void rdpHostObserveFingerprint(void* user, int generation,
+                               const char* fingerprint) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.meta);
+  if (state.stop || state.generation.load() != generation) return;
+  state.fingerprint = fingerprint != nullptr ? fingerprint : "";
 }
 
 void rdpResizeFrame(void* user, int generation, int width, int height) {
@@ -2727,6 +2754,7 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
   bridge.waitForReconnect = rdpHostWaitForReconnect;
   bridge.currentPin = rdpHostCurrentPin;
   bridge.setTrustRequired = rdpHostSetTrustRequired;
+  bridge.observeFingerprint = rdpHostObserveFingerprint;
   bridge.resizeFrame = rdpResizeFrame;
   bridge.commitFrame = rdpCommitFrame;
   bridge.setCursor = rdpSetCursor;
@@ -3319,6 +3347,17 @@ std::string tianguan::sessionStatus(const std::string& sessionId) {
   return statusJson(state);
 }
 
+// Shared reconnect trigger for reconnectSession() and
+// forgetTrustedFingerprint(): one connection attempt per generation. The
+// caller holds the meta lock while it edits the trust anchor, so the new
+// generation can never be observed with a half-updated pin. beginAttempt()
+// then leaves the generation alone (it only bumps the automatic retry path).
+void triggerReconnectLocked(SessionState& state) {
+  state.generation++;
+  state.retryInMs = 0;
+  state.forceReconnect = true;
+}
+
 std::string tianguan::reconnectSession(const std::string& sessionId) {
   const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
   if (!state) return "INVALID_SESSION";
@@ -3333,12 +3372,24 @@ std::string tianguan::reconnectSession(const std::string& sessionId) {
       state->error.clear();
       state->errorCode = "none";
     }
-    // One connection attempt per generation: bumping it here makes the next
-    // attempt use a fresh generation, and beginAttempt() will not bump again.
-    state->generation++;
-    state->retryInMs = 0;
+    triggerReconnectLocked(*state);
   }
-  state->forceReconnect = true;
+  return "OK";
+}
+
+// Drops the session's trust anchor and reconnects through the same trigger as
+// reconnectSession(). The next attempt therefore runs with no expected
+// fingerprint, stops at trust-required and publishes the fingerprint the
+// server presents now. This function itself trusts nothing and never touches
+// the ArkTS trust store: the user still has to confirm, and the UI still saves
+// the pin and calls reconnectSession() afterwards.
+std::string tianguan::forgetTrustedFingerprint(const std::string& sessionId) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return "INVALID_SESSION";
+  std::lock_guard<std::mutex> lock(state->meta);
+  state->expectedPin.clear();
+  state->fingerprint.clear();
+  triggerReconnectLocked(*state);
   return "OK";
 }
 

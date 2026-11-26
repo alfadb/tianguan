@@ -12,6 +12,12 @@ export const listSessions: () => string;
 export function sessionStatus(): string;
 export function sessionStatus(sessionId: string): string;
 export const reconnectSession: (sessionId: string) => string;
+// Drops the session's expected/observed server fingerprint and reconnects
+// through the same trigger as reconnectSession(). The next attempt runs with no
+// pin, so it stops at trust-required and reports the fingerprint the server
+// presents now; the user must confirm again and the UI then saves it and calls
+// reconnectSession(). Returns "OK" or "INVALID_SESSION". Never trusts anything.
+export const forgetTrustedFingerprint: (sessionId: string) => string;
 export const takeFrame: (sessionId: string, buffer: ArrayBuffer, afterVersion: number,
   forceFull: boolean) => string;
 export function sendPointer(x: number, y: number, mask: number): string;

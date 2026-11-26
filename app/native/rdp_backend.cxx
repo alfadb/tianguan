@@ -1747,7 +1747,8 @@ bool fingerprintsEqual(const std::string& pinned, const std::string& observed) {
 DWORD decideCertificate(RdpAttemptContext* attempt, const char* fingerprint) {
   if (attempt == nullptr || attempt->host == nullptr ||
       attempt->host->currentPin == nullptr ||
-      attempt->host->setTrustRequired == nullptr) {
+      attempt->host->setTrustRequired == nullptr ||
+      attempt->host->observeFingerprint == nullptr) {
     return 0;  // bridge not fully wired: fail closed, never accept blindly
   }
   const std::string observed = normalizeFingerprint(fingerprint);
@@ -1772,6 +1773,8 @@ DWORD decideCertificate(RdpAttemptContext* attempt, const char* fingerprint) {
     return 2;  // accept for this session only; 1 would store it in FreeRDP's own
                // known_hosts, which this app deliberately does not use
   attempt->fingerprintMismatch = true;
+  attempt->host->observeFingerprint(attempt->host->user, attempt->generation,
+                                    observed.c_str());
   diagWarn("rdp: server certificate fingerprint differs from the trusted value");
   return 0;
 }
@@ -2870,7 +2873,7 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       host.takeDesktopSizeRequest == nullptr ||
       host.finishDesktopSizeRequest == nullptr ||
       host.sinkClipboard == nullptr || host.currentPin == nullptr ||
-      host.setTrustRequired == nullptr) {
+      host.setTrustRequired == nullptr || host.observeFingerprint == nullptr) {
     return;  // bridge not fully wired: fail closed instead of crashing
   }
   int lastApplied = 0;

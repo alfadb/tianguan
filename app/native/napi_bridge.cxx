@@ -272,6 +272,18 @@ napi_value ReconnectSession(napi_env env, napi_callback_info info) {
     return MakeString(env, "INVALID_SESSION");
   return MakeString(env, tianguan::reconnectSession(id));
 }
+// forgetTrustedFingerprint(sessionId): drop the session's trust anchor and
+// reconnect (same trigger as reconnectSession). Returns "OK" or
+// "INVALID_SESSION"; the follow-up attempt stops at trust-required.
+napi_value ForgetTrustedFingerprint(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  std::string id;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 ||
+      !GetStringArg(env, argv[0], 256, id))
+    return MakeString(env, "INVALID_SESSION");
+  return MakeString(env, tianguan::forgetTrustedFingerprint(id));
+}
 napi_value TakeFrame(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value argv[4];
@@ -447,6 +459,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"pendingCloses", nullptr, PendingCloses, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"listSessions", nullptr, ListSessions, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"reconnectSession", nullptr, ReconnectSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"forgetTrustedFingerprint", nullptr, ForgetTrustedFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setClipboard", nullptr, SetClipboard, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -457,7 +470,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 26, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 27, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

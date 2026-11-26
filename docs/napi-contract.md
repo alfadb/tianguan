@@ -18,7 +18,8 @@
 | `pendingCloses(): number` | 尚未完成线程回收的已关闭会话数。退出流程轮询到 0 或期限（当前 3 秒）后强退。 |
 | `listSessions(): string` | 返回 JSON 数组，每项含 id、state、width、height、generation、profileName，**以及 `host`/`port`**（用于给孤儿会话恢复端点，信任确认依赖它）。 |
 | `sessionStatus(sessionId: string): string` | 返回该会话状态 JSON。 |
-| `reconnectSession(sessionId: string): string` | 立即重连，`generation` 递增。 |
+| `reconnectSession(sessionId: string): string` | 立即重连，`generation` 递增。`state=trust-required` 调用时把已展示的 `fingerprint` 记为信任锚。 |
+| `forgetTrustedFingerprint(sessionId: string): string` | 清空该会话的 `expectedPin` 与 `fingerprint`，并按与 `reconnectSession` 相同的逻辑立即重连（`generation` 递增）。返回 `OK` / `INVALID_SESSION`。 |
 
 `optionsJson` 字段：
 
@@ -50,8 +51,19 @@
 ```
 
 - `state=trust-required` 时附带 `fingerprint`，界面据此展示确认；确认写入 ArkTS 侧信任库后由界面调用 `reconnectSession`。
-- `errorCode` 是枚举；`error` 只用于辅助显示。
+- `state=failed` 且 `errorCode=fingerprint-mismatch` 时也附带当前观测到的 `fingerprint`（VNC 与 RDP 一致）：它是本次连接中服务端实际出示的指纹，供界面与已信任值对比展示。
+- `errorCode` 是枚举；`error` 只用于辅助显示。指纹不一致时 `error` 统一为「服务端指纹与已信任值不一致，已拒绝连接」。
 - `resizeSupport` 按会话独立维护，重连后复位为 `"unknown"`：`"ok"` 表示服务端已按客户端请求确认/应用过至少一次（VNC：收到 `reasonClient` 的成功答复；RDP：收到与在途请求对应的 `DesktopResize`）；`"rejected"` 只可能来自 VNC（服务端明确拒绝）。RDP 协议没有拒绝应答，请求被忽略时保持 `"unknown"`，界面必须自行超时并停用该会话的自动跟随。
+
+### 重新确认服务端指纹
+
+```
+forgetTrustedFingerprint(sessionId: string): string
+```
+
+- **同步**返回。会话存在时：清空该会话的期望指纹 `expectedPin` 与已观测指纹 `fingerprint`，然后触发一次与 `reconnectSession` 等价的重连（`generation` 递增，正在退避或等待确认的重连立即进行）。下一次连接因没有期望指纹而停在 `state=trust-required`，并带回当前观测到的服务端指纹，由用户再次确认。返回 `OK`；会话不存在返回 `INVALID_SESSION`。
+- 对处于 `failed` / `trust-required` / `connected` / `connecting` 等任何状态的会话都允许调用；清 pin 后一律按重连处理。
+- **安全含义**：它只让会话重新展示服务端当前出示的指纹，不自动信任任何指纹，也不读写 ArkTS 侧信任库文件。真正建立信任仍必须由用户在界面上确认、界面写入信任库，再由界面调用 `reconnectSession`（该调用在 `trust-required` 状态下才把当前 `fingerprint` 记为信任锚）。因此它不能把「指纹不一致」直接变成「已连接」。
 
 ## 画面
 
