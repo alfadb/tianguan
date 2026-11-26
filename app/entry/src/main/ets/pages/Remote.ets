@@ -12,12 +12,15 @@
  * stays unmounted. There is no "last window", FIFO or "first registry session"
  * fallback.
  *
- * The page is the remote picture plus a floating operation bar at the top (pin,
- * minimise, fullscreen on desktop, disconnect); on touch devices a small centre
- * handle summons that bar. The bar and the handle are siblings of the picture,
- * so nothing else covers it. The connection name belongs to the window title
- * (set by RemoteAbility). On a desktop the window's title-bar X is the disconnect
- * path. A phone has no title bar, so there the bar's disconnect button and the
+ * The page is the remote picture plus a small floating bubble that can be
+ * dragged anywhere inside the picture (normalised page coordinates, no
+ * persistence). Tapping the bubble fans out a radial menu (minimise,
+ * fullscreen on desktop, disconnect); dragging it moves it and snaps it half
+ * out of the nearest edge. The bubble and the menu buttons are siblings of the
+ * picture, so nothing else covers it and their pointer events never reach the
+ * remote input. The connection name belongs to the window title (set by
+ * RemoteAbility). On a desktop the window's title-bar X is the disconnect path.
+ * A phone has no title bar, so there the menu's disconnect button and the
  * system back action both end this session and close this window instead of
  * merely backgrounding it, through the same programmatic path the connection
  * list uses. Losing the view without either (backgrounding, another window on
@@ -88,7 +91,7 @@ import {
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession, clipboardSetSessionVisible,
   clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
-import { closeRemoteWindow, sessionKeyForWindow } from '../windows/RemoteWindows';
+import { closeRemoteWindow, remoteReopenKeyForSession, sessionKeyForWindow } from '../windows/RemoteWindows';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -420,25 +423,76 @@ const DEVICE_CONTROL_KEYS: Set<number> = new Set<number>([
   KeyCode.KEYCODE_CAMERA
 ]);
 
-// --- Floating operation bar (the remote "connection bar") ------------------
-// A semi-transparent dark bar floating over the top centre of the picture. It
-// is built from siblings of remote_area inside the outer Stack, never from
-// inside remote_area, so its pointer events cannot reach the remote pointer /
-// key paths. All sizes are vp.
-const TOOLBAR_WIDTH_VP: number = 336;
-const TOOLBAR_HEIGHT_VP: number = 38;
-const TOOLBAR_TOP_VP: number = 6;
-// Retract ~1 s after the pointer leaves the bar. There is deliberately no
-// full-width top-edge hot zone and no intro auto-show: a hover-summoned bar
-// appears too easily and covers the remote content along the picture's top
-// edge (a remote browser's tab strip, for example), so the bar opens only on
-// an explicit handle click.
-const TOOLBAR_HIDE_DELAY_MS: number = 1000;
-// Small centre handle, the only way to summon the bar, on mouse and touch
-// alike. It is hidden while the bar is open and fades back in when the bar
-// retracts.
-const TOOLBAR_HANDLE_WIDTH_VP: number = 64;
-const TOOLBAR_HANDLE_HEIGHT_VP: number = 20;
+// --- Floating bubble and radial menu ---------------------------------------
+// A small dark translucent bubble floating over the picture, the only local
+// window-action entry point on mouse and touch alike. It is a sibling of
+// remote_area inside the outer Stack, never a child, so its pointer events
+// cannot reach the remote pointer / key paths. Tapping it fans the buttons out
+// along an arc; dragging it moves it inside the picture. All sizes are vp.
+//
+// There is deliberately no full-width top-edge hot zone and no intro auto-show:
+// a hover-summoned bar appears too easily and covers the remote content along
+// the picture's top edge (a remote browser's tab strip, for example). The old
+// horizontal operation bar and its "固定" state are gone: a menu that is one
+// tap away at all times needs no pinning.
+const BUBBLE_DIAMETER_VP: number = 44;
+const BUBBLE_RADIUS_VP: number = BUBBLE_DIAMETER_VP / 2;
+// A new session starts with the bubble fully visible in the bottom-right
+// corner, 24 vp clear of the right and bottom edges (its centre is one radius
+// plus that gap away from each edge). It is NOT snapped at startup.
+const BUBBLE_DEFAULT_MARGIN_VP: number = 24;
+// Movement past this vp is a drag, not a tap. Tap and pan are mutually
+// exclusive gestures, so a tap can never drag and a drag can never tap.
+const BUBBLE_DRAG_SLOP_VP: number = 8;
+// Release this close to an edge and the bubble snaps to it.
+const BUBBLE_EDGE_SNAP_VP: number = 24;
+// A snapped bubble keeps its centre this far INSIDE the picture instead of
+// exactly on the edge: at 6 vp the outer pixels still sat on the system
+// window-resize border and a drag started there was taken by the system; 10 vp
+// leaves a comfortable grab area while the visible shape is still a large
+// part-circle hugging the edge.
+const BUBBLE_EDGE_INSET_VP: number = 10;
+const BUBBLE_REST_OPACITY: number = 0.5;
+const BUBBLE_ACTIVE_OPACITY: number = 0.9;
+const BUBBLE_EDGE_OPACITY: number = 0.3;
+// Per-session bubble position in AppStorage: "fx,fy,edge" (edge '' = free).
+// Read on the first layout, written after a drag/snap and on relayout, and
+// removed when the session ends (kept across a phone minimize -> reopen).
+const BUBBLE_STORE_PREFIX: string = 'remote.bubble.';
+// Radial menu geometry: circular buttons on a 76 vp arc around the bubble.
+const BUBBLE_MENU_RADIUS_VP: number = 76;
+const BUBBLE_MENU_BUTTON_VP: number = 44;
+const BUBBLE_MENU_BUTTON_RADIUS_VP: number = BUBBLE_MENU_BUTTON_VP / 2;
+// Fixed icon drawing area inside every button (vp). The icon is centred in this
+// box and the box is centred in the circular button.
+const BUBBLE_MENU_ICON_VP: number = 16;
+// Clearance kept between a button circle and the picture edge.
+const BUBBLE_MENU_EDGE_GAP_VP: number = 2;
+const BUBBLE_MENU_SAFE_VP: number =
+  BUBBLE_MENU_BUTTON_RADIUS_VP + BUBBLE_MENU_EDGE_GAP_VP;
+// A 110 deg fan separates three buttons; it shrinks towards the inside of the
+// picture (down to 30 deg) when an edge would clip a button.
+const BUBBLE_MENU_MAX_SPAN_DEG: number = 110;
+const BUBBLE_MENU_MIN_SPAN_DEG: number = 30;
+const BUBBLE_MENU_ANIM_MS: number = 200;
+// PC: retract the menu ~1 s after the pointer leaves the bubble and its
+// buttons. Touch has no hover, so the menu stays until it is dismissed.
+const BUBBLE_MENU_HIDE_DELAY_MS: number = 1000;
+// Touch long-press on a menu button only shows its label; a tap runs it.
+const BUBBLE_MENU_LONG_PRESS_MS: number = 500;
+// After a long press, an erroneous tap callback from the same release is
+// ignored; this window is comfortably longer than the hold itself.
+const BUBBLE_MENU_LONG_PRESS_GUARD_MS: number = 1500;
+// A long-press label stays on screen briefly after the finger lifts.
+const BUBBLE_MENU_HINT_LINGER_MS: number = 800;
+// The same self-drawn label is used for the PC hover hint; hide soon after the
+// pointer leaves the button.
+const BUBBLE_MENU_HINT_HIDE_MS: number = 150;
+// A menu-dismiss press swallows its whole press/move/release sequence. If the
+// matching release is lost (window relayout, a system dialog, ...), clear the
+// swallow state after this long without another event of that sequence so the
+// next click reaches the remote again.
+const BUBBLE_MENU_DISMISS_TIMEOUT_MS: number = 2000;
 
 // --- Remote-resolution follow ----------------------------------------------
 // The remote desktop is asked to match the picture area. On a 2-in-1 it is
@@ -636,28 +690,73 @@ struct Remote {
   // Serialises enter/exit: maximize()/recover() are async and a double toggle
   // must not interleave two window-state transitions.
   private fullscreenBusy: boolean = false;
-  // --- Floating operation bar ------------------------------------------------
-  @State private toolbarVisible: boolean = false;
-  // Pinned = no automatic retraction; a second press on "固定" restores it.
-  @State private toolbarPinned: boolean = false;
-  // While the pointer is over the bar / handle the locally drawn remote cursor
-  // is unmounted: the system pointer is visible there and a stale remote
-  // cursor image would be left floating over the picture.
+  // --- Floating bubble and radial menu --------------------------------------
+  // Bubble centre saved as normalised picture coordinates (0..1). After the
+  // user has dragged / snapped the bubble a picture resize (window drag,
+  // fullscreen, rotation) converts them again for the new size, so the bubble
+  // keeps its relative position and stays inside the picture. Before that first
+  // drag the default bottom-right position is re-applied on every resize instead
+  // (the PC window is auto-adjusted shortly after opening). The pair is written
+  // to AppStorage under this session's key only after a drag / snap, so a
+  // phone/tablet window reopen (new page, same live session) restores it; a
+  // session end deletes that key.
+  @State private bubbleFx: number = 0.5;
+  @State private bubbleFy: number = 0;
+  // True once the user has dragged the bubble (or a saved position was
+  // restored). Only then are the normalised coordinates saved / re-converted.
+  private bubbleUserPositioned: boolean = false;
+  // vp size the normalised coordinates were last converted for. Rendering reads
+  // the centre through these, so a state change re-lays it out.
+  @State private bubbleAreaW: number = 0;
+  @State private bubbleAreaH: number = 0;
+  @State private bubblePlaced: boolean = false;
+  // '' while free; otherwise the snapped edge. A snapped centre sits
+  // BUBBLE_EDGE_INSET_VP inside that edge, so the visible part is a large
+  // part-circle and its grab area is clear of the window-resize border.
+  @State private bubbleEdge: string = '';
+  @State private bubbleHovered: boolean = false;
+  @State private bubblePressed: boolean = false;
+  @State private bubbleMenuVisible: boolean = false;
+  // Absolute angles (deg) of the menu buttons around the bubble centre, one per
+  // button; empty while the menu is closed.
+  @State private bubbleMenuAngles: number[] = [];
+  // Index of the menu button whose self-drawn text label is shown (-1 = none).
+  // Shown on a touch long press, and on PC while the pointer hovers a button.
+  @State private bubbleMenuHintIndex: number = -1;
+  // While the pointer is over the bubble / menu buttons the locally drawn
+  // remote cursor is unmounted: the system pointer is visible there and a stale
+  // remote cursor image would be left floating over the picture.
   @State private cursorOverlayHidden: boolean = false;
-  private toolbarHideTimer: number = -1;
-  // True while the pointer is over the bar itself: re-arming auto-hide (unpin)
-  // must not retract the bar under the cursor.
-  private toolbarHovered: boolean = false;
-  // Pointer is over the centre handle. Hover only brightens the grab bar; it
-  // never opens the operation bar (opening is click-only, see the handle).
-  @State private toolbarHandleHovered: boolean = false;
+  private bubbleMenuHideTimer: number = -1;
+  private bubbleMenuHintHideTimer: number = -1;
+  // Cached vp2px(16) for the menu icon drawing area (px). commands and stroke
+  // are px in ArkUI Shape / Path, so they are generated from this.
+  private bubbleMenuIconPxCache: number = 0;
+  // Which bubble / menu element currently owns the pointer. Crossing the gap
+  // between them delivers leave then enter, and that must not arm the timer.
+  private bubbleHoverOwner: string = '';
+  // Bubble centre (vp) at the start of a drag; the pan offset is added to it.
+  private bubbleDragOriginX: number = 0;
+  private bubbleDragOriginY: number = 0;
+  // Esc Down closes the menu; its Up is swallowed as well so the remote never
+  // sees half a key press.
+  private bubbleMenuEscPending: boolean = false;
+  // A picture press that dismisses the menu must not leak to the remote. The
+  // whole press/move/release is swallowed per input path; the flags clear on
+  // that path's release (or on teardown / input release).
+  private bubbleMenuDismissSwallowTouch: boolean = false;
+  private bubbleMenuDismissSwallowMouse: boolean = false;
+  // Safety fuse: if the release that should clear the swallow state is lost,
+  // this timer clears it after BUBBLE_MENU_DISMISS_TIMEOUT_MS without events.
+  private bubbleMenuDismissTimer: number = -1;
+  // Long press on a menu button: remembers which button and when, so a tap
+  // callback from the same release (if one is ever delivered) is ignored.
+  private bubbleMenuLongPressIndex: number = -1;
+  private bubbleMenuLongPressMs: number = 0;
   private disconnectRequested: boolean = false;
-  // Touch-first layout: acting on a bar button retracts the bar and tapping the
-  // picture closes it. A phone has no title bar at all, so the fullscreen
-  // button is meaningless there. Summoning is the same centre handle on every
-  // device.
-  private readonly touchUi: boolean =
-    deviceInfo.deviceType === 'phone' || deviceInfo.deviceType === 'tablet';
+  // Touch-first layout: a phone has no title bar at all, so its menu is shorter
+  // (no fullscreen button) and its destructive action is red and at the far end
+  // of the fan. Tablet keeps the PC button set.
   private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
   // --- Remote-resolution follow ---------------------------------------------
   // PC, phone and tablet. resizeDisabled is sticky for this page/window: a
@@ -939,7 +1038,9 @@ struct Remote {
     this.tornDown = true;
     this.stopFrameTimer();
     this.stopIdleTimer();
-    this.cancelToolbarHide();
+    this.cancelBubbleMenuHide();
+    this.cancelBubbleMenuHintHide();
+    this.clearBubbleMenuDismissSwallow('teardown');
     if (this.resizeFollowTimer >= 0) {
       clearTimeout(this.resizeFollowTimer);
       this.resizeFollowTimer = -1;
@@ -965,6 +1066,15 @@ struct Remote {
     this.releaseCursorPixelMap();
     if (this.sessionId.length === 0) {
       return;
+    }
+    // The bubble position is kept when this page goes away only to be rebuilt
+    // for the SAME live session (phone/tablet minimize -> 打开 sets the reopen
+    // key before terminateSelf()). Every real session end deletes it, so a new
+    // session never starts at an old position. The reopen key is still true
+    // here: RemoteAbility.onDestroy removes it only after the window stage (and
+    // therefore this page) is destroyed.
+    if (AppStorage.get<boolean>(remoteReopenKeyForSession(this.sessionId)) !== true) {
+      this.deleteBubblePosition();
     }
     this.releaseAllInputs('teardown');
     clipboardUnregisterSession(this.sessionId);
@@ -1107,15 +1217,21 @@ struct Remote {
   private onWindowEvent(event: window.WindowEventType): void {
     if (event === window.WindowEventType.WINDOW_INACTIVE) {
       // Another window now owns the keyboard/mouse: anything held here would
-      // otherwise stay pressed on the server.
+      // otherwise stay pressed on the server. Also drop any menu-dismiss
+      // swallow state: its release may never arrive in this window.
+      this.clearBubbleMenuDismissSwallow('window-inactive');
       this.releaseAllInputs('window-inactive');
       this.endGesture();
       // The user may toggle CapsLock/NumLock in that other window: re-read the
       // real lock state from the next key event.
       this.lockStateNeedsSync = true;
     } else if (event === window.WindowEventType.WINDOW_HIDDEN) {
+      this.clearBubbleMenuDismissSwallow('window-hidden');
       this.setPageVisible(false);
     } else if (event === window.WindowEventType.WINDOW_SHOWN) {
+      // A re-shown window must never start with a stale "drop the next press"
+      // state from before it was hidden.
+      this.clearBubbleMenuDismissSwallow('window-shown');
       this.setPageVisible(true);
     }
   }
@@ -1131,7 +1247,7 @@ struct Remote {
   // hidden even when the cursor reaches the hot zone. recover() is the
   // documented reverse: it returns the main window from full screen/maximized
   // to FLOATING with the size and position it had before entering, which is
-  // exactly what the floating-bar button will need.
+  // exactly what the bubble menu's 全屏 / 退出全屏 button needs.
   //
   // Both calls are made on THIS page's own window (ownWindow / the window name
   // from getUIContext().getWindowName()); there is no cross-window registry.
@@ -1176,6 +1292,10 @@ struct Remote {
    */
   private onWindowStatusChange(status: window.WindowStatusType): void {
     if (status === window.WindowStatusType.FULL_SCREEN) {
+      // A full-screen switch relayouts the picture, so the menu's fan no longer
+      // matches and the system may never deliver the hover-leave that would
+      // close it: close it here (see also closeBubbleMenuAfterFullscreen).
+      this.closeBubbleMenu('window-status');
       if (!this.fullscreen) {
         this.fullscreen = true;
         hilog.info(DOMAIN, TAG,
@@ -1187,6 +1307,7 @@ struct Remote {
         status === window.WindowStatusType.UNDEFINED) {
       return;
     }
+    this.closeBubbleMenu('window-status');
     if (this.fullscreen) {
       this.fullscreen = false;
       hilog.info(DOMAIN, TAG,
@@ -1225,7 +1346,7 @@ struct Remote {
       hilog.warn(DOMAIN, TAG, 'remote fullscreen 进入失败：%{public}s', String(error));
     } finally {
       this.fullscreenBusy = false;
-      this.settleToolbarAfterFullscreen();
+      this.closeBubbleMenuAfterFullscreen();
     }
   }
 
@@ -1273,28 +1394,26 @@ struct Remote {
       hilog.warn(DOMAIN, TAG, 'remote fullscreen 退出失败：%{public}s', String(error));
     } finally {
       this.fullscreenBusy = false;
-      this.settleToolbarAfterFullscreen();
+      this.closeBubbleMenuAfterFullscreen();
     }
   }
 
   /**
    * A full-screen enter / exit relayouts the window under the pointer, and the
-   * system may then never deliver the onHover(false) that normally re-arms
-   * auto-hide. The pointer was on the bar when the button was pressed
-   * (toolbarHovered = true), so without this the bar would stay open until the
-   * pointer enters and leaves it again. Treat the completed transition as the
-   * pointer leaving: re-arm the normal retraction timer unless the user pinned
-   * the bar. Called from the finally blocks, so a failed transition also ends
-   * this way (the button action is complete either way).
+   * system may then never deliver the onHover(false) that normally re-arms the
+   * menu's retract timer. The pointer was on a menu button when it was pressed,
+   * so close the menu here instead of waiting for hover events; the next tap on
+   * the bubble re-opens it at the new geometry. Called from the finally blocks,
+   * so a failed transition also ends this way (the button action is complete
+   * either way).
    */
-  private settleToolbarAfterFullscreen(): void {
-    this.toolbarHovered = false;
-    if (!this.toolbarPinned) {
-      this.scheduleToolbarHide();
-    }
+  private closeBubbleMenuAfterFullscreen(): void {
+    this.bubbleHoverOwner = '';
+    this.bubbleHovered = false;
+    this.closeBubbleMenu('fullscreen');
   }
 
-  /** Toggle entry point for the in-page floating operation bar. */
+  /** Toggle entry point for the menu's 全屏 / 退出全屏 button. */
   private async toggleFullscreen(): Promise<void> {
     if (this.fullscreen) {
       await this.exitFullscreen();
@@ -1304,65 +1423,665 @@ struct Remote {
   }
 
   // -------------------------------------------------------------------------
-  // Floating operation bar: show/hide state machine and its window actions.
-  // The bar is a sibling of remote_area, so the pointer handlers below never
-  // reach sendPointer/sendKey (those live only on remote_area / the page root).
+  // Floating bubble: position, edge snapping, tap / drag, and its radial menu.
+  // The bubble and the menu buttons are siblings of remote_area, so nothing here
+  // reaches sendPointer / sendKey (those live only on remote_area / page root).
   // -------------------------------------------------------------------------
 
-  private showToolbar(): void {
+  /** Bubble centre in vp, converted from the normalised page state. */
+  private bubbleCenterX(): number {
+    return this.bubbleFx * this.bubbleAreaW;
+  }
+
+  private bubbleCenterY(): number {
+    return this.bubbleFy * this.bubbleAreaH;
+  }
+
+  private clampBubble(value: number, min: number, max: number): number {
+    if (max <= min) {
+      return (min + max) / 2;
+    }
+    return Math.min(Math.max(value, min), max);
+  }
+
+  /**
+   * (Re)converts the normalised bubble position for the current picture size.
+   * A snapped edge stays on that edge; a free bubble is clamped fully inside.
+   * Called from remote_area's onAreaChange, so window resize, fullscreen enter /
+   * exit and rotation all land here.
+   */
+  private layoutBubble(): void {
+    const width = this.viewWidth;
+    const height = this.viewHeight;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    const r = BUBBLE_RADIUS_VP;
+    if (!this.bubblePlaced) {
+      this.bubblePlaced = true;
+      if (this.restoreBubblePosition()) {
+        // A saved position only exists after the user dragged the bubble; the
+        // same live session is being shown again after a phone/tablet reopen.
+        this.bubbleUserPositioned = true;
+      }
+    }
+    if (!this.bubbleUserPositioned) {
+      // Until the first drag, every picture resize re-applies the bottom-right
+      // default instead of converting a stale normalised pair. The PC session
+      // window is auto-adjusted about 400 ms after it opens; converting the
+      // pre-adjustment pair would leave the bubble about 15 vp from the edges
+      // instead of the intended 24.
+      this.bubbleEdge = '';
+      this.bubbleFx = this.clampBubble(width - (BUBBLE_DEFAULT_MARGIN_VP + r),
+        BUBBLE_EDGE_SNAP_VP, width - BUBBLE_EDGE_SNAP_VP) / width;
+      this.bubbleFy = this.clampBubble(height - (BUBBLE_DEFAULT_MARGIN_VP + r),
+        BUBBLE_EDGE_SNAP_VP, height - BUBBLE_EDGE_SNAP_VP) / height;
+    }
+    // Convert the normalised centre with the CURRENT size, then re-apply the
+    // edge state / clamp so the bubble can never be left off-picture.
+    let x = this.bubbleFx * width;
+    let y = this.bubbleFy * height;
+    if (this.bubbleEdge === 'left' || this.bubbleEdge === 'right') {
+      y = this.clampBubble(y, r, height - r);
+    } else if (this.bubbleEdge === 'top' || this.bubbleEdge === 'bottom') {
+      x = this.clampBubble(x, r, width - r);
+    } else {
+      // A free bubble stays at least the snap distance away from every edge, so
+      // "fully inside" and "within the snap threshold" never disagree.
+      x = this.clampBubble(x, BUBBLE_EDGE_SNAP_VP, width - BUBBLE_EDGE_SNAP_VP);
+      y = this.clampBubble(y, BUBBLE_EDGE_SNAP_VP, height - BUBBLE_EDGE_SNAP_VP);
+    }
+    if (this.bubbleEdge === 'left') {
+      x = BUBBLE_EDGE_INSET_VP;
+    } else if (this.bubbleEdge === 'right') {
+      x = width - BUBBLE_EDGE_INSET_VP;
+    } else if (this.bubbleEdge === 'top') {
+      y = BUBBLE_EDGE_INSET_VP;
+    } else if (this.bubbleEdge === 'bottom') {
+      y = height - BUBBLE_EDGE_INSET_VP;
+    }
+    this.bubbleAreaW = width;
+    this.bubbleAreaH = height;
+    this.bubbleFx = x / width;
+    this.bubbleFy = y / height;
+    // Only a user-positioned bubble is persisted: a default that is re-applied
+    // on every resize is not a stored choice.
+    if (this.bubbleUserPositioned) {
+      this.saveBubblePosition();
+    }
+  }
+
+  private bubbleStoreKey(): string {
+    return BUBBLE_STORE_PREFIX + this.sessionId;
+  }
+
+  /** Persists the normalised position and edge state for this session. */
+  private saveBubblePosition(): void {
+    if (this.sessionId.length === 0 || this.bubbleAreaW <= 0 || this.bubbleAreaH <= 0) {
+      return;
+    }
+    const value = this.bubbleFx.toString() + ',' + this.bubbleFy.toString() + ',' +
+      this.bubbleEdge;
+    try {
+      AppStorage.setOrCreate<string>(this.bubbleStoreKey(), value);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '保存气泡位置失败：%{public}s', String(error));
+    }
+  }
+
+  /** Reads this session's saved bubble position; false when none is valid. */
+  private restoreBubblePosition(): boolean {
+    if (this.sessionId.length === 0) {
+      return false;
+    }
+    let saved = '';
+    try {
+      const value = AppStorage.get<string>(this.bubbleStoreKey());
+      if (value === undefined) {
+        return false;
+      }
+      saved = value;
+    } catch (error) {
+      return false;
+    }
+    if (saved.length === 0) {
+      return false;
+    }
+    const parts = saved.split(',');
+    if (parts.length < 2) {
+      return false;
+    }
+    const fx = Number(parts[0]);
+    const fy = Number(parts[1]);
+    if (!Number.isFinite(fx) || !Number.isFinite(fy) ||
+        fx < 0 || fx > 1 || fy < 0 || fy > 1) {
+      return false;
+    }
+    this.bubbleFx = fx;
+    this.bubbleFy = fy;
+    const edge = parts.length > 2 ? parts[2] : '';
+    if (edge === 'left' || edge === 'right' || edge === 'top' || edge === 'bottom') {
+      this.bubbleEdge = edge;
+    } else {
+      this.bubbleEdge = '';
+    }
+    return true;
+  }
+
+  /** Removes this session's saved position when the session really ends. */
+  private deleteBubblePosition(): void {
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    try {
+      AppStorage.delete(this.bubbleStoreKey());
+    } catch (error) {
+      // Key already gone.
+    }
+  }
+
+  private showBubbleMenuHint(index: number): void {
+    if (!this.bubbleMenuVisible) {
+      return;
+    }
+    this.cancelBubbleMenuHintHide();
+    this.bubbleMenuHintIndex = index;
+  }
+
+  private scheduleBubbleMenuHintHide(delayMs: number): void {
+    this.cancelBubbleMenuHintHide();
+    if (this.bubbleMenuHintIndex < 0) {
+      return;
+    }
+    this.bubbleMenuHintHideTimer = setTimeout((): void => {
+      this.bubbleMenuHintHideTimer = -1;
+      this.bubbleMenuHintIndex = -1;
+    }, delayMs);
+  }
+
+  private cancelBubbleMenuHintHide(): void {
+    if (this.bubbleMenuHintHideTimer >= 0) {
+      clearTimeout(this.bubbleMenuHintHideTimer);
+      this.bubbleMenuHintHideTimer = -1;
+    }
+  }
+
+  private resetBubbleMenuHint(): void {
+    this.cancelBubbleMenuHintHide();
+    this.bubbleMenuHintIndex = -1;
+  }
+
+  private bubbleMenuHintX(): number {
+    const index = this.bubbleMenuHintIndex;
+    if (index < 0 || index >= this.bubbleMenuAngles.length) {
+      return this.bubbleCenterX();
+    }
+    return this.clampBubble(this.bubbleMenuButtonX(index), 44,
+      this.bubbleAreaW - 44);
+  }
+
+  private bubbleMenuHintAbove(): boolean {
+    const index = this.bubbleMenuHintIndex;
+    if (index < 0 || index >= this.bubbleMenuAngles.length) {
+      return true;
+    }
+    return this.bubbleMenuButtonY(index) > 64;
+  }
+
+  private bubbleMenuHintY(): number {
+    const index = this.bubbleMenuHintIndex;
+    if (index < 0 || index >= this.bubbleMenuAngles.length) {
+      return 0;
+    }
+    const gap = BUBBLE_MENU_BUTTON_RADIUS_VP + 10;
+    return this.bubbleMenuHintAbove()
+      ? this.bubbleMenuButtonY(index) - gap
+      : this.bubbleMenuButtonY(index) + gap;
+  }
+
+  private onBubbleMenuLongPress(index: number): void {
+    this.bubbleMenuLongPressIndex = index;
+    this.bubbleMenuLongPressMs = Date.now();
+    this.showBubbleMenuHint(index);
+  }
+
+  private onBubbleMenuHintRelease(): void {
+    this.scheduleBubbleMenuHintHide(BUBBLE_MENU_HINT_LINGER_MS);
+  }
+
+  private onBubbleMenuTap(index: number): void {
+    // Safety net: the exclusive gesture group already prevents a tap from the
+    // long-press release, but never run the action if one ever arrives.
+    const held = this.bubbleMenuLongPressIndex === index &&
+      Date.now() - this.bubbleMenuLongPressMs < BUBBLE_MENU_LONG_PRESS_GUARD_MS;
+    if (held) {
+      return;
+    }
+    this.runBubbleMenuAction(index);
+  }
+
+  private bubbleOpacity(): number {
+    if (this.bubbleMenuVisible || this.bubbleHovered || this.bubblePressed) {
+      return BUBBLE_ACTIVE_OPACITY;
+    }
+    return this.bubbleEdge.length > 0 ? BUBBLE_EDGE_OPACITY : BUBBLE_REST_OPACITY;
+  }
+
+  /**
+   * Pointer ownership for the bubble and the menu buttons: hovering any of them
+   * makes the bubble solid, hides the local remote cursor, and keeps the menu
+   * open. Leaving all of them arms the ~1 s PC retract timer.
+   */
+  private onBubblePointerHover(owner: string, isHover: boolean): void {
+    if (isHover) {
+      this.bubbleHoverOwner = owner;
+      this.bubbleHovered = owner === 'bubble';
+      // The system pointer is visible there; the locally drawn remote cursor
+      // must not stay behind as a ghost under the bubble / buttons.
+      this.cursorOverlayHidden = true;
+      this.cancelBubbleMenuHide();
+      return;
+    }
+    if (this.bubbleHoverOwner !== owner) {
+      // Another bubble / menu element already owns the pointer; its leave will
+      // arm the timer when it is really left.
+      return;
+    }
+    this.bubbleHoverOwner = '';
+    this.bubbleHovered = false;
+    this.scheduleBubbleMenuHide();
+  }
+
+  private onBubbleTap(): void {
+    if (this.bubbleMenuVisible) {
+      this.closeBubbleMenu('bubble-tap');
+      return;
+    }
+    this.openBubbleMenu();
+  }
+
+  private onBubbleDragStart(): void {
+    // A drag always closes the menu first: the buttons would otherwise fan out
+    // around a moving centre.
+    this.closeBubbleMenu('drag');
+    this.cancelBubbleMenuHide();
+    this.bubblePressed = true;
+    // From now on the bubble belongs to the user: resizes convert the
+    // normalised coordinates instead of re-applying the default corner.
+    this.bubbleUserPositioned = true;
+    this.bubbleDragOriginX = this.bubbleCenterX();
+    this.bubbleDragOriginY = this.bubbleCenterY();
+    // Dragging a snapped bubble pulls it out of the edge; it may snap again on
+    // release.
+    this.bubbleEdge = '';
+  }
+
+  private onBubbleDragUpdate(offsetX: number, offsetY: number): void {
+    const width = this.bubbleAreaW;
+    const height = this.bubbleAreaH;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    // While dragging the centre may reach the very edge (the outer half is then
+    // clipped by the window), which is what makes edge snapping possible; a
+    // free bubble is clamped fully inside on release.
+    const x = this.clampBubble(this.bubbleDragOriginX + offsetX, 0, width);
+    const y = this.clampBubble(this.bubbleDragOriginY + offsetY, 0, height);
+    this.bubbleFx = x / width;
+    this.bubbleFy = y / height;
+  }
+
+  private onBubbleDragEnd(): void {
+    this.bubblePressed = false;
+    this.snapBubbleToEdge();
+  }
+
+  /** Snaps a released bubble to the nearest edge when it is close enough. */
+  private snapBubbleToEdge(): void {
+    const width = this.bubbleAreaW;
+    const height = this.bubbleAreaH;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    const r = BUBBLE_RADIUS_VP;
+    let x = this.bubbleCenterX();
+    let y = this.bubbleCenterY();
+    let edge = '';
+    let best = BUBBLE_EDGE_SNAP_VP;
+    if (x <= best) {
+      best = x;
+      edge = 'left';
+    }
+    if (width - x < best) {
+      best = width - x;
+      edge = 'right';
+    }
+    if (y < best) {
+      best = y;
+      edge = 'top';
+    }
+    if (height - y < best) {
+      best = height - y;
+      edge = 'bottom';
+    }
+    if (edge === 'left' || edge === 'right') {
+      // Inset by 10 vp instead of putting the centre exactly on the window edge:
+      // the outer pixels belong to the system window-resize border and would
+      // steal the drag. The visible shape is still a large part-circle.
+      x = edge === 'left' ? BUBBLE_EDGE_INSET_VP : width - BUBBLE_EDGE_INSET_VP;
+      y = this.clampBubble(y, r, height - r);
+    } else if (edge === 'top' || edge === 'bottom') {
+      y = edge === 'top' ? BUBBLE_EDGE_INSET_VP : height - BUBBLE_EDGE_INSET_VP;
+      x = this.clampBubble(x, r, width - r);
+    } else {
+      // Not close enough to snap: keep it fully inside the picture, at least
+      // the snap distance from every edge.
+      x = this.clampBubble(x, BUBBLE_EDGE_SNAP_VP, width - BUBBLE_EDGE_SNAP_VP);
+      y = this.clampBubble(y, BUBBLE_EDGE_SNAP_VP, height - BUBBLE_EDGE_SNAP_VP);
+    }
+    this.bubbleEdge = edge;
+    this.bubbleUserPositioned = true;
+    this.bubbleFx = x / width;
+    this.bubbleFy = y / height;
+    this.saveBubblePosition();
+  }
+
+  private openBubbleMenu(): void {
     if (this.disposed) {
       return;
     }
-    this.cancelToolbarHide();
-    // The pointer is not assumed to be over the bar: the bar's own hover
-    // handler sets this as soon as it actually is.
-    this.toolbarHovered = false;
-    // The clicked handle is about to unmount; drop its hover highlight so it
-    // does not reappear bright when the bar retracts.
-    this.toolbarHandleHovered = false;
-    this.toolbarVisible = true;
-  }
-
-  /** Retracts the bar unless it is pinned; delay lets the pointer cross gaps. */
-  private scheduleToolbarHide(): void {
-    if (this.disposed || this.toolbarPinned || this.toolbarHovered) {
+    this.cancelBubbleMenuHide();
+    // Opening the menu cancels any leftover dismissal swallow state and any
+    // stale pressed button (a lost release would otherwise silently drop the
+    // next mouse press in pointerDown()).
+    this.clearBubbleMenuDismissSwallow('menu-open');
+    this.abortSingleFingerInput();
+    this.resetBubbleMenuHint();
+    this.bubbleMenuLongPressIndex = -1;
+    this.bubbleMenuEscPending = false;
+    const angles = this.computeBubbleMenuAngles();
+    if (angles.length === 0) {
       return;
     }
-    this.cancelToolbarHide();
-    this.toolbarHideTimer = setTimeout((): void => {
-      this.toolbarHideTimer = -1;
-      if (!this.toolbarPinned) {
-        this.toolbarHovered = false;
-        this.toolbarVisible = false;
+    // Angles first: when the menu becomes visible the buttons must already have
+    // their final positions for the appear transition to start at the bubble.
+    this.bubbleMenuAngles = angles;
+    this.bubbleMenuVisible = true;
+  }
+
+  private closeBubbleMenu(reason: string): void {
+    this.cancelBubbleMenuHide();
+    // Every close clears any leftover dismissal swallow state and any stale
+    // pressed button. The dismissing press itself calls closeBubbleMenu() BEFORE
+    // setting its swallow flag, so A's one-press swallow still works.
+    this.clearBubbleMenuDismissSwallow('menu-close');
+    this.abortSingleFingerInput();
+    this.resetBubbleMenuHint();
+    this.bubbleMenuLongPressIndex = -1;
+    if (!this.bubbleMenuVisible) {
+      return;
+    }
+    this.bubbleMenuVisible = false;
+    this.bubbleMenuAngles = [];
+    hilog.debug(DOMAIN, TAG, 'remote bubble menu closed reason=%{public}s', reason);
+  }
+
+  /** PC only: ~1 s after the pointer leaves the bubble and its buttons. */
+  private scheduleBubbleMenuHide(): void {
+    if (this.disposed || !this.bubbleMenuVisible) {
+      return;
+    }
+    this.cancelBubbleMenuHide();
+    this.bubbleMenuHideTimer = setTimeout((): void => {
+      this.bubbleMenuHideTimer = -1;
+      this.closeBubbleMenu('pointer-left');
+    }, BUBBLE_MENU_HIDE_DELAY_MS);
+  }
+
+  private cancelBubbleMenuHide(): void {
+    if (this.bubbleMenuHideTimer >= 0) {
+      clearTimeout(this.bubbleMenuHideTimer);
+      this.bubbleMenuHideTimer = -1;
+    }
+  }
+
+  /**
+   * Ends the "this press only dismisses the menu" swallow state. Cancels the
+   * safety fuse as well. Called on the matching release, on a timeout with no
+   * further events, when the window loses focus / the page hides (through
+   * releaseAllInputs) and when the menu is opened again.
+   */
+  private clearBubbleMenuDismissSwallow(reason: string): void {
+    if (this.bubbleMenuDismissTimer >= 0) {
+      clearTimeout(this.bubbleMenuDismissTimer);
+      this.bubbleMenuDismissTimer = -1;
+    }
+    if (this.bubbleMenuDismissSwallowTouch || this.bubbleMenuDismissSwallowMouse) {
+      hilog.debug(DOMAIN, TAG, '菜单收起吞事件结束 reason=%{public}s', reason);
+    }
+    this.bubbleMenuDismissSwallowTouch = false;
+    this.bubbleMenuDismissSwallowMouse = false;
+  }
+
+  /**
+   * (Re)arms the safety fuse for a swallowed dismissal sequence. If the release
+   * event is lost (window relayout, a system dialog, a dropped pointer up), the
+   * fuse clears the swallow state after 2 s so the next click reaches the remote
+   * again instead of the UI staying deaf.
+   */
+  private armBubbleMenuDismissTimeout(): void {
+    if (this.bubbleMenuDismissTimer >= 0) {
+      clearTimeout(this.bubbleMenuDismissTimer);
+    }
+    this.bubbleMenuDismissTimer = setTimeout((): void => {
+      this.bubbleMenuDismissTimer = -1;
+      hilog.debug(DOMAIN, TAG, '菜单收起吞事件超时，恢复远端输入');
+      this.bubbleMenuDismissSwallowTouch = false;
+      this.bubbleMenuDismissSwallowMouse = false;
+      // If a release was lost during this sequence, a stale pressedMask would
+      // still make pointerDown() ignore the next click; release it now.
+      this.abortSingleFingerInput();
+    }, BUBBLE_MENU_DISMISS_TIMEOUT_MS);
+  }
+
+  /** PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps the PC set. */
+  private bubbleMenuCount(): number {
+    return this.phoneUi ? 2 : 3;
+  }
+
+  private bubbleMenuAction(index: number): string {
+    if (index === 0) {
+      return 'minimize';
+    }
+    if (this.phoneUi) {
+      return 'disconnect';
+    }
+    return index === 1 ? 'fullscreen' : 'disconnect';
+  }
+
+  private bubbleMenuLabel(index: number): string {
+    if (index === 0) {
+      return '最小化';
+    }
+    if (this.phoneUi) {
+      return '断开';
+    }
+    return index === 1 ? (this.fullscreen ? '退出全屏' : '全屏') : '断开';
+  }
+
+  private bubbleMenuDanger(index: number): boolean {
+    return this.bubbleMenuAction(index) === 'disconnect';
+  }
+
+  /** Icon drawing area in PHYSICAL px (vp2px(16)); cached after first use. */
+  private bubbleMenuIconPx(): number {
+    if (this.bubbleMenuIconPxCache > 0) {
+      return this.bubbleMenuIconPxCache;
+    }
+    try {
+      this.bubbleMenuIconPxCache = this.getUIContext().vp2px(BUBBLE_MENU_ICON_VP);
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, '读取图标像素尺寸失败：%{public}s', String(error));
+    }
+    if (!(this.bubbleMenuIconPxCache > 0)) {
+      this.bubbleMenuIconPxCache = BUBBLE_MENU_ICON_VP * this.deviceDensity();
+    }
+    return this.bubbleMenuIconPxCache;
+  }
+
+  /** The 16 vp drawing area expressed in px, for Path width / height / layout. */
+  private bubbleMenuIconSize(): string {
+    return this.bubbleMenuIconPx().toFixed(2) + 'px';
+  }
+
+  /** 2 design units of stroke scaled to the pixel drawing area. */
+  private bubbleMenuIconStroke(): string {
+    return (this.bubbleMenuIconPx() * 2 / BUBBLE_MENU_ICON_VP).toFixed(2) + 'px';
+  }
+
+  /**
+   * Path commands are in PX (ArkUI Shape / Path does not scale them with the
+   * component). All four icons are designed on a 16-unit grid symmetric about
+   * (8,8) and every coordinate is multiplied by px/16, so the ink fills the
+   * square pixel drawing area and its centre stays at the area centre.
+   */
+  private bubbleMenuIconCommands(action: string): string {
+    const scale = this.bubbleMenuIconPx() / BUBBLE_MENU_ICON_VP;
+    const px = (value: number): string => (value * scale).toFixed(2);
+    const m = (x: number, y: number): string => 'M' + px(x) + ' ' + px(y);
+    const l = (x: number, y: number): string => 'L' + px(x) + ' ' + px(y);
+    if (action === 'minimize') {
+      return m(1, 8) + l(15, 8);
+    }
+    if (action === 'fullscreen') {
+      if (this.fullscreen) {
+        // Inward corners with the arms extended to the same 1..15 ink extents
+        // as the outward icon, so both full-screen icons measure 14/16 of the
+        // drawing area instead of the previous 12/16 (18 px vs 21 px on PC).
+        return m(6, 1) + l(6, 6) + l(1, 6) +
+          m(10, 1) + l(10, 6) + l(15, 6) +
+          m(15, 10) + l(10, 10) + l(10, 15) +
+          m(1, 10) + l(6, 10) + l(6, 15);
       }
-    }, TOOLBAR_HIDE_DELAY_MS);
-  }
-
-  private cancelToolbarHide(): void {
-    if (this.toolbarHideTimer >= 0) {
-      clearTimeout(this.toolbarHideTimer);
-      this.toolbarHideTimer = -1;
+      return m(2, 6) + l(2, 2) + l(6, 2) +
+        m(10, 2) + l(14, 2) + l(14, 6) +
+        m(14, 10) + l(14, 14) + l(10, 14) +
+        m(6, 14) + l(2, 14) + l(2, 10);
     }
+    return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
 
-  /** Explicit close of the bar (touch tap on the picture); pinned ignores it. */
-  private hideToolbar(): void {
-    if (this.toolbarPinned) {
-      return;
+  private bubbleMenuButtonX(index: number): number {
+    const w = this.bubbleAreaW;
+    if (index < 0 || index >= this.bubbleMenuAngles.length || w <= 0) {
+      return this.bubbleCenterX();
     }
-    this.cancelToolbarHide();
-    this.toolbarHovered = false;
-    this.toolbarVisible = false;
+    const rad = this.bubbleMenuAngles[index] * Math.PI / 180;
+    return this.clampBubble(this.bubbleCenterX() + BUBBLE_MENU_RADIUS_VP * Math.cos(rad),
+      BUBBLE_MENU_SAFE_VP, w - BUBBLE_MENU_SAFE_VP);
   }
 
-  private toggleToolbarPinned(): void {
-    this.toolbarPinned = !this.toolbarPinned;
-    if (this.toolbarPinned) {
-      this.cancelToolbarHide();
-      this.toolbarVisible = true;
-    } else if (!this.toolbarHovered) {
-      // Keep the bar under the cursor; leaving it arms the normal timer.
-      this.scheduleToolbarHide();
+  private bubbleMenuButtonY(index: number): number {
+    const h = this.bubbleAreaH;
+    if (index < 0 || index >= this.bubbleMenuAngles.length || h <= 0) {
+      return this.bubbleCenterY();
+    }
+    const rad = this.bubbleMenuAngles[index] * Math.PI / 180;
+    return this.clampBubble(this.bubbleCenterY() + BUBBLE_MENU_RADIUS_VP * Math.sin(rad),
+      BUBBLE_MENU_SAFE_VP, h - BUBBLE_MENU_SAFE_VP);
+  }
+
+  private bubbleMenuAnglesFor(count: number, centerDeg: number, spanDeg: number): number[] {
+    if (count <= 1) {
+      return [centerDeg];
+    }
+    if (count === 2) {
+      return [centerDeg - spanDeg / 2, centerDeg + spanDeg / 2];
+    }
+    return [centerDeg - spanDeg / 2, centerDeg, centerDeg + spanDeg / 2];
+  }
+
+  private bubbleMenuAngleGap(a: number, b: number): number {
+    let diff = Math.abs(a - b) % 360;
+    if (diff > 180) {
+      diff = 360 - diff;
+    }
+    return diff;
+  }
+
+  /** True when every button circle of this fan is fully inside the picture. */
+  private bubbleMenuFits(angles: number[], width: number, height: number): boolean {
+    const safe = BUBBLE_MENU_SAFE_VP;
+    for (let i = 0; i < angles.length; i++) {
+      const rad = angles[i] * Math.PI / 180;
+      const x = this.bubbleCenterX() + BUBBLE_MENU_RADIUS_VP * Math.cos(rad);
+      const y = this.bubbleCenterY() + BUBBLE_MENU_RADIUS_VP * Math.sin(rad);
+      if (x < safe || x > width - safe || y < safe || y > height - safe) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Absolute angles for the menu buttons. The fan is centred on the direction
+   * towards the picture centre and as wide as 110 deg; when a button circle
+   * would cross an edge (any of the four edges or corners) the search shrinks
+   * the span and rotates the fan until every circle fits, so the fan always
+   * opens towards the inside of the picture. The order is [最小化, 全屏, 断开]
+   * on PC and [最小化, 断开] on a phone: 断开 is the +end of the fan, so it is
+   * the button farthest from 最小化 and never sits between the bubble and the
+   * other actions. If even the narrowest fan does not fit (a picture only a few
+   * vp wide), the per-button clamp in bubbleMenuButtonX/Y still keeps every
+   * circle inside.
+   */
+  private computeBubbleMenuAngles(): number[] {
+    const width = this.bubbleAreaW;
+    const height = this.bubbleAreaH;
+    const count = this.bubbleMenuCount();
+    if (width <= 0 || height <= 0 || count <= 0) {
+      return [];
+    }
+    // Preferred direction: towards the picture centre. Dead centre has no
+    // direction, so the fan opens downwards there.
+    let inward = 90;
+    const dx = width / 2 - this.bubbleCenterX();
+    const dy = height / 2 - this.bubbleCenterY();
+    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+      inward = Math.atan2(dy, dx) * 180 / Math.PI;
+    }
+    for (let span = BUBBLE_MENU_MAX_SPAN_DEG;
+         span >= BUBBLE_MENU_MIN_SPAN_DEG; span -= 10) {
+      let bestCenter = 0;
+      let bestGap = 361;
+      for (let center = 0; center < 360; center += 3) {
+        const angles = this.bubbleMenuAnglesFor(count, center, span);
+        if (!this.bubbleMenuFits(angles, width, height)) {
+          continue;
+        }
+        const gap = this.bubbleMenuAngleGap(center, inward);
+        if (gap < bestGap) {
+          bestGap = gap;
+          bestCenter = center;
+        }
+      }
+      if (bestGap <= 360) {
+        return this.bubbleMenuAnglesFor(count, bestCenter, span);
+      }
+    }
+    return this.bubbleMenuAnglesFor(count, inward, BUBBLE_MENU_MIN_SPAN_DEG);
+  }
+
+  /** Runs one menu action; every action closes the menu first. */
+  private runBubbleMenuAction(index: number): void {
+    const action = this.bubbleMenuAction(index);
+    this.closeBubbleMenu('action-' + action);
+    if (action === 'minimize') {
+      this.minimizeThisWindow();
+    } else if (action === 'fullscreen') {
+      this.toggleFullscreen();
+    } else if (action === 'disconnect') {
+      this.disconnectThisSession();
     }
   }
 
@@ -1373,7 +2092,7 @@ struct Remote {
       return;
     }
     own.minimize().catch((error: Error): void => {
-      hilog.warn(DOMAIN, TAG, 'remote toolbar 最小化失败：%{public}s', String(error));
+      hilog.warn(DOMAIN, TAG, 'remote bubble menu 最小化失败：%{public}s', String(error));
     });
   }
 
@@ -1396,16 +2115,16 @@ struct Remote {
     }
     const context = this.getUIContext().getHostContext();
     if (context === undefined) {
-      hilog.warn(DOMAIN, TAG, 'remote toolbar 断开失败：拿不到 host context');
+      hilog.warn(DOMAIN, TAG, 'remote bubble menu 断开失败：拿不到 host context');
       return;
     }
     this.disconnectRequested = true;
-    hilog.info(DOMAIN, TAG, 'remote toolbar disconnect session=%{public}s', this.sessionId);
+    hilog.info(DOMAIN, TAG, 'remote bubble menu disconnect session=%{public}s', this.sessionId);
     const ability: common.UIAbilityContext = context as common.UIAbilityContext;
     const close: () => void = (): void => {
       ability.terminateSelf().catch((error: Error): void => {
         this.disconnectRequested = false;
-        hilog.warn(DOMAIN, TAG, 'remote toolbar 断开失败：%{public}s', String(error));
+        hilog.warn(DOMAIN, TAG, 'remote bubble menu 断开失败：%{public}s', String(error));
       });
     };
     // A session window restored from the task switcher leaves the connection
@@ -1423,7 +2142,7 @@ struct Remote {
     ability.startAbility(listWant).then((): void => {
       close();
     }).catch((error: Error): void => {
-      hilog.warn(DOMAIN, TAG, 'remote toolbar 断开前恢复主列表失败：%{public}s', String(error));
+      hilog.warn(DOMAIN, TAG, 'remote bubble menu 断开前恢复主列表失败：%{public}s', String(error));
       close();
     });
   }
@@ -1887,6 +2606,10 @@ struct Remote {
   private releaseAllInputs(reason: string): void {
     // A touch that has not pressed yet must not press after the release.
     this.cancelLongPress('release-inputs');
+    // A menu-dismiss press owns no remote event; drop its swallow state with
+    // the rest of the input state (covers window inactive / page hidden, where
+    // the matching release may never arrive).
+    this.clearBubbleMenuDismissSwallow('release-inputs');
     this.resetTouchPressState();
     this.touchFingerIds.clear();
     this.multiTouchBlocked = false;
@@ -3647,6 +4370,23 @@ struct Remote {
         DEVICE_CONTROL_KEYS.has(event.keyCode)) {
       return false;
     }
+    // Esc closes an open radial menu and is NOT forwarded: it is the local
+    // menu's dismiss key, and the remote desktop must not receive that press.
+    // Its Up is swallowed too, so the remote never sees half a key. With no
+    // menu open, Esc keeps its existing behaviour (forwarded).
+    if (event.keyCode === KeyCode.KEYCODE_ESCAPE) {
+      if (this.bubbleMenuVisible) {
+        this.bubbleMenuEscPending = event.type === KeyType.Down;
+        this.closeBubbleMenu('esc');
+        return true;
+      }
+      if (this.bubbleMenuEscPending) {
+        this.bubbleMenuEscPending = false;
+        if (event.type === KeyType.Up || event.type === KeyType.CANCEL) {
+          return true;
+        }
+      }
+    }
     if (!this.keyForwardingActive()) {
       return false;
     }
@@ -3938,7 +4678,7 @@ struct Remote {
    * A Remote page is the main page of its own UIAbility window, so
    * window.destroyWindow() is not supported for it and router.back() has no
    * previous page to go back to (that combination made 返回连接列表 look dead).
-   * The one path verified on a real device is the operation bar's 断开:
+   * The one path verified on a real device is the bubble menu's 断开:
    * terminateSelf() ends exactly this ability instance, RemoteAbility.onDestroy
    * calls closeSessionById() for the session bound to this window (if any), and
    * the list + tray observers get their normal update. On phone/tablet the
@@ -4002,6 +4742,148 @@ struct Remote {
         String(error));
       this.leavePage();
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Bubble / menu rendering. All three are plain Stack nodes positioned inside
+  // the picture area; they draw themselves, no text glyphs are used for the
+  // icons, so they look identical on every font / theme.
+  // -------------------------------------------------------------------------
+
+  /** The bubble's "more" glyph: three short bars. */
+  @Builder
+  private bubbleGlyph() {
+    Column({ space: 4 }) {
+      Row().width(16).height(2).borderRadius(1).backgroundColor('#F2F2F2')
+      Row().width(16).height(2).borderRadius(1).backgroundColor('#F2F2F2')
+      Row().width(16).height(2).borderRadius(1).backgroundColor('#F2F2F2')
+    }
+  }
+
+  /**
+   * Menu button glyph, self-drawn with Row / Path. The local SDK has no reliable
+   * system-symbol catalogue (sys.symbol appears only in type declarations, with
+   * no bundled symbol resource index), so SymbolGlyph names cannot be verified
+   * here; simple shapes avoid a resource that might be missing on the device.
+   *  - 最小化: one horizontal bar
+   *  - 全屏 / 退出全屏: outward / inward corner brackets
+   *  - 断开: a cross
+   */
+  @Builder
+  private bubbleMenuGlyph(index: number) {
+    // ArkUI Shape / Path commands are in PX and do not scale with the component,
+    // so the drawing area, every command coordinate and the stroke are generated
+    // from vp2px(16). The fixed pixel-size Stack is centred in the 44 vp button;
+    // the Path fills that box and the 16-unit design is symmetric about its
+    // centre, so the ink is centred on both PC and phone at any density.
+    Stack({ alignContent: Alignment.Center }) {
+      Path({
+        width: this.bubbleMenuIconSize(),
+        height: this.bubbleMenuIconSize(),
+        commands: this.bubbleMenuIconCommands(this.bubbleMenuAction(index))
+      })
+        .width(this.bubbleMenuIconSize())
+        .height(this.bubbleMenuIconSize())
+        .stroke('#FFF2F2F2')
+        .strokeWidth(this.bubbleMenuIconStroke())
+        .fill(Color.Transparent)
+    }
+    .width(this.bubbleMenuIconSize())
+    .height(this.bubbleMenuIconSize())
+  }
+
+  @Builder
+  private bubbleMenuButton(index: number) {
+    Stack({ alignContent: Alignment.Center }) {
+      this.bubbleMenuGlyph(index)
+    }
+    .width(BUBBLE_MENU_BUTTON_VP)
+    .height(BUBBLE_MENU_BUTTON_VP)
+    .borderRadius(BUBBLE_MENU_BUTTON_RADIUS_VP)
+    .backgroundColor(this.bubbleMenuDanger(index) ? '#CC7F1D1D' : '#CC202124')
+    .border({
+      width: 1,
+      color: this.bubbleMenuDanger(index) ? '#66FF8A80' : '#40FFFFFF'
+    })
+    .shadow({ radius: 6, color: '#66000000', offsetY: 2 })
+    // The fan point is the final position; the appear / disappear transition
+    // translates the same node to the bubble centre with a smaller scale, so
+    // the buttons pop out of the bubble and retract back into it.
+    .position({
+      x: this.bubbleMenuButtonX(index) - BUBBLE_MENU_BUTTON_RADIUS_VP,
+      y: this.bubbleMenuButtonY(index) - BUBBLE_MENU_BUTTON_RADIUS_VP
+    })
+    .focusable(false)
+    // PC hover shows the same self-drawn label as a touch long press (bindTips
+    // never appeared for a long press on this device, so it is not used).
+    .onHover((isHover: boolean) => {
+      this.onBubblePointerHover('menu-' + index, isHover);
+      if (isHover) {
+        this.showBubbleMenuHint(index);
+      } else {
+        this.scheduleBubbleMenuHintHide(BUBBLE_MENU_HINT_HIDE_MS);
+      }
+    })
+    // Touch: a long press only shows the label; the release hides it shortly
+    // after. The TapGesture below is the only path that runs the action.
+    .onTouch((event: TouchEvent) => {
+      if (event.type === TouchType.Down) {
+        this.cancelBubbleMenuHintHide();
+      } else if (event.type === TouchType.Up ||
+                 event.type === TouchType.Cancel) {
+        this.onBubbleMenuHintRelease();
+      }
+    })
+    .gesture(
+      GestureGroup(GestureMode.Exclusive,
+        LongPressGesture({ fingers: 1, repeat: false, duration: BUBBLE_MENU_LONG_PRESS_MS })
+          .onAction(() => {
+            this.onBubbleMenuLongPress(index);
+          })
+          .onActionEnd(() => {
+            this.onBubbleMenuHintRelease();
+          })
+          .onActionCancel(() => {
+            this.onBubbleMenuHintRelease();
+          }),
+        TapGesture({ count: 1, fingers: 1, distanceThreshold: BUBBLE_DRAG_SLOP_VP })
+          .onAction(() => {
+            this.onBubbleMenuTap(index);
+          })
+      )
+    )
+    .transition(TransitionEffect.translate({
+      x: this.bubbleCenterX() - this.bubbleMenuButtonX(index),
+      y: this.bubbleCenterY() - this.bubbleMenuButtonY(index)
+    })
+      .combine(TransitionEffect.scale({ x: 0.4, y: 0.4 }))
+      .combine(TransitionEffect.OPACITY)
+      .animation({ duration: BUBBLE_MENU_ANIM_MS, curve: Curve.EaseOut }))
+  }
+
+  /**
+   * The shared text label for the menu buttons: PC hover and touch long press
+   * both show exactly this node. It is hit-test transparent and is positioned
+   * above the button (or below it near the top edge), anchored bottom-centre to
+   * the button's x by translate(-50%, -100%).
+   */
+  @Builder
+  private bubbleMenuHint() {
+    Text(this.bubbleMenuLabel(this.bubbleMenuHintIndex))
+      .fontSize(12)
+      .fontColor('#F2F2F2')
+      .maxLines(1)
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .backgroundColor('#E6202124')
+      .border({ width: 1, color: '#33FFFFFF' })
+      .borderRadius(8)
+      .shadow({ radius: 6, color: '#66000000', offsetY: 2 })
+      .position({ x: this.bubbleMenuHintX(), y: this.bubbleMenuHintY() })
+      .translate(this.bubbleMenuHintAbove()
+        ? { x: '-50%', y: '-100%' }
+        : { x: '-50%' })
+      .focusable(false)
+      .hitTestBehavior(HitTestMode.None)
   }
 
   build() {
@@ -4145,6 +5027,13 @@ struct Remote {
             this.lastAreaWidth = width;
             this.lastAreaHeight = height;
             if (resized) {
+              // A relayout moves the picture under the bubble / menu, so the
+              // menu no longer matches its fan: close it instead of animating
+              // buttons from a stale centre. layoutBubble() then re-converts the
+              // normalised position for the new size (edge snapping preserved)
+              // and clamps the bubble back inside the picture.
+              this.closeBubbleMenu('area-resize');
+              this.layoutBubble();
               this.redrawAfterResize();
               if (USE_GL_RENDER) {
                 this.handleViewResize();
@@ -4164,7 +5053,7 @@ struct Remote {
           .onHover((isHover: boolean) => {
             // The system pointer is shown outside the picture; the locally
             // drawn remote cursor must not stay behind as a ghost when the
-            // pointer moves up into the handle / operation bar.
+            // pointer moves up into the bubble or its radial menu.
             this.cursorOverlayHidden = !isHover;
             this.setHostCursorVisible(!isHover);
           })
@@ -4216,11 +5105,47 @@ struct Remote {
               if (!freshSingleDown) {
                 if (!this.multiTouchBlocked && fingers === 0) {
                   this.multiTouchActive = false;
+                  // A menu-dismiss sequence interrupted by extra fingers ends
+                  // here; do not keep swallowing later taps.
+                  this.clearBubbleMenuDismissSwallow('multi-finger');
                 }
                 return;
               }
               // A new one-finger touch starts here: the gesture is over.
               this.multiTouchActive = false;
+            }
+            // A press that dismisses an open radial menu belongs to the local
+            // menu only: swallow this whole one-finger sequence (down, every
+            // move, and the release) so the remote pointer never sees the
+            // dismissal click. With no menu open, the path below is unchanged.
+            const menuDismissTouch = this.bubbleMenuDismissSwallowTouch ||
+              ((this.bubbleMenuVisible || this.bubbleMenuDismissSwallowMouse) &&
+               event.type === TouchType.Down);
+            if (menuDismissTouch) {
+              const firstSwallowedEvent = !this.bubbleMenuDismissSwallowTouch;
+              if (firstSwallowedEvent) {
+                hilog.debug(DOMAIN, TAG,
+                  '菜单收起吞掉触摸 type=%{public}s fingers=%{public}d',
+                  Remote.touchTypeName(event.type), fingers);
+                if (this.bubbleMenuVisible) {
+                  this.closeBubbleMenu('picture-touch');
+                }
+                this.cursorOverlayHidden = false;
+                this.requestViewFocus();
+              }
+              this.bubbleMenuDismissSwallowTouch = true;
+              // Every event of the swallowed sequence resets the lost-release
+              // fuse; silence for BUBBLE_MENU_DISMISS_TIMEOUT_MS clears it.
+              this.armBubbleMenuDismissTimeout();
+              // Drop any pending local press; it must not become a click.
+              this.cancelLongPress('menu-dismiss');
+              this.abortSingleFingerInput();
+              this.resetTouchPressState();
+              if (event.type === TouchType.Up ||
+                  event.type === TouchType.Cancel || fingers === 0) {
+                this.clearBubbleMenuDismissSwallow('touch-release');
+              }
+              return;
             }
             if (event.touches.length > 0) {
               this.lastTouchX = event.touches[0].x;
@@ -4232,11 +5157,11 @@ struct Remote {
             }
             if (event.type === TouchType.Down) {
               // A touch on the picture means the pointer is no longer over the
-              // bar: restore the local cursor and retract the bar (unless the
-              // user pinned it). This stays inside the existing touch path;
-              // no pointer event is added or removed by it.
+              // bubble / menu: restore the local cursor and retract an open
+              // menu. This stays inside the existing touch path; no pointer
+              // event is added or removed by it.
               this.cursorOverlayHidden = false;
-              this.hideToolbar();
+              this.closeBubbleMenu('picture-touch');
               this.requestViewFocus();
               // Do not press yet: this touch may still become a pinch, a tap
               // or a long press. The mask-0 move keeps the remote pointer (and
@@ -4296,17 +5221,68 @@ struct Remote {
             // Any press or long-press still waiting for the touch must not fire
             // once the mouse owns this action.
             this.cancelLongPress('mouse');
+            if (event.action === MouseAction.Press) {
+              // Diagnostic for the "first click after the menu closed" report:
+              // this line proves whether the press reached this page and which
+              // local state (menu / swallow / pressed) saw it.
+              hilog.debug(DOMAIN, TAG,
+                '鼠标按下 x=%{public}d y=%{public}d menu=%{public}s swallow=%{public}s/%{public}s pressed=%{public}d',
+                Math.round(event.x), Math.round(event.y), String(this.bubbleMenuVisible),
+                String(this.bubbleMenuDismissSwallowTouch),
+                String(this.bubbleMenuDismissSwallowMouse), this.pressedMask);
+            }
+            // A mouse press that dismisses an open menu is consumed: neither it
+            // nor its moves and release may reach the remote pointer, and they
+            // must not move the locally drawn remote cursor either. Without an
+            // open menu the existing press/move/release path is unchanged.
+            const menuDismissPress = event.action === MouseAction.Press &&
+              (this.bubbleMenuVisible || this.bubbleMenuDismissSwallowTouch);
+            if (menuDismissPress) {
+              hilog.debug(DOMAIN, TAG,
+                '菜单收起吞掉鼠标按下 x=%{public}d y=%{public}d',
+                Math.round(event.x), Math.round(event.y));
+              this.closeBubbleMenu('picture-press');
+              this.bubbleMenuDismissSwallowMouse = true;
+              this.armBubbleMenuDismissTimeout();
+              // Focus normally follows touch, not mouse clicks, so grab it here;
+              // otherwise key events never reach onKeyPreIme.
+              this.requestViewFocus();
+              this.cancelLongPress('menu-dismiss');
+              this.abortSingleFingerInput();
+              this.resetTouchPressState();
+              return;
+            }
+            if (this.bubbleMenuDismissSwallowMouse) {
+              // A swallowed move must not update viewPointerX/Y: the poll's
+              // placeCursor() would then draw the local cursor away from the
+              // remote pointer, which never moved.
+              if (event.action === MouseAction.Release) {
+                this.clearBubbleMenuDismissSwallow('mouse-release');
+              } else {
+                this.armBubbleMenuDismissTimeout();
+              }
+              return;
+            }
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
             // The pointer is back over the picture: show the local cursor again
-            // (it was suppressed while the pointer was on the operation bar).
+            // (it was suppressed while on the bubble / menu).
             this.cursorOverlayHidden = false;
             // The local cursor follows every pointer event; the poll only acts
             // as the fallback for server-side shape/size changes.
             this.placeCursor();
             if (event.action === MouseAction.Press) {
-              // Focus normally follows touch, not mouse clicks, so grab it here;
-              // otherwise key events never reach onKeyPreIme.
+              if (this.pressedMask !== 0) {
+                // A second physical press cannot arrive before the previous
+                // release; that release must have been lost. Release the stale
+                // button explicitly instead of letting pointerDown() silently
+                // drop this press (which is exactly a "first click does
+                // nothing, second works" symptom).
+                hilog.debug(DOMAIN, TAG,
+                  '鼠标按下发现上次抬起丢失，先释放旧按键 pressed=%{public}d',
+                  this.pressedMask);
+                this.abortSingleFingerInput();
+              }
               this.requestViewFocus();
               this.pointerDown(event.x, event.y, Remote.buttonMask(event.button));
             } else if (event.action === MouseAction.Release) {
@@ -4365,14 +5341,14 @@ struct Remote {
           // one). It is interactive, unlike the old plain failure text.
           //
           // Every overlay control below (this failure overlay and its buttons,
-          // the operation bar and its buttons, the centre handle) is explicitly
-          // .focusable(false). They are driven only by clicks / hover and never
-          // need focus; without this they become the page's only focusable
-          // small controls, so the system draws its blue focus box around the
-          // handle whenever the page / window regains focus, and clicking one
-          // then also moves keyboard focus off remote_area / page_root, which is
-          // what onKeyPreIme listens on. The
-          // two keyboard entry points keep their focus attributes unchanged.
+          // the floating bubble and its radial menu buttons) is explicitly
+          // .focusable(false). They are driven only by clicks / gestures / hover
+          // and never need focus; without this they become the page's only
+          // focusable small controls, so the system draws its blue focus box
+          // around them whenever the page / window regains focus, and clicking
+          // one then also moves keyboard focus off remote_area / page_root,
+          // which is what onKeyPreIme listens on. The two keyboard entry points
+          // keep their focus attributes unchanged.
           if (this.failureVisible) {
             Column({ space: 18 }) {
               Text('连接已断开：' + this.failureDetail)
@@ -4408,169 +5384,92 @@ struct Remote {
             // through onto the remote picture underneath.
             .onClick(() => {})
           }
-          // ---- Floating operation bar -------------------------------------
+          // ---- Floating bubble and radial menu ----------------------------
           // Everything below is a SIBLING of remote_area inside this Stack, so
           // its mouse/touch events are hit-tested here and never enter the
           // remote pointer/key paths bound to remote_area or the page root.
-          // The only way to summon the bar on every device: a small centre
-          // handle. A full-width top-edge hover hot zone was removed on purpose
-          // -- it made the bar slide out whenever the pointer merely crossed
-          // the remote picture's top edge (e.g. aiming for a remote browser
-          // tab), covering exactly what the user was about to click. Hovering
-          // the handle only brightens it; opening is click-only.
           //
-          // Hidden while the bar is open (the bar occupies the same spot) and
-          // faded back in as the bar retracts, so the two never swap abruptly.
-          if (!this.toolbarVisible) {
+          // Tap = open / close the fan; drag past BUBBLE_DRAG_SLOP_VP = move the
+          // bubble. Tap and pan are an exclusive gesture group, so a tap can
+          // never drag and a drag can never tap. On release near an edge the
+          // bubble snaps to it with its centre 10 vp inside, so the visible shape
+          // is a large part-circle clear of the window-resize border.
+          //
+          // The bubble's position is normalised page state (bubbleFx / bubbleFy)
+          // converted with the current picture size; a new session starts
+          // bottom-right, fully visible, 24 vp clear of both edges.
+          if (this.bubblePlaced) {
             Stack({ alignContent: Alignment.Center }) {
-              Row()
-                .width(this.toolbarHandleHovered ? 56 : 48)
-                .height(4)
-                .borderRadius(2)
-                .backgroundColor(this.toolbarHandleHovered ? '#C0FFFFFF' : '#66FFFFFF')
+              this.bubbleGlyph()
             }
-            .width(TOOLBAR_HANDLE_WIDTH_VP)
-            .height(TOOLBAR_HANDLE_HEIGHT_VP)
-            .position({ x: '50%', y: 0 })
-            .translate({ x: '-50%' })
+            .width(BUBBLE_DIAMETER_VP)
+            .height(BUBBLE_DIAMETER_VP)
+            .borderRadius(BUBBLE_RADIUS_VP)
+            .backgroundColor('#B3202124')
+            .border({
+              width: 1,
+              color: this.bubbleMenuVisible ? '#B3FFFFFF' : '#66FFFFFF'
+            })
+            .shadow({ radius: 6, color: '#55000000', offsetY: 1 })
+            .opacity(this.bubbleOpacity())
+            .position({
+              x: this.bubbleCenterX() - BUBBLE_RADIUS_VP,
+              y: this.bubbleCenterY() - BUBBLE_RADIUS_VP
+            })
             .focusable(false)
             .onHover((isHover: boolean) => {
-              // Visual feedback only: hovering must never call showToolbar().
-              this.toolbarHandleHovered = isHover;
-              if (isHover) {
+              this.onBubblePointerHover('bubble', isHover);
+            })
+            .onTouch((event: TouchEvent) => {
+              // Visual feedback only: the gesture group below owns tap / drag.
+              if (event.type === TouchType.Down) {
+                this.bubblePressed = true;
                 this.cursorOverlayHidden = true;
+                this.cancelBubbleMenuHide();
+              } else if (event.type === TouchType.Up ||
+                         event.type === TouchType.Cancel) {
+                this.bubblePressed = false;
               }
             })
-            .onClick(() => {
-              this.cursorOverlayHidden = true;
-              this.showToolbar();
-            })
-            .transition(TransitionEffect.OPACITY
-              .animation({ duration: 200, curve: Curve.EaseOut }))
+            .gesture(
+              GestureGroup(GestureMode.Exclusive,
+                TapGesture({ count: 1, fingers: 1, distanceThreshold: BUBBLE_DRAG_SLOP_VP })
+                  .onAction(() => {
+                    this.onBubbleTap();
+                  }),
+                PanGesture({ fingers: 1, distance: BUBBLE_DRAG_SLOP_VP })
+                  .onActionStart(() => {
+                    this.onBubbleDragStart();
+                  })
+                  .onActionUpdate((event: GestureEvent) => {
+                    this.onBubbleDragUpdate(event.offsetX, event.offsetY);
+                  })
+                  .onActionEnd(() => {
+                    this.onBubbleDragEnd();
+                  })
+                  .onActionCancel(() => {
+                    this.onBubbleDragEnd();
+                  })
+              )
+            )
           }
-          if (this.toolbarVisible) {
-            Row() {
-              Text(this.toolbarPinned ? '取消固定' : '固定')
-                .fontSize(12)
-                .fontColor('#F2F2F2')
-                .textAlign(TextAlign.Center)
-                .layoutWeight(1)
-                .height('100%')
-                .borderRadius(12)
-                .backgroundColor(this.toolbarPinned ? '#33FFFFFF' : Color.Transparent)
-                .focusable(false)
-                .onClick(() => {
-                  this.toggleToolbarPinned();
-                })
-                .onHover((isHover: boolean) => {
-                  if (isHover) {
-                    this.toolbarHovered = true;
-                    this.cancelToolbarHide();
-                  } else {
-                    this.toolbarHovered = false;
-                    this.scheduleToolbarHide();
-                  }
-                })
-              Text('最小化')
-                .fontSize(12)
-                .fontColor('#F2F2F2')
-                .textAlign(TextAlign.Center)
-                .layoutWeight(1)
-                .height('100%')
-                .borderRadius(12)
-                .focusable(false)
-                .onClick(() => {
-                  this.minimizeThisWindow();
-                  if (this.touchUi) {
-                    this.hideToolbar();
-                  }
-                })
-                .onHover((isHover: boolean) => {
-                  if (isHover) {
-                    this.toolbarHovered = true;
-                    this.cancelToolbarHide();
-                  } else {
-                    this.toolbarHovered = false;
-                    this.scheduleToolbarHide();
-                  }
-                })
-              if (!this.phoneUi) {
-                Text(this.fullscreen ? '退出全屏' : '全屏')
-                  .fontSize(12)
-                  .fontColor('#F2F2F2')
-                  .textAlign(TextAlign.Center)
-                  .layoutWeight(1)
-                  .height('100%')
-                  .borderRadius(12)
-                  .focusable(false)
-                  .onClick(() => {
-                    this.toggleFullscreen();
-                    if (this.touchUi) {
-                      this.hideToolbar();
-                    }
-                  })
-                  .onHover((isHover: boolean) => {
-                    if (isHover) {
-                      this.toolbarHovered = true;
-                      this.cancelToolbarHide();
-                    } else {
-                      this.toolbarHovered = false;
-                      this.scheduleToolbarHide();
-                    }
-                  })
-              }
-              Text('断开')
-                .fontSize(12)
-                .fontColor('#FFB4AB')
-                .textAlign(TextAlign.Center)
-                .layoutWeight(1)
-                .height('100%')
-                .borderRadius(12)
-                .focusable(false)
-                .onClick(() => {
-                  this.disconnectThisSession();
-                })
-                .onHover((isHover: boolean) => {
-                  if (isHover) {
-                    this.toolbarHovered = true;
-                    this.cancelToolbarHide();
-                  } else {
-                    this.toolbarHovered = false;
-                    this.scheduleToolbarHide();
-                  }
-                })
+          if (this.bubbleMenuVisible && this.bubbleMenuAngles.length > 0) {
+            // The fan is computed so every button circle stays fully inside the
+            // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
+            // PC / tablet, [最小化, 断开] on a phone.
+            this.bubbleMenuButton(0)
+            if (this.bubbleMenuAngles.length > 1) {
+              this.bubbleMenuButton(1)
             }
-            .width('92%')
-            .constraintSize({ maxWidth: TOOLBAR_WIDTH_VP })
-            .height(TOOLBAR_HEIGHT_VP)
-            .padding({ left: 6, right: 6 })
-            .alignItems(VerticalAlign.Center)
-            .focusable(false)
-            .backgroundColor('#CC202124')
-            .borderRadius(TOOLBAR_HEIGHT_VP / 2)
-            .position({ x: '50%', y: TOOLBAR_TOP_VP })
-            .translate({ x: '-50%' })
-            .shadow({ radius: 8, color: '#66000000', offsetY: 2 })
-            // Any mouse movement over the bar (including over its buttons)
-            // keeps it alive; the retraction timer only wins once the pointer
-            // has left the bar.
-            .onMouse((event: MouseEvent) => {
-              this.cursorOverlayHidden = true;
-              this.cancelToolbarHide();
-            })
-            .onHover((isHover: boolean) => {
-              if (isHover) {
-                this.toolbarHovered = true;
-                this.cursorOverlayHidden = true;
-                this.cancelToolbarHide();
-              } else {
-                this.toolbarHovered = false;
-                this.scheduleToolbarHide();
-              }
-            })
-            .transition(TransitionEffect.translate({ y: -TOOLBAR_HEIGHT_VP })
-              .combine(TransitionEffect.OPACITY)
-              .animation({ duration: 200, curve: Curve.EaseOut }))
+            if (this.bubbleMenuAngles.length > 2) {
+              this.bubbleMenuButton(2)
+            }
+            if (this.bubbleMenuHintIndex >= 0 &&
+                this.bubbleMenuHintIndex < this.bubbleMenuAngles.length) {
+              // One shared, hit-test-transparent text label: PC hover and touch
+              // long press show the same node; rendered last so it is on top.
+              this.bubbleMenuHint()
+            }
           }
         }
         .width('100%')
