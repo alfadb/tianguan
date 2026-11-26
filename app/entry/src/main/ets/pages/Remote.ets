@@ -14,8 +14,9 @@
  *
  * The page is the remote picture plus a small floating bubble that can be
  * dragged anywhere inside the picture (normalised page coordinates, no
- * persistence). Tapping the bubble fans out a radial menu (minimise,
- * fullscreen on desktop, disconnect); dragging it moves it and snaps it half
+ * persistence). Tapping the bubble fans out a radial menu (minimise on
+ * desktop, back to the connection list on phone/tablet, fullscreen on desktop,
+ * disconnect); dragging it moves it and snaps it half
  * out of the nearest edge. The bubble and the menu buttons are siblings of the
  * picture, so nothing else covers it and their pointer events never reach the
  * remote input. The connection name belongs to the window title (set by
@@ -754,9 +755,14 @@ struct Remote {
   private bubbleMenuLongPressIndex: number = -1;
   private bubbleMenuLongPressMs: number = 0;
   private disconnectRequested: boolean = false;
+  // 2-in-1 keeps the real minimize. On a phone a full-screen session window's
+  // minimize() backgrounds the whole app task (it lands on the launcher), so
+  // phone / tablet use "回到主列表" instead: raise EntryAbility and leave this
+  // session window behind, still connected.
+  private readonly pcUi: boolean = deviceInfo.deviceType === '2in1';
   // Touch-first layout: a phone has no title bar at all, so its menu is shorter
-  // (no fullscreen button) and its destructive action is red and at the far end
-  // of the fan. Tablet keeps the PC button set.
+  // (no fullscreen button). Tablet keeps the fullscreen button. Phone and tablet
+  // both replace "最小化" with "主列表" (see bubbleMenuAction()).
   private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
   // --- Remote-resolution follow ---------------------------------------------
   // PC, phone and tablet. resizeDisabled is sticky for this page/window: a
@@ -1884,14 +1890,20 @@ struct Remote {
     }, BUBBLE_MENU_DISMISS_TIMEOUT_MS);
   }
 
-  /** PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps the PC set. */
+  /**
+   * PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps 3 (fullscreen), but
+   * its first button is "主列表" like the phone. The first button is always at
+   * the -end of the fan.
+   */
   private bubbleMenuCount(): number {
     return this.phoneUi ? 2 : 3;
   }
 
   private bubbleMenuAction(index: number): string {
     if (index === 0) {
-      return 'minimize';
+      // 2-in-1 minimises its floating window; phone/tablet raise the connection
+      // list instead because minimize() would background the whole app task.
+      return this.pcUi ? 'minimize' : 'main-list';
     }
     if (this.phoneUi) {
       return 'disconnect';
@@ -1901,7 +1913,7 @@ struct Remote {
 
   private bubbleMenuLabel(index: number): string {
     if (index === 0) {
-      return '最小化';
+      return this.pcUi ? '最小化' : '主列表';
     }
     if (this.phoneUi) {
       return '断开';
@@ -1941,7 +1953,7 @@ struct Remote {
 
   /**
    * Path commands are in PX (ArkUI Shape / Path does not scale them with the
-   * component). All four icons are designed on a 16-unit grid symmetric about
+   * component). All menu glyphs are designed on a 16-unit grid symmetric about
    * (8,8) and every coordinate is multiplied by px/16, so the ink fills the
    * square pixel drawing area and its centre stays at the area centre.
    */
@@ -1952,6 +1964,12 @@ struct Remote {
     const l = (x: number, y: number): string => 'L' + px(x) + ' ' + px(y);
     if (action === 'minimize') {
       return m(1, 8) + l(15, 8);
+    }
+    if (action === 'main-list') {
+      // Phone/tablet "主列表" is a list glyph: three bars of different lengths,
+      // symmetric about (8,8); the top bar spans the same 1..15 horizontal ink
+      // extent as the other 14/16 icons.
+      return m(1, 4) + l(15, 4) + m(3, 8) + l(13, 8) + m(5, 12) + l(11, 12);
     }
     if (action === 'fullscreen') {
       if (this.fullscreen) {
@@ -2028,9 +2046,10 @@ struct Remote {
    * towards the picture centre and as wide as 110 deg; when a button circle
    * would cross an edge (any of the four edges or corners) the search shrinks
    * the span and rotates the fan until every circle fits, so the fan always
-   * opens towards the inside of the picture. The order is [最小化, 全屏, 断开]
-   * on PC and [最小化, 断开] on a phone: 断开 is the +end of the fan, so it is
-   * the button farthest from 最小化 and never sits between the bubble and the
+   * opens towards the inside of the picture. The first button is always at the
+   * -end: [最小化, 全屏, 断开] on PC, [主列表, 全屏, 断开] on tablet and
+   * [主列表, 断开] on phone. 断开 is the +end of the fan, so it is the button
+   * farthest from the first action and never sits between the bubble and the
    * other actions. If even the narrowest fan does not fit (a picture only a few
    * vp wide), the per-button clamp in bubbleMenuButtonX/Y still keeps every
    * circle inside.
@@ -2078,6 +2097,8 @@ struct Remote {
     this.closeBubbleMenu('action-' + action);
     if (action === 'minimize') {
       this.minimizeThisWindow();
+    } else if (action === 'main-list') {
+      this.returnToMainList();
     } else if (action === 'fullscreen') {
       this.toggleFullscreen();
     } else if (action === 'disconnect') {
@@ -2085,7 +2106,46 @@ struct Remote {
     }
   }
 
-  /** Minimises THIS session window (on a phone: sends it to the background). */
+  /**
+   * Phone/tablet "主列表": raise the connection list with this page's own
+   * UIAbilityContext. Deliberately does NOT minimise: on a phone the full-screen
+   * session window's minimize() backgrounds the whole app task and lands on the
+   * launcher. The session stays connected and its window stays behind the list;
+   * the list's existing 打开 path restores the window. A failed startAbility
+   * only logs and leaves the current state (no minimize fallback, which would
+   * show the launcher instead).
+   */
+  private returnToMainList(): void {
+    if (this.disposed) {
+      return;
+    }
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      hilog.warn(DOMAIN, TAG, 'remote bubble menu 主列表失败：拿不到 host context');
+      return;
+    }
+    const ability: common.UIAbilityContext = context as common.UIAbilityContext;
+    const listWant: Want = {
+      bundleName: ability.abilityInfo.bundleName,
+      abilityName: 'EntryAbility'
+    };
+    hilog.info(DOMAIN, TAG,
+      'remote bubble menu 回到主列表 session=%{public}s', this.sessionId);
+    try {
+      ability.startAbility(listWant).then((): void => {
+        hilog.info(DOMAIN, TAG,
+          'remote bubble menu 主列表已拉起 session=%{public}s', this.sessionId);
+      }).catch((error: Error): void => {
+        hilog.warn(DOMAIN, TAG,
+          'remote bubble menu 回到主列表失败：%{public}s', String(error));
+      });
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG,
+        'remote bubble menu 回到主列表异常：%{public}s', String(error));
+    }
+  }
+
+  /** Minimises THIS session window (2-in-1 only; phone/tablet use the list). */
   private minimizeThisWindow(): void {
     const own = this.fullscreenWindow();
     if (own === undefined) {
@@ -4765,7 +4825,8 @@ struct Remote {
    * system-symbol catalogue (sys.symbol appears only in type declarations, with
    * no bundled symbol resource index), so SymbolGlyph names cannot be verified
    * here; simple shapes avoid a resource that might be missing on the device.
-   *  - 最小化: one horizontal bar
+   *  - 最小化 (PC only): one horizontal bar
+   *  - 主列表 (phone/tablet): three bars of different lengths
    *  - 全屏 / 退出全屏: outward / inward corner brackets
    *  - 断开: a cross
    */
@@ -5456,7 +5517,7 @@ struct Remote {
           if (this.bubbleMenuVisible && this.bubbleMenuAngles.length > 0) {
             // The fan is computed so every button circle stays fully inside the
             // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
-            // PC / tablet, [最小化, 断开] on a phone.
+            // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone.
             this.bubbleMenuButton(0)
             if (this.bubbleMenuAngles.length > 1) {
               this.bubbleMenuButton(1)
