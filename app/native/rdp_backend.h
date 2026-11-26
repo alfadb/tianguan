@@ -159,7 +159,9 @@ struct RdpHost {
 };
 
 // Blocks until the host asks to stop. While running it performs the same
-// connect / connected / reconnect with backoff cycle as the VNC session loop.
+// connect / connected / reconnect with backoff cycle as the VNC session loop,
+// except that a session taken over by another connection ends in
+// failed/session-taken-over and is never retried automatically.
 void runRdpSession(const RdpHost& host, const RdpOptions& options);
 
 }  // namespace tianguan

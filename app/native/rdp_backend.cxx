@@ -10,9 +10,14 @@
 //
 //   beginAttempt() -> connecting -> [connect: TCP, TLS, NLA, activation]
 //     failure: auth -> failed/auth-failed, protocol -> failed/protocol,
+//              other connection took the session over ->
+//              failed/session-taken-over (terminal, no retry),
 //              transport -> reconnecting/network with 1s..4s backoff
 //     success: connected (PostConnect) -> 10 ms event loop -> connection lost
-//              -> reconnecting/network with backoff, or reconnect on a new
+//              -> reconnecting/network with backoff, or
+//              failed/session-taken-over when FreeRDP reports that the server
+//              ended the session for another connection (same account: one
+//              active Windows session only), or reconnect on a new
 //              generation, or clean exit when stop is set.
 //
 // Every callback runs on the session thread. Only the session thread writes
@@ -57,6 +62,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1572,6 +1578,14 @@ std::string singleLine(const char* text) {
   return out;
 }
 
+// Fixed-width hex for diagnostic log lines: the raw FreeRDP error values are
+// only meaningful in hex (class/type bit fields).
+std::string hex32(UINT32 value) {
+  char buffer[16];
+  std::snprintf(buffer, sizeof(buffer), "0x%08" PRIX32, value);
+  return std::string(buffer);
+}
+
 void replaceAll(std::string& text, const std::string& needle) {
   if (needle.empty()) return;
   const std::string replacement = "[redacted]";
@@ -1613,9 +1627,53 @@ enum RdpFailureClass {
   RdpFailureAuth,
   RdpFailureNetwork,
   RdpFailureProtocol,
+  RdpFailureTakenOver,
 };
 
+// Windows desktop allows one interactive session per account. When a second
+// connection to that account is accepted, the server tells the already
+// connected session ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION and closes it.
+// Retrying from here would take the session back and make both windows kick
+// each other forever (the observed failure), so this is terminal.
+const char* const kSessionTakenOverMessage =
+    "该账号的远程会话已被其它连接接管：同一 Windows 账号只允许一个远程会话";
+
+const char* failureClassName(RdpFailureClass failure) {
+  switch (failure) {
+    case RdpFailureAuth:
+      return "auth";
+    case RdpFailureNetwork:
+      return "network";
+    case RdpFailureProtocol:
+      return "protocol";
+    case RdpFailureTakenOver:
+      return "session-taken-over";
+  }
+  return "unknown";
+}
+
+// context->disconnectUltimatum / freerdp_get_disconnect_ultimatum(): the MCS
+// Disconnect Provider Ultimatum reason. FreeRDP maps a missing Set Error Info
+// PDU to ERRINFO_RPC_INITIATED_DISCONNECT or ERRINFO_LOGOFF_BY_USER from it.
+const char* disconnectUltimatumName(int reason) {
+  switch (reason) {
+    case Disconnect_Ultimatum_domain_disconnected:
+      return "domain-disconnected";
+    case Disconnect_Ultimatum_provider_initiated:
+      return "provider-initiated";
+    case Disconnect_Ultimatum_token_purged:
+      return "token-purged";
+    case Disconnect_Ultimatum_user_requested:
+      return "user-requested";
+    case Disconnect_Ultimatum_channel_purged:
+      return "channel-purged";
+  }
+  return "unknown";
+}
+
 RdpFailureClass classifyConnectFailure(UINT32 code, bool sawLogonErrorInfo) {
+  if (code == FREERDP_ERROR_DISCONNECTED_BY_OTHER_CONNECTION)
+    return RdpFailureTakenOver;
   switch (code) {
     // Credentials: the UI's existing auth-failed flow (password retry) applies.
     case FREERDP_ERROR_AUTHENTICATION_FAILED:
@@ -2620,10 +2678,14 @@ struct Attempt {
   CliprdrBridge clipboard;
   GfxBridge gfx;
   bool connected;
+  // Why eventLoop() stopped; one literal assigned at each exit point. Logged
+  // once with the raw FreeRDP disconnect reason before teardown.
+  const char* exitReason;
 
   Attempt(const RdpHost& host, const RdpOptions& options, int generation)
       : host(host), options(options), generation(generation), context(nullptr),
-        instance(nullptr), attempt(nullptr), connected(false) {}
+        instance(nullptr), attempt(nullptr), connected(false),
+        exitReason("not-started") {}
 
   ~Attempt() { teardown(); }
 
@@ -2697,6 +2759,15 @@ struct Attempt {
   bool configure() {
     if (context == nullptr || context->settings == nullptr) return false;
     rdpSettings* settings = context->settings;
+    // Advertise RNS_UD_CS_SUPPORT_ERRINFO_PDU in Client Core Data. Per
+    // MS-RDPBCGR 2.2.5.1 / 3.3.5.7.1 the server MUST NOT send the Server Set
+    // Error Info PDU to a client that did not set this flag. FreeRDP 3.9.0
+    // leaves FreeRDP_SupportErrorInfoPdu FALSE for clients (settings.c sets it
+    // to ServerMode), so without this the takeover reason
+    // (ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION) never reaches us and the
+    // kicked session is indistinguishable from a network drop.
+    if (!freerdp_settings_set_bool(settings, FreeRDP_SupportErrorInfoPdu, TRUE))
+      return false;
     // Security stays at FreeRDP's defaults: NLA/TLS/RDP with negotiation.
     return freerdp_settings_set_string(settings, FreeRDP_ServerHostname,
                                        options.host.c_str()) &&
@@ -2747,6 +2818,71 @@ struct Attempt {
   UINT32 lastError() const {
     return context != nullptr ? freerdp_get_last_error(context)
                               : static_cast<UINT32>(FREERDP_ERROR_NONE);
+  }
+
+  // The server's last Error Info PDU (rdpRdp::errorInfo). xfreerdp and the SDL
+  // clients read exactly this to tell a network drop (ERRINFO_SUCCESS) from a
+  // server-announced disconnect reason, so it is also the right source for
+  // "another connection took this session over". Valid until teardown().
+  UINT32 disconnectErrorInfo() const {
+    return instance != nullptr && instance->context != nullptr &&
+                   instance->context->rdp != nullptr
+               ? freerdp_error_info(instance)
+               : 0;
+  }
+
+  // freerdp_check_event_handles() reads at most one core PDU per call and then
+  // also reports channel errors. When a channel error stops the event loop, the
+  // server's preceding Set Error Info PDU may still be queued. Drain a bounded
+  // number of core PDUs before the session is classified, so the disconnect
+  // reason is actually written to rdp->errorInfo. Do not drain once the abort
+  // event is set: transport_read_layer() discards a just-read PDU in that state.
+  void drainCorePdus() {
+    if (instance == nullptr || instance->context == nullptr) return;
+    if (freerdp_shall_disconnect_context(instance->context)) return;
+    for (int i = 0; i < 64; ++i) {
+      if (!freerdp_check_fds(instance)) break;
+      if (freerdp_shall_disconnect_context(instance->context)) break;
+    }
+  }
+
+  // One diagnose line per disconnect, before teardown() resets errorInfo. It
+  // prints every raw value a future "why did FreeRDP not report the reason"
+  // investigation needs: both error fields, the MCS ultimatum reason, the
+  // abort flag, the channel error and whether the Error Info PDU was
+  // advertised at connect time.
+  void logDisconnectDiagnostics() const {
+    if (instance == nullptr || instance->context == nullptr ||
+        instance->context->rdp == nullptr) {
+      diagWarn(std::string("rdp: disconnect diag exit=") + exitReason +
+               " (no FreeRDP context)");
+      return;
+    }
+    rdpContext* ctx = instance->context;
+    const UINT32 errorInfo = freerdp_error_info(instance);
+    const UINT32 lastError = freerdp_get_last_error(ctx);
+    const char* lastName = freerdp_get_last_error_name(lastError);
+    const char* lastText = freerdp_get_last_error_string(lastError);
+    const int ultimatum = freerdp_get_disconnect_ultimatum(ctx);
+    const bool abortSet = freerdp_shall_disconnect_context(ctx) != FALSE;
+    const UINT channelError = getChannelError(ctx);
+    const char* channelText = getChannelErrorDescription(ctx);
+    const bool supportErrorInfo =
+        ctx->settings != nullptr &&
+        freerdp_settings_get_bool(ctx->settings, FreeRDP_SupportErrorInfoPdu);
+
+    std::string line = std::string("rdp: disconnect diag exit=") + exitReason +
+                      " errorInfo=" + hex32(errorInfo) +
+                      " lastError=" + hex32(lastError) + " (";
+    if (lastName != nullptr) line += singleLine(lastName);
+    line += ") lastErrorText=\"" + singleLine(lastText) + "\" ultimatum=" +
+            std::to_string(ultimatum) + "(" +
+            disconnectUltimatumName(ultimatum) + ") abort=" +
+            (abortSet ? "1" : "0") + " channelError=" +
+            std::to_string(channelError) + " channelErrorDesc=\"" +
+            singleLine(channelText) + "\" supportErrorInfo=" +
+            (supportErrorInfo ? "1" : "0");
+    diagWarn(line);
   }
 
   // Hook the cliprdr callbacks once the channel has been opened by
@@ -2820,15 +2956,32 @@ struct Attempt {
     sink.release = sinkRelease;
     sink.clipboard = sinkClipboard;
 
+    exitReason = "stop-requested";
     while (!host.stopRequested(host.user)) {
-      if (host.generation(host.user) != generation) break;
+      if (host.generation(host.user) != generation) {
+        exitReason = "generation-changed";
+        diagWarn("rdp: event loop exit: generation-changed");
+        break;
+      }
       HANDLE handles[MAXIMUM_WAIT_OBJECTS] = {0};
       const DWORD count =
           freerdp_get_event_handles(context, handles, ARRAYSIZE(handles));
-      if (count == 0) break;
+      if (count == 0) {
+        exitReason = "no-event-handles";
+        diagWarn("rdp: event loop exit: no-event-handles");
+        break;
+      }
       const DWORD wait = WaitForMultipleObjects(count, handles, FALSE, kLoopWaitMs);
-      if (wait == WAIT_FAILED) break;
-      if (!freerdp_check_event_handles(context)) break;
+      if (wait == WAIT_FAILED) {
+        exitReason = "wait-failed";
+        diagWarn("rdp: event loop exit: wait-failed");
+        break;
+      }
+      if (!freerdp_check_event_handles(context)) {
+        exitReason = "check-event-handles-false";
+        diagWarn("rdp: event loop exit: check-event-handles-false");
+        break;
+      }
       // requestFullFrame(): treat the next update as a full-screen commit.
       host.consumeFullRequest(host.user);
       // requestDesktopSize(): a size queued from the NAPI thread is turned into
@@ -2848,8 +3001,14 @@ struct Attempt {
           freerdp_input_send_synchronize_event(context->input, toggleFlags);
       }
       host.drainInput(host.user, &sink, &bridge.appliedRelease);
-      if (freerdp_shall_disconnect_context(context)) break;
+      if (freerdp_shall_disconnect_context(context)) {
+        exitReason = "shall-disconnect";
+        diagWarn("rdp: event loop exit: shall-disconnect");
+        break;
+      }
     }
+    if (std::strcmp(exitReason, "stop-requested") == 0)
+      diagWarn("rdp: event loop exit: stop-requested");
     if (bridge.droppedClipboards > 0) {
       // The text is reported as delivered to the caller, so say plainly that
       // it could not be forwarded (cliprdr channel missing or not ready).
@@ -2986,6 +3145,25 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
           attempt.attempt != nullptr && attempt.attempt->fingerprintMismatch;
       const RdpFailureClass failure = classifyConnectFailure(code, sawLogonErrorInfo);
       const std::string message = connectErrorText(code, options);
+      // Some connect failures overwrite last_error with a later transport code
+      // after the server sent its Error Info PDU; the PDU value survives in the
+      // rdp instance, so consult both before classifying as protocol/network.
+      const UINT32 connectErrorInfo = attempt.disconnectErrorInfo();
+      {
+        const char* codeName = freerdp_get_last_error_name(code);
+        const char* codeText = freerdp_get_last_error_string(code);
+        const bool supportErrorInfo =
+            attempt.context != nullptr && attempt.context->settings != nullptr &&
+            freerdp_settings_get_bool(attempt.context->settings,
+                                      FreeRDP_SupportErrorInfoPdu);
+        diagWarn(
+            std::string("rdp: connect failure code=") + hex32(code) + " (" +
+            singleLine(codeName) + ") errorInfo=" + hex32(connectErrorInfo) +
+            " class=" + failureClassName(failure) + " sawLogonErrorInfo=" +
+            (sawLogonErrorInfo ? "1" : "0") + " supportErrorInfo=" +
+            (supportErrorInfo ? "1" : "0") + " text=\"" + singleLine(codeText) +
+            "\"");
+      }
       attempt.teardown();
       if (trustRequired) {
         // setTrustRequired() already published phase=trust-required with the
@@ -2996,6 +3174,17 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
       if (fingerprintMismatch) {
         setPhase(host, RdpPhaseFailed,
                  "服务端指纹与已信任值不一致，已拒绝连接", "fingerprint-mismatch", 0);
+        host.waitForReconnect(host.user);
+        continue;
+      }
+      if (failure == RdpFailureTakenOver ||
+          connectErrorInfo == ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION) {
+        // The server told this attempt that another connection owns the
+        // account's only session. Retrying would take it back; wait for the
+        // user to reconnect deliberately.
+        diagWarn("rdp: session taken over during connect; terminal (no auto-reconnect)");
+        setPhase(host, RdpPhaseFailed, kSessionTakenOverMessage,
+                 "session-taken-over", 0);
         host.waitForReconnect(host.user);
         continue;
       }
@@ -3023,9 +3212,29 @@ void runRdpSession(const RdpHost& host, const RdpOptions& options) {
     attempt.eventLoop();
     const bool stopping = host.stopRequested(host.user);
     const bool superseded = host.generation(host.user) != generation;
+    // A channel error can stop eventLoop() before the server's preceding Set
+    // Error Info PDU was parsed (one core PDU per check_event_handles() call).
+    // Flush that bounded queue before reading the reason, then print the raw
+    // values once so a device log can prove what the server actually sent.
+    if (!stopping && !superseded) attempt.drainCorePdus();
+    attempt.logDisconnectDiagnostics();
+    const UINT32 disconnectReason = attempt.disconnectErrorInfo();
+    const UINT32 disconnectLastError = attempt.lastError();
     attempt.teardown();
     if (stopping) break;
     if (superseded) continue;
+    if (disconnectReason == ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION ||
+        disconnectLastError == FREERDP_ERROR_DISCONNECTED_BY_OTHER_CONNECTION) {
+      // Windows desktop allows one session per account: this session was
+      // kicked by the other window. Reconnecting would kick that one back and
+      // recreate the two-window fight that left the server unresponsive, so
+      // stop here and let the user reconnect deliberately.
+      diagWarn("rdp: session taken over; terminal (no auto-reconnect)");
+      setPhase(host, RdpPhaseFailed, kSessionTakenOverMessage,
+               "session-taken-over", 0);
+      host.waitForReconnect(host.user);
+      continue;
+    }
     // Same terminal wording as the VNC loop: a lost connection is a network
     // event that is retried with backoff, not a terminal failure.
     setPhase(host, RdpPhaseReconnecting, "connection closed", "network",

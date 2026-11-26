@@ -270,8 +270,8 @@ fi
 # 4. FreeRDP 3.9.0: minimal client + winpr static PIC, OpenSSL/zlib/FFmpeg from
 #    the shared prefix. OHOS musl libc exposes no pthread_cancel declaration or
 #    dynamic symbol, so WinPR's TerminateThread must take the "not supported"
-#    branch. This is the only source change and it is applied to a disposable
-#    copy of the checkout.
+#    branch. Two source changes are applied to a disposable copy of the
+#    checkout: this TerminateThread branch and the addin-provider guard below.
 # ---------------------------------------------------------------------------
 freerdp_copy="$build/freerdp-src"
 freerdp_build="$build/freerdp-build"
@@ -295,6 +295,50 @@ patch -d "$freerdp_copy" -p1 --batch --forward \
   < "$build/freerdp-ohos-pthread-cancel.patch" > "$build/freerdp-patch.log" 2>&1 || {
     echo 'FreeRDP OHOS patch failed to apply' >&2
     cat "$build/freerdp-patch.log" >&2
+    exit 1
+  }
+
+# libfreerdp/client-common/client.c: freerdp_client_context_new() runs for every
+# connection attempt and used to overwrite the process-wide addin provider with
+# the default static resolver unconditionally. The app installs its own provider
+# (rdpsnd "tianguan" subsystem) after each context creation; while a second
+# session is in that call, an already connected session can resolve a static or
+# dynamic channel and get NULL ("Failed to load addins") -> its event loop exits
+# -> it reconnects. Guard the default registration so it only fills an empty
+# slot: the first context in the process behaves exactly as before, and a custom
+# provider installed afterwards is never overwritten.
+cat > "$build/freerdp-keep-addin-provider.patch" <<'PATCH'
+diff --git a/client/common/client.c b/client/common/client.c
+index 3d0b5dd..4b1e517 100644
+--- a/client/common/client.c
++++ b/client/common/client.c
+@@ -142,9 +142,18 @@ rdpContext* freerdp_client_context_new(const RDP_CLIENT_ENTRY_POINTS* pEntryPoin
+ 	context->instance = instance;
+ 
+ #if defined(WITH_CHANNELS)
+-	if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) !=
+-	    CHANNEL_RC_OK)
+-		goto out_fail2;
++	/* TIANGUAN: keep an addin provider that the application already installed.
++	 * The provider slot is process-wide, but this function runs once per
++	 * connection attempt; resetting the slot here races with channel/addin
++	 * lookups on a session that is already connected. The first context in the
++	 * process still installs the default resolver because the slot starts NULL;
++	 * a custom provider installed afterwards stays in place. */
++	if (freerdp_get_current_addin_provider() == NULL)
++	{
++		if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) !=
++		    CHANNEL_RC_OK)
++			goto out_fail2;
++	}
+ #endif
+ 
+ 	return context;
+PATCH
+patch -d "$freerdp_copy" -p1 --batch --forward \
+  < "$build/freerdp-keep-addin-provider.patch" > "$build/freerdp-addin-patch.log" 2>&1 || {
+    echo 'FreeRDP addin-provider patch failed to apply' >&2
+    cat "$build/freerdp-addin-patch.log" >&2
     exit 1
   }
 
@@ -438,6 +482,22 @@ for symbol in avcodec_find_decoder avcodec_send_packet avcodec_receive_frame sws
     echo "libfreerdp3.a does not reference $symbol" >&2; exit 1
   }
 done
+
+# Addin-provider guard patch: client-common must consult the process-wide slot
+# before installing its default resolver. Without the patch client.c.o has no
+# reference to freerdp_get_current_addin_provider, and a later
+# freerdp_client_context_new() can clear the app's custom provider while an
+# already connected session is loading a static/dynamic channel.
+"$llvm_nm" -A "$prefix/lib/libfreerdp-client3.a" > "$evidence/libfreerdp-client3.symbols.txt"
+grep -Eq 'client\.c\.o:.*[[:space:]]U freerdp_get_current_addin_provider$' \
+  "$evidence/libfreerdp-client3.symbols.txt" || {
+    echo 'FreeRDP addin-provider guard patch is missing: freerdp_client_context_new still overwrites the provider' >&2
+    exit 1
+  }
+grep -Eq "[[:space:]]T freerdp_get_current_addin_provider$" "$evidence/libfreerdp3.symbols.txt" || {
+  echo 'libfreerdp3.a does not define freerdp_get_current_addin_provider' >&2
+  exit 1
+}
 
 # FreeRDP's CMake cache/config.h must show FFmpeg/swscale enabled and every
 # component resolved to an archive inside this prefix (not a host copy).
@@ -596,9 +656,15 @@ mkdir -p "$prefix/share"
   printf '         WITH_UNICODE_BUILTIN=ON, WITH_CHANNELS=ON, only drdynvc+rdpei+cliprdr+rdpgfx+rdpsnd+rdpdr+disp client channels on,\n'
   printf '         BUILD_SHARED_LIBS=OFF, CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF, CMAKE_POSITION_INDEPENDENT_CODE=ON,\n'
   printf '         OPENSSL_ROOT_DIR/ZLIB_ROOT=%s, OPENSSL_USE_STATIC_LIBS=ON.\n' "$prefix"
-  printf '  Source patch: winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'
-  printf '  branch on __OHOS__ as well as ANDROID, because OHOS musl has no pthread_cancel\n'
-  printf '  declaration or dynamic symbol. No other source changes.\n'
+  printf '  Source patches:\n'
+  printf '  1. winpr/libwinpr/thread/thread.c TerminateThread uses the "not supported"\n'
+  printf '     branch on __OHOS__ as well as ANDROID, because OHOS musl has no pthread_cancel\n'
+  printf '     declaration or dynamic symbol.\n'
+  printf '  2. client/common/client.c freerdp_client_context_new() installs the default\n'
+  printf '     addin resolver only when the process-wide provider slot is still empty, so a\n'
+  printf '     custom provider installed by the application is never overwritten by a later\n'
+  printf '     connection attempt (two concurrent sessions would otherwise lose it while the\n'
+  printf '     other session loads a channel). Validated with llvm-nm on client.c.o.\n'
   printf '\nLink order for consumers (static):\n'
   printf '  -lfreerdp-client3 -lfreerdp3 -lwinpr3 -lwinpr-tools3 -lssl -lcrypto -lz \\\n'
   printf '    -lavcodec -lswscale -lswresample -lavutil -lpthread -ldl -lm\n'

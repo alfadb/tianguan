@@ -1209,7 +1209,8 @@ struct SessionState {
 
   bool connected;           // meta
   std::string error;        // meta, always a single line
-  std::string errorCode;    // meta
+  std::string errorCode;    // meta: none|auth-failed|fingerprint-mismatch|network|
+                            //       protocol|session-taken-over (RDP only)
   std::string fingerprint;  // meta
 
   std::deque<QueuedInput> inputs;  // input
@@ -2368,6 +2369,12 @@ int rdpHostBeginAttempt(void* user, int* lastApplied) {
 
 void rdpHostSetPhase(void* user, int phase, const char* error,
                      const char* errorCode, int retryInMs) {
+  // RDP terminal failures pass their code through unchanged; the backend owns
+  // the classification (auth-failed / fingerprint-mismatch / protocol /
+  // session-taken-over) and this adapter only stores it, so statusJson() emits
+  // it verbatim. session-taken-over is always PhaseFailed (state=failed); the
+  // end-of-session cleanup below keeps PhaseFailed intact and never turns it
+  // into PhaseDisconnected.
   setPhase(*static_cast<SessionState*>(user), phase,
            error != nullptr ? error : "",
            errorCode != nullptr ? errorCode : "none", retryInMs);
