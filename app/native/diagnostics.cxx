@@ -1181,7 +1181,7 @@ struct SessionState {
   std::string securityTypes = "RA2_256,RA2";
 
   std::mutex meta;   // phase/error/retry/generation decisions
-  std::mutex input;  // queued input + release epoch
+  std::mutex input;  // queued input + release epoch + pending lock sync
   std::mutex pix;    // framebuffer mirror, region, cursor, versions
   std::mutex clip;   // clipboard text
   // Client-initiated desktop resize. The NAPI thread only records the size; the
@@ -1213,6 +1213,12 @@ struct SessionState {
   std::string fingerprint;  // meta
 
   std::deque<QueuedInput> inputs;  // input
+  // syncRemoteLockState(): newest absolute CapsLock/NumLock state for RDP.
+  // The NAPI thread overwrites these under the input lock; the RDP session
+  // thread consumes them and turns them into a Sync PDU.
+  bool lockSyncPending = false;  // input
+  bool lockCapsLock = false;     // input
+  bool lockNumLock = false;      // input
 
   int fbWidth, fbHeight;          // pix
   int version;                    // pix
@@ -2632,6 +2638,21 @@ void rdpDrainInput(void* user, const tianguan::RdpInputSink* sink,
   }
 }
 
+// syncRemoteLockState() adapter for RDP: the session thread takes the newest
+// absolute lock state and clears the pending flag in one step. A value queued
+// while disconnected stays pending for the next connection that reaches the
+// event loop.
+bool rdpTakeLockSyncRequest(void* user, bool* capsLock, bool* numLock) {
+  if (capsLock == nullptr || numLock == nullptr) return false;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.input);
+  if (!state.lockSyncPending) return false;
+  state.lockSyncPending = false;
+  *capsLock = state.lockCapsLock;
+  *numLock = state.lockNumLock;
+  return true;
+}
+
 void rdpConsumeFullRequest(void* user) {
   SessionState& state = *static_cast<SessionState*>(user);
   if (!state.needFullRequest.exchange(false)) return;
@@ -2762,6 +2783,7 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
   bridge.setCursorPos = rdpSetCursorPos;
   bridge.prepareInput = rdpPrepareInput;
   bridge.drainInput = rdpDrainInput;
+  bridge.takeLockSyncRequest = rdpTakeLockSyncRequest;
   bridge.consumeFullRequest = rdpConsumeFullRequest;
   bridge.takeDesktopSizeRequest = rdpTakeDesktopSizeRequest;
   bridge.finishDesktopSizeRequest = rdpFinishDesktopSizeRequest;
@@ -3607,6 +3629,23 @@ std::string tianguan::sendKey(const std::string& sessionId, int keysym, int pres
   item.boundary = false;
   state->inputs.push_back(item);
   return "QUEUED";
+}
+
+std::string tianguan::syncRemoteLockState(const std::string& sessionId,
+                                          bool capsLock, bool numLock) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return "INVALID_SESSION";
+  // The VNC protocol has no lock-state PDU; the RFB client already types the
+  // keysym the page sends, so there is nothing to synchronise.
+  if (state->protocol != "rdp") return "OK";
+  // Keep only the newest absolute state. The session thread consumes it and
+  // sends the Sync PDU; a call made while disconnected is sent after the next
+  // connection reaches its event loop.
+  std::lock_guard<std::mutex> lock(state->input);
+  state->lockSyncPending = true;
+  state->lockCapsLock = capsLock;
+  state->lockNumLock = numLock;
+  return "OK";
 }
 
 std::string tianguan::releaseSessionInput(const std::string& sessionId) {

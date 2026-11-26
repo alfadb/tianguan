@@ -18,6 +18,12 @@ export const reconnectSession: (sessionId: string) => string;
 // presents now; the user must confirm again and the UI then saves it and calls
 // reconnectSession(). Returns "OK" or "INVALID_SESSION". Never trusts anything.
 export const forgetTrustedFingerprint: (sessionId: string) => string;
+// RDP only: set the remote CapsLock/NumLock toggle state to the given absolute
+// values through the Client Synchronize Event (Sync PDU). The key events
+// themselves are not forwarded on RDP. VNC is a no-op. Returns "OK" or
+// "INVALID_SESSION"; the session thread performs the send.
+export const syncRemoteLockState: (sessionId: string, capsLock: boolean,
+  numLock: boolean) => string;
 export const takeFrame: (sessionId: string, buffer: ArrayBuffer, afterVersion: number,
   forceFull: boolean) => string;
 export function sendPointer(x: number, y: number, mask: number): string;

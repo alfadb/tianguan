@@ -284,6 +284,21 @@ napi_value ForgetTrustedFingerprint(napi_env env, napi_callback_info info) {
     return MakeString(env, "INVALID_SESSION");
   return MakeString(env, tianguan::forgetTrustedFingerprint(id));
 }
+// syncRemoteLockState(sessionId, capsLock, numLock): absolute RDP lock-state
+// sync; VNC is a no-op. Returns "OK" or "INVALID_SESSION".
+napi_value SyncRemoteLockState(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  std::string id;
+  bool capsLock = false;
+  bool numLock = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3 ||
+      !GetStringArg(env, argv[0], 256, id) ||
+      napi_get_value_bool(env, argv[1], &capsLock) != napi_ok ||
+      napi_get_value_bool(env, argv[2], &numLock) != napi_ok)
+    return MakeString(env, "INVALID_SESSION");
+  return MakeString(env, tianguan::syncRemoteLockState(id, capsLock, numLock));
+}
 napi_value TakeFrame(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value argv[4];
@@ -460,6 +475,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"listSessions", nullptr, ListSessions, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"reconnectSession", nullptr, ReconnectSession, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"forgetTrustedFingerprint", nullptr, ForgetTrustedFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"syncRemoteLockState", nullptr, SyncRemoteLockState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setClipboard", nullptr, SetClipboard, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -470,7 +486,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 27, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 28, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

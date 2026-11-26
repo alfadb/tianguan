@@ -126,6 +126,11 @@ struct RdpHost {
   // updated when a release was requested and performed.
   void (*drainInput)(void* user, const RdpInputSink* sink,
                      unsigned* appliedRelease) = nullptr;
+  // syncRemoteLockState(): newest absolute local CapsLock/NumLock state queued
+  // by the UI. The session thread is the only caller and turns it into a
+  // Client Synchronize Event; a newer call overwrites an older pending one.
+  // False means there is nothing to send.
+  bool (*takeLockSyncRequest)(void* user, bool* capsLock, bool* numLock) = nullptr;
   // requestFullFrame(): the next committed update must be treated as covering
   // the whole desktop.
   void (*consumeFullRequest)(void* user) = nullptr;

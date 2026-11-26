@@ -366,6 +366,23 @@ export function sendKey(sessionId: string, keysym: number, pressed: number): str
   }
 }
 
+/**
+ * RDP only: sets the remote CapsLock/NumLock state to the given absolute
+ * values through the protocol's Client Synchronize Event (Sync PDU). Call it
+ * whenever the local lock state changes; the CapsLock/NumLock key events
+ * themselves are not forwarded on RDP. VNC is a no-op. Returns 'OK' or
+ * 'INVALID_SESSION'; '' if the native call throws.
+ */
+export function syncRemoteLockState(sessionId: string, capsLock: boolean,
+  numLock: boolean): string {
+  try {
+    return diag.syncRemoteLockState(sessionId, capsLock, numLock);
+  } catch (error) {
+    warn('syncRemoteLockState', error);
+    return '';
+  }
+}
+
 export function releaseSessionInput(sessionId: string): void {
   try {
     diag.releaseSessionInput(sessionId);

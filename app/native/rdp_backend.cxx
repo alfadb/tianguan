@@ -2341,19 +2341,24 @@ UINT32 keysymToScancode(int keysym) {
     case 0xFF63: return RDP_SCANCODE_INSERT;     // XK_Insert
     case 0xFFFF: return RDP_SCANCODE_DELETE;     // XK_Delete
     case 0xFF67: return RDP_SCANCODE_APPS;       // XK_Menu
+    // Print Screen / Pause. Break is the same physical key on PC keyboards.
+    case 0xFF61: return RDP_SCANCODE_PRINTSCREEN; // XK_Print
+    case 0xFF13: return RDP_SCANCODE_PAUSE;       // XK_Pause
+    case 0xFF6B: return RDP_SCANCODE_PAUSE;       // XK_Break
     // Modifiers.
     case 0xFFE1: return RDP_SCANCODE_LSHIFT;     // XK_Shift_L
     case 0xFFE2: return RDP_SCANCODE_RSHIFT;     // XK_Shift_R
     case 0xFFE3: return RDP_SCANCODE_LCONTROL;   // XK_Control_L
     case 0xFFE4: return RDP_SCANCODE_RCONTROL;   // XK_Control_R
-    case 0xFFE5: return RDP_SCANCODE_CAPSLOCK;   // XK_Caps_Lock
     case 0xFFE7: return RDP_SCANCODE_LWIN;       // XK_Meta_L
     case 0xFFE8: return RDP_SCANCODE_RWIN;       // XK_Meta_R
     case 0xFFE9: return RDP_SCANCODE_LMENU;      // XK_Alt_L
     case 0xFFEA: return RDP_SCANCODE_RMENU;      // XK_Alt_R
     case 0xFFEB: return RDP_SCANCODE_LWIN;       // XK_Super_L
     case 0xFFEC: return RDP_SCANCODE_RWIN;       // XK_Super_R
-    case 0xFF7F: return RDP_SCANCODE_NUMLOCK;    // XK_Num_Lock
+    // XK_Caps_Lock (0xFFE5) and XK_Num_Lock (0xFF7F) are not mapped: sinkKey
+    // swallows both because syncRemoteLockState() sets the remote lock state
+    // absolutely (Client Synchronize Event) instead of toggling it by key.
     case 0xFF14: return RDP_SCANCODE_SCROLLLOCK; // XK_Scroll_Lock
     // Function keys.
     case 0xFFBE: return RDP_SCANCODE_F1;
@@ -2374,21 +2379,43 @@ UINT32 keysymToScancode(int keysym) {
     case 0xFFAB: return RDP_SCANCODE_ADD;        // XK_KP_Add
     case 0xFFAC: return RDP_SCANCODE_DECIMAL;    // XK_KP_Separator
     case 0xFFAD: return RDP_SCANCODE_SUBTRACT;   // XK_KP_Subtract
-    case 0xFFAE: return RDP_SCANCODE_DECIMAL;    // XK_KP_Decimal
+    // Main-row '.' so the decimal point does not depend on the remote NumLock
+    // state (same reason as the keypad digits below).
+    case 0xFFAE: return RDP_SCANCODE_OEM_PERIOD;  // XK_KP_Decimal
     case 0xFFAF: return RDP_SCANCODE_DIVIDE;     // XK_KP_Divide
-    case 0xFFB0: return RDP_SCANCODE_NUMPAD0;    // XK_KP_0
-    case 0xFFB1: return RDP_SCANCODE_NUMPAD1;    // XK_KP_1
-    case 0xFFB2: return RDP_SCANCODE_NUMPAD2;    // XK_KP_2
-    case 0xFFB3: return RDP_SCANCODE_NUMPAD3;    // XK_KP_3
-    case 0xFFB4: return RDP_SCANCODE_NUMPAD4;    // XK_KP_4
-    case 0xFFB5: return RDP_SCANCODE_NUMPAD5;    // XK_KP_5
-    case 0xFFB6: return RDP_SCANCODE_NUMPAD6;    // XK_KP_6
-    case 0xFFB7: return RDP_SCANCODE_NUMPAD7;    // XK_KP_7
-    case 0xFFB8: return RDP_SCANCODE_NUMPAD8;    // XK_KP_8
-    case 0xFFB9: return RDP_SCANCODE_NUMPAD9;    // XK_KP_9
+    // Main-row digit scancodes: the page decides NumLock semantics locally, so
+    // keypad digits must type digits regardless of the remote NumLock state.
+    case 0xFFB0: return RDP_SCANCODE_KEY_0;       // XK_KP_0
+    case 0xFFB1: return RDP_SCANCODE_KEY_1;       // XK_KP_1
+    case 0xFFB2: return RDP_SCANCODE_KEY_2;       // XK_KP_2
+    case 0xFFB3: return RDP_SCANCODE_KEY_3;       // XK_KP_3
+    case 0xFFB4: return RDP_SCANCODE_KEY_4;       // XK_KP_4
+    case 0xFFB5: return RDP_SCANCODE_KEY_5;       // XK_KP_5
+    case 0xFFB6: return RDP_SCANCODE_KEY_6;       // XK_KP_6
+    case 0xFFB7: return RDP_SCANCODE_KEY_7;       // XK_KP_7
+    case 0xFFB8: return RDP_SCANCODE_KEY_8;       // XK_KP_8
+    case 0xFFB9: return RDP_SCANCODE_KEY_9;       // XK_KP_9
+    // FreeRDP has no separate keypad '=' scancode; the keypad '=' key types the
+    // same character as the main '=' key, so reuse its scancode.
+    case 0xFFBD: return RDP_SCANCODE_OEM_PLUS;   // XK_KP_Equal
+    // Browser / application launch keys (XF86 keysyms).
+    case 0x1008FF2E: return RDP_SCANCODE_BROWSER_HOME;      // XF86WWW
+    case 0x1008FF18: return RDP_SCANCODE_BROWSER_HOME;      // XF86HomePage
+    case 0x1008FF1B: return RDP_SCANCODE_BROWSER_SEARCH;    // XF86Search
+    case 0x1008FF19: return RDP_SCANCODE_LAUNCH_MAIL;       // XF86Mail
+    case 0x1008FF1D: return RDP_SCANCODE_LAUNCH_APP2;       // XF86Calculator
+    case 0x1008FF26: return RDP_SCANCODE_BROWSER_BACK;      // XF86Back
+    case 0x1008FF27: return RDP_SCANCODE_BROWSER_FORWARD;   // XF86Forward
+    case 0x1008FF28: return RDP_SCANCODE_BROWSER_STOP;      // XF86Stop
+    case 0x1008FF29: return RDP_SCANCODE_BROWSER_REFRESH;   // XF86Refresh
+    case 0x1008FF30: return RDP_SCANCODE_BROWSER_FAVORITES; // XF86Favorites
     default: return 0;
   }
 }
+
+// At most this many distinct keysyms are reported individually when they have
+// no scancode mapping; the session-end summary keeps the full count.
+const size_t kMaxLoggedUnmappedKeys = 16;
 
 struct InputBridge {
   RdpAttemptContext* attempt;
@@ -2400,7 +2427,23 @@ struct InputBridge {
   unsigned appliedRelease;
   size_t droppedClipboards;
   unsigned long long unmappedKeys;
+  int loggedUnmappedKeys[kMaxLoggedUnmappedKeys];
+  size_t loggedUnmappedCount;
 };
+
+// Report each distinct unmapped keysym once (up to kMaxLoggedUnmappedKeys) at
+// drop time, so the key can be identified without flooding the log on repeats.
+void noteUnmappedKey(InputBridge* bridge, int keysym) {
+  ++bridge->unmappedKeys;
+  if (bridge->loggedUnmappedCount >= kMaxLoggedUnmappedKeys) return;
+  for (size_t i = 0; i < bridge->loggedUnmappedCount; ++i)
+    if (bridge->loggedUnmappedKeys[i] == keysym) return;
+  bridge->loggedUnmappedKeys[bridge->loggedUnmappedCount++] = keysym;
+  std::fprintf(stderr,
+               "tianguan: rdp dropped key keysym 0x%04X: no scancode mapping\n",
+               static_cast<unsigned>(keysym));
+  std::fflush(stderr);
+}
 
 void sinkPointer(void* context, int x, int y, int mask) {
   InputBridge* bridge = static_cast<InputBridge*>(context);
@@ -2469,10 +2512,17 @@ void sinkKey(void* context, int keysym, int pressed) {
   if (bridge == nullptr || bridge->attempt == nullptr) return;
   rdpInput* input = bridge->attempt->common.context.input;
   if (input == nullptr) return;
+  // CapsLock and NumLock are deliberately not forwarded: the page keeps its
+  // own lock state and syncRemoteLockState() sets the remote state absolutely,
+  // so forwarding these toggle keys would desynchronise the two. XK_Begin
+  // (0xFF58) is the NumLock-off keypad 5 alias; no scancode makes Windows read
+  // it as Clear regardless of its NumLock state, so it is ignored too. All
+  // three are dropped silently: no scancode, no unmappedKeys increment, no log.
+  if (keysym == 0xFFE5 || keysym == 0xFF7F || keysym == 0xFF58) return;
   if (pressed != 0) {
     const UINT32 scancode = keysymToScancode(keysym);
     if (scancode == 0) {
-      ++bridge->unmappedKeys;
+      noteUnmappedKey(bridge, keysym);
       return;
     }
     // A second down for a key that is already held is an auto-repeat: tell
@@ -2491,7 +2541,7 @@ void sinkKey(void* context, int keysym, int pressed) {
       scancode = keysymToScancode(keysym);
     }
     if (scancode == 0) {
-      ++bridge->unmappedKeys;
+      noteUnmappedKey(bridge, keysym);
       return;
     }
     freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, scancode);
@@ -2751,6 +2801,7 @@ struct Attempt {
     bridge.lastY = 0;
     bridge.droppedClipboards = 0;
     bridge.unmappedKeys = 0;
+    bridge.loggedUnmappedCount = 0;
     // Attach before pumping the channel message queue: a MonitorReady that
     // already arrived is dispatched by the first freerdp_check_event_handles()
     // call below, with these callbacks in place.
@@ -2783,6 +2834,19 @@ struct Attempt {
       // requestDesktopSize(): a size queued from the NAPI thread is turned into
       // a DISPLAY_CONTROL monitor-layout PDU here, on the socket-owning thread.
       sendPendingDesktopSize(attempt);
+      // syncRemoteLockState(): the page decides keypad semantics from its local
+      // NumLock state, so the remote lock state is set absolutely through a
+      // Client Synchronize Event instead of a forwarded CapsLock/NumLock key.
+      // Sent before this tick's queued keys so the state is already aligned.
+      bool capsLock = false;
+      bool numLock = false;
+      if (host.takeLockSyncRequest(host.user, &capsLock, &numLock)) {
+        UINT32 toggleFlags = 0;
+        if (capsLock) toggleFlags |= KBD_SYNC_CAPS_LOCK;
+        if (numLock) toggleFlags |= KBD_SYNC_NUM_LOCK;
+        if (context->input != nullptr)
+          freerdp_input_send_synchronize_event(context->input, toggleFlags);
+      }
       host.drainInput(host.user, &sink, &bridge.appliedRelease);
       if (freerdp_shall_disconnect_context(context)) break;
     }

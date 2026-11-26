@@ -150,6 +150,17 @@ releaseSessionInput(sessionId: string): string   // 释放按键/按钮并清指
 - 返回 `QUEUED`、`COALESCED`、`NOT_CONNECTED`、`NOT_READY`、`INVALID_SESSION`。
 - 纯移动（`mask == 0`）可合并为最新位置；按下/抬起/滚轮不得静默丢弃。
 
+### RDP 锁定状态同步
+
+```
+syncRemoteLockState(sessionId: string, capsLock: boolean, numLock: boolean): string
+```
+
+- 同步返回 `OK` / `INVALID_SESSION`（会话不存在）。
+- RDP：把 `capsLock` / `numLock` 作为**绝对状态**，由会话线程通过 FreeRDP 的 Client Synchronize Event（`freerdp_input_send_synchronize_event`，toggleFlags 含 `KBD_SYNC_CAPS_LOCK` / `KBD_SYNC_NUM_LOCK`）发给远端。调用方在 NAPI 线程只登记新值，不写 socket；新值覆盖尚未发送的旧值；若当前未连接，最新值保留到下一次连接进入事件循环后发送。本调用不改变本机状态，也不等待远端确认。
+- RDP 上 CapsLock（`0xFFE5`）与 NumLock（`0xFF7F`）的键事件不再转发（静默忽略：不产生扫描码、不计入未映射丢键数、不打丢弃日志）；远端锁定状态只由本接口设置。ScrollLock 仍按原样转发。
+- VNC：不做任何事，返回 `OK`（RFB 直接发送 keysym，没有锁定状态 PDU）。
+
 ## 剪贴板
 
 | 接口 | 说明 |

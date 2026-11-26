@@ -74,6 +74,14 @@ FrameGrabStatus takeFrameStruct(const std::string& sessionId, void* dst,
 size_t copyCursorFor(const std::string& sessionId, void* dst, size_t capacity);
 std::string sendPointer(const std::string& sessionId, int x, int y, int mask);
 std::string sendKey(const std::string& sessionId, int keysym, int pressed);
+// RDP only: set the remote CapsLock/NumLock state to the given absolute values
+// with the RDP Client Synchronize Event (Sync PDU). The page calls this when its
+// local lock state changes; the CapsLock/NumLock key events themselves are not
+// forwarded. A newer call replaces a pending older one; the session thread
+// sends it, never the caller. VNC is a no-op. Returns "OK", or
+// "INVALID_SESSION" for an unknown session.
+std::string syncRemoteLockState(const std::string& sessionId, bool capsLock,
+                                bool numLock);
 // Releases the buttons/keys this session pressed and drops queued pointer/key
 // input. Queued clipboard text is deliberately KEPT: it was already reported to
 // the caller as delivered and is unrelated to releasing input, so dropping it
