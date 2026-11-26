@@ -20,7 +20,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import type { common } from '@kit.AbilityKit';
 import {
-  createSession, diagMultiSessionAvailable, forgetTrustedFingerprint
+  createSession, diagMultiSessionAvailable, forgetTrustedFingerprint,
+  SESSION_ERROR_SESSION_TAKEN_OVER
 } from '../diag/SessionApi';
 import type { SessionOptions } from '../diag/SessionApi';
 import {
@@ -30,7 +31,7 @@ import {
 } from '../model/ConnectionStore';
 import type { ConnectionEntry } from '../model/ConnectionStore';
 import {
-  addSessionsListener, removeSessionsListener, sessionsForConnection,
+  addSessionsListener, removeSessionsListener, sessionsForConnection, allSessions, findSession,
   registerSession, closeSessionById, reconnectById
 } from '../model/SessionRegistry';
 import type { RuntimeSession } from '../model/SessionRegistry';
@@ -166,12 +167,17 @@ struct ConnectionCard {
       });
     }
     if (this.view.hasSessions) {
-      items.push({
-        value: '新建会话',
-        action: (): void => {
-          this.onNewSession(this.view.id);
-        }
-      });
+      // RDP: one Windows account owns one session window at most. Offering
+      // 「新建会话」 here would be a direct way around that rule, so the entry
+      // is VNC-only; 「连接」 on an RDP row switches to the existing window.
+      if (this.view.protocol !== 'rdp') {
+        items.push({
+          value: '新建会话',
+          action: (): void => {
+            this.onNewSession(this.view.id);
+          }
+        });
+      }
       // Ending the session from the list matters most on a phone: the session
       // window has no title bar there, so its own close affordance is all the
       // user has besides this menu row.
@@ -453,6 +459,10 @@ struct Index {
   // Sessions whose window is being opened right now: a double click must not
   // start two multiton instances for the same session.
   private openingSessions: Set<string> = new Set<string>();
+  // RDP account keys (see rdpAccountKey) with a connect attempt in flight: the
+  // registry has no session yet while the first attempt waits for its password,
+  // so two entries of the same Windows account must not both get through.
+  private connectingRdpKeys: Set<string> = new Set<string>();
   private listener: () => void = (): void => {};
   private hintTimer: number = -1;
   private viewMap: Map<string, ConnectionView> = new Map<string, ConnectionView>();
@@ -462,6 +472,10 @@ struct Index {
   // connectionId -> latest Chinese failure reason, kept after the failed session
   // is closed so the row can still explain why.
   private failureText: Map<string, string> = new Map<string, string>();
+  // Sessions whose reconnect was started by this list's 重连/primary action. When
+  // one of them reaches connected, its window is brought forward once (P2).
+  // Populated only by reconnectEntry(), so other paths never steal focus.
+  private pendingForegroundSessions: Set<string> = new Set<string>();
 
   aboutToAppear(): void {
     this.viewportWidth = this.initialViewportWidth();
@@ -482,6 +496,7 @@ struct Index {
       // version rebuilt every card on every session tick.
       this.listener = (): void => {
         this.trackFailures();
+        this.promoteReconnectedSessions();
         this.syncViews();
       };
       addSessionsListener(this.listener);
@@ -521,6 +536,26 @@ struct Index {
 
   private endpointOf(entry: ConnectionEntry): string {
     return entry.host + ':' + entry.port;
+  }
+
+  /**
+   * Identity of the Windows account an RDP connection logs on as. One account
+   * owns at most one session window at any moment, whatever state it is in.
+   * The key deliberately spans connection entries (a 复制 copy has its own id
+   * but the same account) and is lower-cased because Windows host names and
+   * logon names are case-insensitive. VNC and RDP entries without a user name
+   * yield '' (unknown account, never blocked): an account that cannot be
+   * confirmed is not treated as the same one.
+   */
+  private rdpAccountKey(entry: ConnectionEntry): string {
+    if (entry.protocol !== 'rdp') {
+      return '';
+    }
+    const username = entry.username.trim();
+    if (username.length === 0) {
+      return '';
+    }
+    return entry.host.trim().toLowerCase() + ':' + entry.port + '|' + username.toLowerCase();
   }
 
   private statusOf(entry: ConnectionEntry): RowStatus {
@@ -1007,6 +1042,51 @@ struct Index {
     return kind === 'failed' || kind === 'disconnected' || kind === 'reconnecting';
   }
 
+  /**
+   * First live session of the same RDP account, resolved across connection
+   * entries. A session whose owner entry is missing (orphan: connectionId '')
+   * or whose entry is not confirmably RDP has no usable key and is skipped:
+   * only a proven same-account match blocks a new session.
+   */
+  private existingRdpAccountSession(entry: ConnectionEntry): RuntimeSession | undefined {
+    const key = this.rdpAccountKey(entry);
+    if (key.length === 0) {
+      return undefined;
+    }
+    const sessions = allSessions();
+    for (let i = 0; i < sessions.length; i++) {
+      const owner = findConnection(sessions[i].connectionId);
+      if (owner === undefined) {
+        continue;
+      }
+      if (this.rdpAccountKey(owner) === key) {
+        return sessions[i];
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Hard guard for every path that would create a session. Returns true when
+   * the new session was replaced by "switch to the existing window": a
+   * failed/disconnected/reconnecting session goes through the existing
+   * reconnect logic, every other state just gets its window activated.
+   */
+  private activateExistingRdpSession(entry: ConnectionEntry): boolean {
+    const existing = this.existingRdpAccountSession(entry);
+    if (existing === undefined) {
+      return false;
+    }
+    if (this.isReconnectKind(existing.state)) {
+      reconnectById(existing.sessionId);
+      this.showHint('同一个 Windows 账号只允许一个远程会话，已切换到现有会话并重连');
+    } else {
+      this.activateSession(existing.sessionId, existing.name);
+      this.showHint('同一个 Windows 账号只允许一个远程会话，已切换到现有会话');
+    }
+    return true;
+  }
+
   /** Primary action: reconnect when the row is in a recoverable state. */
   private primaryAction(entry: ConnectionEntry): void {
     const sessions = sessionsForConnection(entry.id);
@@ -1032,6 +1112,7 @@ struct Index {
       const state = sessions[i].state;
       if (state === 'failed' || state === 'disconnected' || state === 'reconnecting') {
         reconnectById(sessions[i].sessionId);
+        this.pendingForegroundSessions.add(sessions[i].sessionId);
         count += 1;
       }
     }
@@ -1039,6 +1120,40 @@ struct Index {
       this.showHint('正在重连：' + entry.name);
     } else {
       this.showHint('没有可重连的会话', true);
+    }
+  }
+
+  /**
+   * P2: bring the window of a session reconnected from this list forward once it
+   * reaches connected. Reuses activateSession() (the same path as 打开), and only
+   * runs for sessions reconnectEntry() queued: a reconnect that ends in
+   * failed/disconnected, or a session that no longer exists, is dropped so a
+   * later unrelated state change cannot steal focus.
+   */
+  private promoteReconnectedSessions(): void {
+    if (this.pendingForegroundSessions.size === 0) {
+      return;
+    }
+    const done: string[] = [];
+    const activate: RuntimeSession[] = [];
+    this.pendingForegroundSessions.forEach((sessionId: string) => {
+      const session = findSession(sessionId);
+      if (session === undefined || session.state === 'failed' ||
+          session.state === 'disconnected') {
+        done.push(sessionId);
+      } else if (session.state === 'connected') {
+        done.push(sessionId);
+        activate.push(session);
+      }
+    });
+    // Clear before activating: openRemoteWindow() notifies the registry on
+    // windowOpen, which re-enters this listener and must not queue the same
+    // session twice.
+    for (let i = 0; i < done.length; i++) {
+      this.pendingForegroundSessions.delete(done[i]);
+    }
+    for (let i = 0; i < activate.length; i++) {
+      this.activateSession(activate[i].sessionId, activate[i].name);
     }
   }
 
@@ -1156,6 +1271,13 @@ struct Index {
   }
 
   private async connect(entry: ConnectionEntry, explicitPassword: string): Promise<void> {
+    // RDP: one Windows account owns at most one session window at any moment.
+    // Every new-session path ends here, so the hard guard runs before anything
+    // else: a blocked attempt leaves the row untouched and switches to (or
+    // reconnects) the existing window instead.
+    if (this.activateExistingRdpSession(entry)) {
+      return;
+    }
     // A new attempt clears the previous failure reason (the row must leave the
     // "失败：…" state even when this attempt stops early).
     this.failureText.delete(entry.id);
@@ -1171,7 +1293,19 @@ struct Index {
     if (this.connectingEntryIds.has(entry.id)) {
       return;
     }
+    // Same RDP account reached from two different entries: while the first
+    // attempt waits for its password there is no registered session yet, so
+    // the registry check above cannot see it. One in-flight attempt per account
+    // closes that hole too.
+    const rdpKey = this.rdpAccountKey(entry);
+    if (rdpKey.length > 0 && this.connectingRdpKeys.has(rdpKey)) {
+      this.showHint('同一个 Windows 账号只允许一个远程会话，该账号已有连接正在建立', true);
+      return;
+    }
     this.connectingEntryIds.add(entry.id);
+    if (rdpKey.length > 0) {
+      this.connectingRdpKeys.add(rdpKey);
+    }
     try {
       let password = explicitPassword;
       if (password.length === 0 && entry.savePassword) {
@@ -1256,6 +1390,7 @@ struct Index {
       // Result received (success or failure): let the button act again. Only
       // this entry's guard is cleared, so another entry's connect keeps its own.
       this.connectingEntryIds.delete(entry.id);
+      this.connectingRdpKeys.delete(rdpKey);
     }
   }
 
@@ -1270,6 +1405,8 @@ struct Index {
         return '网络连接中断';
       case 'protocol':
         return '协议不匹配或服务器拒绝';
+      case SESSION_ERROR_SESSION_TAKEN_OVER:
+        return '该账号的会话已被别的连接接管。在远端注销被接管的会话，或直接点「重连」即可重新连接。';
       default:
         return '连接失败';
     }
@@ -1286,6 +1423,8 @@ struct Index {
         return '网络中断';
       case 'protocol':
         return '协议不匹配';
+      case SESSION_ERROR_SESSION_TAKEN_OVER:
+        return '会话被接管';
       default:
         return '';
     }

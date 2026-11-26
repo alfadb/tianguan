@@ -103,6 +103,13 @@ export const SESSION_STATE_FAILED: string = 'failed';
 export const SESSION_STATE_TRUST_REQUIRED: string = 'trust-required';
 export const SESSION_STATE_RECONNECTING: string = 'reconnecting';
 
+/**
+ * errorCode of a failed session whose RDP account was taken over by another
+ * connection: the same Windows account only allows one active session, and the
+ * native side does not reconnect from this state on its own.
+ */
+export const SESSION_ERROR_SESSION_TAKEN_OVER: string = 'session-taken-over';
+
 export function buildOptionsJson(options: SessionOptions): string {
   return JSON.stringify(options);
 }

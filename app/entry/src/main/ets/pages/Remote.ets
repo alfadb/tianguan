@@ -77,7 +77,8 @@ import {
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
   syncRemoteLockState,
-  SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED
+  SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
+  SESSION_ERROR_SESSION_TAKEN_OVER
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
 import { findSession, markWindowOpen, closeSessionById } from '../model/SessionRegistry';
@@ -534,6 +535,13 @@ struct Remote {
   @State private mismatchCurrent: string = '';
   @State private mismatchTrusted: string = '';
   @State private mismatchError: string = '';
+  // Terminal failure (state=failed, except fingerprint-mismatch which keeps its
+  // own panel): a session that already has a picture keeps that last frame and
+  // never reaches the "waiting for first frame" node again, so the reason and
+  // the two actions must be an interactive overlay that does not depend on
+  // canvasShown.
+  @State private failureVisible: boolean = false;
+  @State private failureDetail: string = '';
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private canvasReady: boolean = false;
@@ -2341,6 +2349,7 @@ struct Remote {
       this.needsTrust = true;
       this.fingerprint = status.fingerprint === undefined ? '' : status.fingerprint;
       this.statusText = '需要确认身份';
+      this.failureVisible = false;
       return;
     }
     this.needsTrust = false;
@@ -2363,6 +2372,9 @@ struct Remote {
     } else if (this.needsTrustReset) {
       this.clearTrustMismatch();
     }
+    // Every state except a terminal failure leaves the overlay hidden; the
+    // failed branch below re-opens it (fingerprint-mismatch keeps its own panel).
+    this.failureVisible = false;
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
         this.statusText = '已连接（实时刷新）';
@@ -2377,9 +2389,15 @@ struct Remote {
         this.statusText = '连接中断，正在重连（' + Math.max(1, Math.ceil(retry / 1000)) + 's）';
         return;
       }
-      case 'failed':
-        this.statusText = '失败：' + (status.error.length > 0 ? status.error : status.errorCode);
+      case 'failed': {
+        const detail = this.failureReason(status);
+        this.statusText = '失败：' + detail;
+        if (status.errorCode !== 'fingerprint-mismatch') {
+          this.failureDetail = detail;
+          this.failureVisible = true;
+        }
         return;
+      }
       case 'disconnected':
         this.statusText = '已断开';
         return;
@@ -2390,6 +2408,45 @@ struct Remote {
         this.statusText = status.state;
         return;
     }
+  }
+
+  /**
+   * Reason shown by the terminal-failure overlay. The native error text wins;
+   * when it is empty the errorCode is translated so the overlay never shows a
+   * bare machine code.
+   */
+  private failureReason(status: SessionStatus): string {
+    if (status.error.length > 0) {
+      return status.error;
+    }
+    switch (status.errorCode) {
+      case SESSION_ERROR_SESSION_TAKEN_OVER:
+        return '该账号的远程会话已被其它连接接管：同一 Windows 账号只允许一个远程会话';
+      case 'auth-failed':
+        return '密码错误';
+      case 'fingerprint-mismatch':
+        return '服务端指纹与已信任值不一致，已拒绝连接';
+      case 'network':
+        return '网络连接中断';
+      case 'protocol':
+        return '协议不匹配或服务器拒绝';
+      default:
+        return '连接失败';
+    }
+  }
+
+  /**
+   * Overlay 重新连接: the same primitive the connection list's 重连 uses. The
+   * poll hides the overlay when the state leaves failed; hiding it now gives
+   * immediate feedback, and a failed retry brings it back with the new reason.
+   */
+  private retryFromFailure(): void {
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    reconnectSession(this.sessionId);
+    this.failureVisible = false;
+    this.statusText = '正在重新连接…';
   }
 
   private poll(): void {
@@ -3813,29 +3870,22 @@ struct Remote {
   }
 
   /**
-   * The only action left when this page could not attribute itself to a
-   * session. The page always lives in its own ability window, so there is no
-   * list to go back to: try to close this window. Closing it also drops the
-   * unknown instance; if the platform refuses a programmatic main-window close,
-   * the title-bar X remains the normal path (RemoteAbility.onDestroy ends the
-   * session it knows, if any).
+   * 离开本窗口 = 关闭窗口并结束它所属的会话（若有）。
+   *
+   * A Remote page is the main page of its own UIAbility window, so
+   * window.destroyWindow() is not supported for it and router.back() has no
+   * previous page to go back to (that combination made 返回连接列表 look dead).
+   * The one path verified on a real device is the operation bar's 断开:
+   * terminateSelf() ends exactly this ability instance, RemoteAbility.onDestroy
+   * calls closeSessionById() for the session bound to this window (if any), and
+   * the list + tray observers get their normal update. On phone/tablet the
+   * connection list is raised before the instance goes away. Every existing
+   * caller keeps using this function (the panels' 返回连接列表, onBackPress when
+   * no session is bound, and endSessionAndWindow's fallback); the
+   * disconnectRequested guard in disconnectThisSession makes repeats idempotent.
    */
-  private async leavePage(): Promise<void> {
-    this.teardown();
-    if (this.ownWindowName.length > 0) {
-      try {
-        await window.findWindow(this.ownWindowName).destroyWindow();
-        return;
-      } catch (error) {
-        hilog.warn(DOMAIN, TAG, '关闭无法归属的远程窗口失败（请用标题栏关闭）：%{public}s',
-          String(error));
-      }
-    }
-    try {
-      this.getUIContext().getRouter().back();
-    } catch (error) {
-      hilog.warn(DOMAIN, TAG, '返回连接列表失败：%{public}s', String(error));
-    }
+  private leavePage(): void {
+    this.disconnectThisSession();
   }
 
   /**
@@ -4233,25 +4283,52 @@ struct Remote {
             )
           )
           // Secondary UI only: the Canvas stays mounted underneath while the
-          // first frame is on its way.
-          if (!this.canvasShown) {
+          // first frame is on its way. A failed session is not "waiting" any
+          // more: the interactive failure overlay below replaces this hint.
+          if (!this.canvasShown && !this.failureVisible) {
             Column({ space: 12 }) {
-              if (this.lastState === 'failed' || this.statusText.indexOf('失败') === 0) {
-                // A failed session never delivers a first frame: show WHY
-                // instead of spinning on "等待首帧…" forever.
-                Text(this.statusText)
-                  .fontSize(16)
-                  .fontColor($r('app.color.danger'))
-                  .textAlign(TextAlign.Center)
-              } else {
-                LoadingProgress().width(36).height(36)
-                Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
-              }
+              LoadingProgress().width(36).height(36)
+              Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
             }
             .width('100%')
             .height('100%')
             .justifyContent(FlexAlign.Center)
             .hitTestBehavior(HitTestMode.None)
+          }
+          // Terminal failure overlay: works both before the first frame and over
+          // the last rendered frame (a taken-over session never gets a new
+          // one). It is interactive, unlike the old plain failure text.
+          if (this.failureVisible) {
+            Column({ space: 18 }) {
+              Text('连接已断开：' + this.failureDetail)
+                .fontSize(16)
+                .fontColor(Color.White)
+                .textAlign(TextAlign.Center)
+                .width('100%')
+                .constraintSize({ maxWidth: 520 })
+              Row({ space: 12 }) {
+                Button('重新连接')
+                  .fontSize(14)
+                  .fontColor(Color.White)
+                  .backgroundColor($r('app.color.brand'))
+                  .height(40)
+                  .borderRadius(12)
+                  .onClick(() => { this.retryFromFailure(); })
+                Button('返回连接列表')
+                  .fontSize(14)
+                  .height(40)
+                  .borderRadius(12)
+                  .onClick(() => { this.leavePage(); })
+              }
+            }
+            .width('100%')
+            .height('100%')
+            .padding({ left: 24, right: 24 })
+            .justifyContent(FlexAlign.Center)
+            .backgroundColor('rgba(0,0,0,0.55)')
+            // Swallow taps outside the two buttons so a click cannot fall
+            // through onto the remote picture underneath.
+            .onClick(() => {})
           }
           // ---- Floating operation bar -------------------------------------
           // Everything below is a SIBLING of remote_area inside this Stack, so
