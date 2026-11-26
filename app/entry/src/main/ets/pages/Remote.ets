@@ -76,6 +76,7 @@ import {
   copyCursor, forgetTrustedFingerprint, parseFrameMeta, reconnectSession, releaseSessionInput,
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
+  syncRemoteLockState,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
@@ -135,6 +136,288 @@ const MIN_BLOCKED_FINGERS: number = 3;
 // and two or more fingers never have a mouse counterpart at all.
 const MOUSE_TOUCH_DEDUPE_MS: number = 150;
 const MOUSE_TOUCH_DEDUPE_VP: number = 10;
+
+// --- Keyboard keyCode -> X11 keysym ----------------------------------------
+// Keyboard / editing / browser / app-launch keys that this page forwards while
+// a session is connected. System navigation and device-control keys (volume,
+// brightness, media playback, camera, ...) are deliberately absent and are
+// passed through to the platform instead (SYSTEM_NAV_KEYS / DEVICE_CONTROL_KEYS
+// below). Anything else that is absent (pure modifiers such as Fn, TV/vendor
+// keys, newer evdev-only keysyms) is passed through to the platform and
+// logged, not swallowed. See app/README.md for the per-key coverage and the
+// "not forwarded on RDP" list.
+const KEYCODE_KEYSYM: Map<number, number> = new Map<number, number>([
+  [KeyCode.KEYCODE_SEARCH, 0x1008ff1b], // XF86XK_Search
+  // Main block: digits, letters, punctuation (US layout; the shifted symbol is
+  // produced locally by shiftedKeysym()).
+  [KeyCode.KEYCODE_0, 0x30], // XK_0
+  [KeyCode.KEYCODE_1, 0x31], // XK_1
+  [KeyCode.KEYCODE_2, 0x32], // XK_2
+  [KeyCode.KEYCODE_3, 0x33], // XK_3
+  [KeyCode.KEYCODE_4, 0x34], // XK_4
+  [KeyCode.KEYCODE_5, 0x35], // XK_5
+  [KeyCode.KEYCODE_6, 0x36], // XK_6
+  [KeyCode.KEYCODE_7, 0x37], // XK_7
+  [KeyCode.KEYCODE_8, 0x38], // XK_8
+  [KeyCode.KEYCODE_9, 0x39], // XK_9
+  [KeyCode.KEYCODE_STAR, 0x2a], // XK_asterisk
+  [KeyCode.KEYCODE_POUND, 0x23], // XK_numbersign
+  [KeyCode.KEYCODE_DPAD_UP, 0xff52], // XK_Up
+  [KeyCode.KEYCODE_DPAD_DOWN, 0xff54], // XK_Down
+  [KeyCode.KEYCODE_DPAD_LEFT, 0xff51], // XK_Left
+  [KeyCode.KEYCODE_DPAD_RIGHT, 0xff53], // XK_Right
+  [KeyCode.KEYCODE_DPAD_CENTER, 0xff0d], // XK_Return
+  [KeyCode.KEYCODE_A, 0x61], // XK_a
+  [KeyCode.KEYCODE_B, 0x62], // XK_b
+  [KeyCode.KEYCODE_C, 0x63], // XK_c
+  [KeyCode.KEYCODE_D, 0x64], // XK_d
+  [KeyCode.KEYCODE_E, 0x65], // XK_e
+  [KeyCode.KEYCODE_F, 0x66], // XK_f
+  [KeyCode.KEYCODE_G, 0x67], // XK_g
+  [KeyCode.KEYCODE_H, 0x68], // XK_h
+  [KeyCode.KEYCODE_I, 0x69], // XK_i
+  [KeyCode.KEYCODE_J, 0x6a], // XK_j
+  [KeyCode.KEYCODE_K, 0x6b], // XK_k
+  [KeyCode.KEYCODE_L, 0x6c], // XK_l
+  [KeyCode.KEYCODE_M, 0x6d], // XK_m
+  [KeyCode.KEYCODE_N, 0x6e], // XK_n
+  [KeyCode.KEYCODE_O, 0x6f], // XK_o
+  [KeyCode.KEYCODE_P, 0x70], // XK_p
+  [KeyCode.KEYCODE_Q, 0x71], // XK_q
+  [KeyCode.KEYCODE_R, 0x72], // XK_r
+  [KeyCode.KEYCODE_S, 0x73], // XK_s
+  [KeyCode.KEYCODE_T, 0x74], // XK_t
+  [KeyCode.KEYCODE_U, 0x75], // XK_u
+  [KeyCode.KEYCODE_V, 0x76], // XK_v
+  [KeyCode.KEYCODE_W, 0x77], // XK_w
+  [KeyCode.KEYCODE_X, 0x78], // XK_x
+  [KeyCode.KEYCODE_Y, 0x79], // XK_y
+  [KeyCode.KEYCODE_Z, 0x7a], // XK_z
+  [KeyCode.KEYCODE_COMMA, 0x2c], // XK_comma
+  [KeyCode.KEYCODE_PERIOD, 0x2e], // XK_period
+  [KeyCode.KEYCODE_ALT_LEFT, 0xffe9], // XK_Alt_L
+  [KeyCode.KEYCODE_ALT_RIGHT, 0xffea], // XK_Alt_R
+  [KeyCode.KEYCODE_SHIFT_LEFT, 0xffe1], // XK_Shift_L
+  [KeyCode.KEYCODE_SHIFT_RIGHT, 0xffe2], // XK_Shift_R
+  [KeyCode.KEYCODE_TAB, 0xff09], // XK_Tab
+  [KeyCode.KEYCODE_SPACE, 0x20], // XK_space
+  [KeyCode.KEYCODE_EXPLORER, 0x1008ff2e], // XF86XK_WWW (the SDK's web/explorer launch key)
+  [KeyCode.KEYCODE_ENVELOPE, 0x1008ff19], // XF86XK_Mail
+  [KeyCode.KEYCODE_ENTER, 0xff0d], // XK_Return
+  [KeyCode.KEYCODE_DEL, 0xff08], // XK_BackSpace
+  [KeyCode.KEYCODE_GRAVE, 0x60], // XK_grave
+  [KeyCode.KEYCODE_MINUS, 0x2d], // XK_minus
+  [KeyCode.KEYCODE_EQUALS, 0x3d], // XK_equal
+  [KeyCode.KEYCODE_LEFT_BRACKET, 0x5b], // XK_bracketleft
+  [KeyCode.KEYCODE_RIGHT_BRACKET, 0x5d], // XK_bracketright
+  [KeyCode.KEYCODE_BACKSLASH, 0x5c], // XK_backslash
+  [KeyCode.KEYCODE_SEMICOLON, 0x3b], // XK_semicolon
+  [KeyCode.KEYCODE_APOSTROPHE, 0x27], // XK_apostrophe
+  [KeyCode.KEYCODE_SLASH, 0x2f], // XK_slash
+  [KeyCode.KEYCODE_AT, 0x40], // XK_at
+  [KeyCode.KEYCODE_PLUS, 0x2b], // XK_plus
+  [KeyCode.KEYCODE_MENU, 0xff67], // XK_Menu
+  [KeyCode.KEYCODE_PAGE_UP, 0xff55], // XK_Prior
+  [KeyCode.KEYCODE_PAGE_DOWN, 0xff56], // XK_Next
+  [KeyCode.KEYCODE_ESCAPE, 0xff1b], // XK_Escape
+  [KeyCode.KEYCODE_FORWARD_DEL, 0xffff], // XK_Delete
+  [KeyCode.KEYCODE_CTRL_LEFT, 0xffe3], // XK_Control_L
+  [KeyCode.KEYCODE_CTRL_RIGHT, 0xffe4], // XK_Control_R
+  [KeyCode.KEYCODE_CAPS_LOCK, 0xffe5], // XK_Caps_Lock
+  [KeyCode.KEYCODE_SCROLL_LOCK, 0xff14], // XK_Scroll_Lock
+  [KeyCode.KEYCODE_META_LEFT, 0xffeb], // XK_Super_L
+  [KeyCode.KEYCODE_META_RIGHT, 0xffec], // XK_Super_R
+  [KeyCode.KEYCODE_SYSRQ, 0xff61], // XK_Print
+  [KeyCode.KEYCODE_BREAK, 0xff6b], // XK_Break
+  [KeyCode.KEYCODE_MOVE_HOME, 0xff50], // XK_Home
+  [KeyCode.KEYCODE_MOVE_END, 0xff57], // XK_End
+  [KeyCode.KEYCODE_INSERT, 0xff63], // XK_Insert
+  [KeyCode.KEYCODE_FORWARD, 0x1008ff27], // XF86XK_Forward
+  // Function keys.
+  [KeyCode.KEYCODE_F1, 0xffbe], // XK_F1
+  [KeyCode.KEYCODE_F2, 0xffbf], // XK_F2
+  [KeyCode.KEYCODE_F3, 0xffc0], // XK_F3
+  [KeyCode.KEYCODE_F4, 0xffc1], // XK_F4
+  [KeyCode.KEYCODE_F5, 0xffc2], // XK_F5
+  [KeyCode.KEYCODE_F6, 0xffc3], // XK_F6
+  [KeyCode.KEYCODE_F7, 0xffc4], // XK_F7
+  [KeyCode.KEYCODE_F8, 0xffc5], // XK_F8
+  [KeyCode.KEYCODE_F9, 0xffc6], // XK_F9
+  [KeyCode.KEYCODE_F10, 0xffc7], // XK_F10
+  [KeyCode.KEYCODE_F11, 0xffc8], // XK_F11
+  [KeyCode.KEYCODE_F12, 0xffc9], // XK_F12
+  [KeyCode.KEYCODE_NUM_LOCK, 0xff7f], // XK_Num_Lock
+  // Numeric keypad (every NUMPAD_* key the platform reports; X11 has no
+  // separate KP_Comma, so NUMPAD_COMMA uses XK_KP_Separator).
+  [KeyCode.KEYCODE_NUMPAD_0, 0xffb0], // XK_KP_0
+  [KeyCode.KEYCODE_NUMPAD_1, 0xffb1], // XK_KP_1
+  [KeyCode.KEYCODE_NUMPAD_2, 0xffb2], // XK_KP_2
+  [KeyCode.KEYCODE_NUMPAD_3, 0xffb3], // XK_KP_3
+  [KeyCode.KEYCODE_NUMPAD_4, 0xffb4], // XK_KP_4
+  [KeyCode.KEYCODE_NUMPAD_5, 0xffb5], // XK_KP_5
+  [KeyCode.KEYCODE_NUMPAD_6, 0xffb6], // XK_KP_6
+  [KeyCode.KEYCODE_NUMPAD_7, 0xffb7], // XK_KP_7
+  [KeyCode.KEYCODE_NUMPAD_8, 0xffb8], // XK_KP_8
+  [KeyCode.KEYCODE_NUMPAD_9, 0xffb9], // XK_KP_9
+  [KeyCode.KEYCODE_NUMPAD_DIVIDE, 0xffaf], // XK_KP_Divide
+  [KeyCode.KEYCODE_NUMPAD_MULTIPLY, 0xffaa], // XK_KP_Multiply
+  [KeyCode.KEYCODE_NUMPAD_SUBTRACT, 0xffad], // XK_KP_Subtract
+  [KeyCode.KEYCODE_NUMPAD_ADD, 0xffab], // XK_KP_Add
+  [KeyCode.KEYCODE_NUMPAD_DOT, 0xffae], // XK_KP_Decimal
+  [KeyCode.KEYCODE_NUMPAD_COMMA, 0xffac], // XK_KP_Separator
+  [KeyCode.KEYCODE_NUMPAD_ENTER, 0xff8d], // XK_KP_Enter
+  [KeyCode.KEYCODE_NUMPAD_EQUALS, 0xffbd], // XK_KP_Equal
+  [KeyCode.KEYCODE_NUMPAD_LEFT_PAREN, 0x28], // XK_parenleft
+  [KeyCode.KEYCODE_NUMPAD_RIGHT_PAREN, 0x29], // XK_parenright
+  // 2600-block: language/IME keys, edit/navigation, browser/app-launch, F13..F24.
+  [KeyCode.KEYCODE_ZENKAKU_HANKAKU, 0xff2a], // XK_Zenkaku_Hankaku
+  [KeyCode.KEYCODE_RO, 0xff24], // XK_Romaji
+  [KeyCode.KEYCODE_KATAKANA, 0xff26], // XK_Katakana
+  [KeyCode.KEYCODE_HIRAGANA, 0xff25], // XK_Hiragana
+  [KeyCode.KEYCODE_HENKAN, 0xff23], // XK_Henkan
+  [KeyCode.KEYCODE_KATAKANA_HIRAGANA, 0xff27], // XK_Hiragana_Katakana
+  [KeyCode.KEYCODE_MUHENKAN, 0xff22], // XK_Muhenkan
+  [KeyCode.KEYCODE_LINEFEED, 0xff0a], // XK_Linefeed
+  [KeyCode.KEYCODE_NUMPAD_PLUSMINUS, 0xb1], // XK_plusminus
+  [KeyCode.KEYCODE_HANGUEL, 0xff31], // XK_Hangul
+  [KeyCode.KEYCODE_HANJA, 0xff34], // XK_Hangul_Hanja
+  [KeyCode.KEYCODE_YEN, 0xa5], // XK_yen
+  [KeyCode.KEYCODE_STOP, 0x1008ff28], // XF86XK_Stop
+  [KeyCode.KEYCODE_AGAIN, 0xff66], // XK_Redo
+  [KeyCode.KEYCODE_UNDO, 0xff65], // XK_Undo
+  [KeyCode.KEYCODE_COPY, 0x1008ff57], // XF86XK_Copy
+  [KeyCode.KEYCODE_OPEN, 0x1008ff6b], // XF86XK_Open
+  [KeyCode.KEYCODE_PASTE, 0x1008ff6d], // XF86XK_Paste
+  [KeyCode.KEYCODE_FIND, 0xff68], // XK_Find
+  [KeyCode.KEYCODE_CUT, 0x1008ff58], // XF86XK_Cut
+  [KeyCode.KEYCODE_HELP, 0xff6a], // XK_Help
+  [KeyCode.KEYCODE_CALC, 0x1008ff1d], // XF86XK_Calculator
+  [KeyCode.KEYCODE_BOOKMARKS, 0x1008ff30], // XF86XK_Favorites
+  [KeyCode.KEYCODE_REFRESH, 0x1008ff29], // XF86XK_Refresh
+  [KeyCode.KEYCODE_SCROLLUP, 0x1008ff78], // XF86XK_ScrollUp
+  [KeyCode.KEYCODE_SCROLLDOWN, 0x1008ff79], // XF86XK_ScrollDown
+  [KeyCode.KEYCODE_NEW, 0x1008ff68], // XF86XK_New
+  [KeyCode.KEYCODE_REDO, 0xff66], // XK_Redo
+  [KeyCode.KEYCODE_CLOSE, 0x1008ff56], // XF86XK_Close
+  [KeyCode.KEYCODE_PRINT, 0xff61], // XK_Print
+  [KeyCode.KEYCODE_FINANCE, 0x1008ff3c], // XF86XK_Finance
+  [KeyCode.KEYCODE_CANCEL, 0xff69], // XK_Cancel
+  [KeyCode.KEYCODE_SEND, 0x1008ff7b], // XF86XK_Send
+  [KeyCode.KEYCODE_REPLY, 0x1008ff72], // XF86XK_Reply
+  [KeyCode.KEYCODE_FORWARDMAIL, 0x1008ff90], // XF86XK_MailForward
+  [KeyCode.KEYCODE_SAVE, 0x1008ff77], // XF86XK_Save
+  [KeyCode.KEYCODE_DOCUMENTS, 0x1008ff5b], // XF86XK_Documents
+  [KeyCode.KEYCODE_FULL_SCREEN, 0x1008ffb8], // XF86XK_FullScreen
+  [KeyCode.KEYCODE_CD, 0x1008ff53], // XF86XK_CD
+  [KeyCode.KEYCODE_VIDEO, 0x1008ff87], // XF86XK_Video
+  [KeyCode.KEYCODE_MEMO, 0x1008ff1e], // XF86XK_Memo
+  [KeyCode.KEYCODE_CALENDAR, 0x1008ff20], // XF86XK_Calendar
+  [KeyCode.KEYCODE_GAMES, 0x1008ff5e], // XF86XK_Game
+  [KeyCode.KEYCODE_ZOOMIN, 0x1008ff8b], // XF86XK_ZoomIn
+  [KeyCode.KEYCODE_ZOOMOUT, 0x1008ff8c], // XF86XK_ZoomOut
+  [KeyCode.KEYCODE_WORDPROCESSOR, 0x1008ff89], // XF86XK_Word
+  [KeyCode.KEYCODE_SPREADSHEET, 0x1008ff5c], // XF86XK_Excel
+  [KeyCode.KEYCODE_NEWS, 0x1008ff69], // XF86XK_News
+  [KeyCode.KEYCODE_MESSENGER, 0x1008ff8e], // XF86XK_Messenger
+  [KeyCode.KEYCODE_SPELLCHECK, 0x1008ff7c], // XF86XK_Spell
+  [KeyCode.KEYCODE_IMAGES, 0x1008ff91], // XF86XK_Pictures
+  [KeyCode.KEYCODE_XFER, 0x1008ff8a], // XF86XK_Xfer
+  [KeyCode.KEYCODE_MSDOS, 0x1008ff5a], // XF86XK_DOS
+  [KeyCode.KEYCODE_COMPUTER, 0x1008ff33], // XF86XK_MyComputer
+  [KeyCode.KEYCODE_F13, 0xffca], // XK_F13
+  [KeyCode.KEYCODE_F14, 0xffcb], // XK_F14
+  [KeyCode.KEYCODE_F15, 0xffcc], // XK_F15
+  [KeyCode.KEYCODE_F16, 0xffcd], // XK_F16
+  [KeyCode.KEYCODE_F17, 0xffce], // XK_F17
+  [KeyCode.KEYCODE_F18, 0xffcf], // XK_F18
+  [KeyCode.KEYCODE_F19, 0xffd0], // XK_F19
+  [KeyCode.KEYCODE_F20, 0xffd1], // XK_F20
+  [KeyCode.KEYCODE_F21, 0xffd2], // XK_F21
+  [KeyCode.KEYCODE_F22, 0xffd3], // XK_F22
+  [KeyCode.KEYCODE_F23, 0xffd4], // XK_F23
+  [KeyCode.KEYCODE_F24, 0xffd5], // XK_F24
+]);
+
+// With NumLock OFF the numeric keypad carries its navigation meaning. VNC
+// forwards final keysyms and never applies its own NumLock, so the mapping must
+// happen locally. Arithmetic keys, Enter and Equal are not translated.
+const NUMPAD_NAV_KEYSYM: Map<number, number> = new Map<number, number>([
+  [KeyCode.KEYCODE_NUMPAD_0, 0xff63], // XK_Insert
+  [KeyCode.KEYCODE_NUMPAD_1, 0xff57], // XK_End
+  [KeyCode.KEYCODE_NUMPAD_2, 0xff54], // XK_Down
+  [KeyCode.KEYCODE_NUMPAD_3, 0xff56], // XK_Page_Down
+  [KeyCode.KEYCODE_NUMPAD_4, 0xff51], // XK_Left
+  [KeyCode.KEYCODE_NUMPAD_5, 0xff58], // XK_Begin
+  [KeyCode.KEYCODE_NUMPAD_6, 0xff53], // XK_Right
+  [KeyCode.KEYCODE_NUMPAD_7, 0xff50], // XK_Home
+  [KeyCode.KEYCODE_NUMPAD_8, 0xff52], // XK_Up
+  [KeyCode.KEYCODE_NUMPAD_9, 0xff55], // XK_Page_Up
+  [KeyCode.KEYCODE_NUMPAD_DOT, 0xffff] // XK_Delete
+]);
+
+// Remaining keys without a keysym / sendKey failures are logged at most once
+// per key per interval; key repeats must not flood the log.
+const KEY_LOG_INTERVAL_MS: number = 2000;
+// System navigation / power keys belong to the platform, not to the remote
+// keyboard. handleKeyPreIme returns false for them before anything else, and
+// they are deliberately absent from KEYCODE_KEYSYM: back must keep driving
+// onBackPress (ending this session), home / power menu / recents keep their
+// system behaviour. KEYCODE_VIRTUAL_MULTITASK is the platform's multi-task key
+// (same category, outside the 0..41 block).
+const SYSTEM_NAV_KEYS: Set<number> = new Set<number>([
+  KeyCode.KEYCODE_BACK,
+  KeyCode.KEYCODE_HOME,
+  KeyCode.KEYCODE_POWER,
+  KeyCode.KEYCODE_VIRTUAL_MULTITASK
+]);
+// Device-control keys stay local for the same reason: the remote's audio plays
+// on this device (so its volume key must change the local volume), HarmonyOS
+// does not let an app reliably suppress these system defaults, and VNC has no
+// audio at all. They are not mapped, not forwarded and not swallowed:
+// handleKeyPreIme returns false so the system performs its normal action.
+// Browser / app-launch / editing keys are NOT in this set and stay forwarded;
+// see the KEYCODE_KEYSYM table above.
+const DEVICE_CONTROL_KEYS: Set<number> = new Set<number>([
+  KeyCode.KEYCODE_VOLUME_UP,
+  KeyCode.KEYCODE_VOLUME_DOWN,
+  KeyCode.KEYCODE_VOLUME_MUTE,
+  KeyCode.KEYCODE_MUTE,
+  KeyCode.KEYCODE_BRIGHTNESS_UP,
+  KeyCode.KEYCODE_BRIGHTNESS_DOWN,
+  KeyCode.KEYCODE_BRIGHTNESS_CYCLE,
+  KeyCode.KEYCODE_BRIGHTNESS_ZERO,
+  KeyCode.KEYCODE_BRIGHTNESS_MIN,
+  KeyCode.KEYCODE_BRIGHTNESS_MAX,
+  KeyCode.KEYCODE_BRIGHTNESS_TOGGLE,
+  KeyCode.KEYCODE_MEDIA_PLAY_PAUSE,
+  KeyCode.KEYCODE_MEDIA_PLAY,
+  KeyCode.KEYCODE_MEDIA_PAUSE,
+  KeyCode.KEYCODE_MEDIA_STOP,
+  KeyCode.KEYCODE_MEDIA_NEXT,
+  KeyCode.KEYCODE_MEDIA_PREVIOUS,
+  KeyCode.KEYCODE_MEDIA_REWIND,
+  KeyCode.KEYCODE_MEDIA_FAST_FORWARD,
+  KeyCode.KEYCODE_MEDIA_CLOSE,
+  KeyCode.KEYCODE_MEDIA_EJECT,
+  KeyCode.KEYCODE_MEDIA_RECORD,
+  KeyCode.KEYCODE_MEDIA_REPEAT,
+  KeyCode.KEYCODE_PLAYPAUSE,
+  KeyCode.KEYCODE_PLAY,
+  KeyCode.KEYCODE_PREVIOUS,
+  KeyCode.KEYCODE_STOPCD,
+  KeyCode.KEYCODE_SHUFFLE,
+  KeyCode.KEYCODE_AUDIO,
+  KeyCode.KEYCODE_BASSBOOST,
+  KeyCode.KEYCODE_EJECTCLOSECD,
+  KeyCode.KEYCODE_SLEEP,
+  KeyCode.KEYCODE_WAKEUP,
+  KeyCode.KEYCODE_SUSPEND,
+  KeyCode.KEYCODE_SCREENSAVER,
+  KeyCode.KEYCODE_KBDILLUM_TOGGLE,
+  KeyCode.KEYCODE_KBDILLUM_UP,
+  KeyCode.KEYCODE_KBDILLUM_DOWN,
+  KeyCode.KEYCODE_CAMERA
+]);
 
 // --- Floating operation bar (the remote "connection bar") ------------------
 // A semi-transparent dark bar floating over the top centre of the picture. It
@@ -282,6 +565,27 @@ struct Remote {
   private lastTapY: number = -1;
   private shiftDown: boolean = false;
   private pressedKeysym: Map<number, number> = new Map<number, number>();
+  // CapsLock / NumLock state. The local mirror is authoritative: it flips once
+  // per physical press (never on auto-repeat) and drives the character/nav
+  // translation. KeyEvent.isCapsLockOn / isNumLockOn are NOT read per event —
+  // on this platform they can be defined yet never follow the key — they are
+  // used once to initialise the mirror after page start / focus loss / hide.
+  // The lock keys themselves are still forwarded.
+  private capsLockLocal: boolean = false;
+  private numLockLocal: boolean = false;
+  private capsLockDown: boolean = false;
+  private numLockDown: boolean = false;
+  // True until the mirror has been initialised once from a KeyEvent flag; set
+  // again on window inactive / page hidden so the next key re-reads reality.
+  private lockStateNeedsSync: boolean = true;
+  // Rate-limit state for the two key diagnostics (unmapped keyCode, rejected
+  // sendKey). Same key is logged at most once per KEY_LOG_INTERVAL_MS.
+  private lastUnmappedKeyCode: number = -1;
+  private lastUnmappedLogMs: number = 0;
+  private lastSendFailureKeysym: number = -1;
+  private lastSendFailureLogMs: number = 0;
+  // Rate limit for a rejected syncRemoteLockState (RDP absolute lock sync).
+  private lastLockSyncFailureLogMs: number = 0;
   // Last remote pixel the pointer was actually at; the release uses it when the
   // physical pointer is outside the picture (letterbox) by then.
   private lastRemoteX: number = -1;
@@ -784,6 +1088,9 @@ struct Remote {
       // otherwise stay pressed on the server.
       this.releaseAllInputs('window-inactive');
       this.endGesture();
+      // The user may toggle CapsLock/NumLock in that other window: re-read the
+      // real lock state from the next key event.
+      this.lockStateNeedsSync = true;
     } else if (event === window.WindowEventType.WINDOW_HIDDEN) {
       this.setPageVisible(false);
     } else if (event === window.WindowEventType.WINDOW_SHOWN) {
@@ -1418,6 +1725,11 @@ struct Remote {
 
   private setPageVisible(visible: boolean): void {
     this.pageVisible = visible;
+    if (!visible) {
+      // The lock state may have changed while the page was hidden: initialise
+      // the mirrors again from the next key event.
+      this.lockStateNeedsSync = true;
+    }
     if (this.disposed || this.sessionId.length === 0) {
       return;
     }
@@ -1512,6 +1824,10 @@ struct Remote {
       this.pressedKeysym.size > 0;
     this.pressedMask = 0;
     this.shiftDown = false;
+    // The physical lock keys are no longer held, but the lock state itself
+    // persists; only the "already down" edges are reset.
+    this.capsLockDown = false;
+    this.numLockDown = false;
     this.pressedKeysym.clear();
     if (this.sessionId.length === 0) {
       return;
@@ -3198,77 +3514,48 @@ struct Remote {
     }
   }
 
+  // The single keyboard entry point: bound on the page root's onKeyPreIme, so
+  // it runs before the input method sees the key. Returning true declares the
+  // key handled: no local default action, no IME handling and no second
+  // onKeyEvent pass (there must be exactly one forwarding path).
+  private handleKeyPreIme(event: KeyEvent): boolean {
+    // System navigation / power keys and device-control keys stay with the
+    // platform: never swallow them, never forward them. Back must keep driving
+    // onBackPress (ending the session); home/power/recents and volume/brightness/
+    // media/camera keys keep their system behaviour.
+    if (SYSTEM_NAV_KEYS.has(event.keyCode) ||
+        DEVICE_CONTROL_KEYS.has(event.keyCode)) {
+      return false;
+    }
+    if (!this.keyForwardingActive()) {
+      return false;
+    }
+    // forwardKey() reports whether the key has a keysym and was sent. An
+    // unmapped key (vendor/Fn/TV key) is passed through to the platform as
+    // well: no stopPropagation, no forwarding, only the rate-limited log.
+    if (!this.forwardKey(event)) {
+      return false;
+    }
+    event.stopPropagation();
+    return true;
+  }
+
+  // "Connected" is the only state in which mapped keys are swallowed. Resolving,
+  // connecting, trust-required, failed and disconnected all keep the original
+  // behaviour (return false), so the system/IME still works there.
+  private keyForwardingActive(): boolean {
+    return this.sessionId.length > 0 && this.sessionResolved &&
+      this.lastState === SESSION_STATE_CONNECTED;
+  }
+
   private keysymFor(event: KeyEvent): number {
-    switch (event.keyCode) {
-      case KeyCode.KEYCODE_ENTER:
-      case KeyCode.KEYCODE_NUMPAD_ENTER:
-        return 0xff0d;
-      case KeyCode.KEYCODE_DEL:
-        return 0xff08;
-      case KeyCode.KEYCODE_FORWARD_DEL:
-        return 0xffff;
-      case KeyCode.KEYCODE_TAB:
-        return 0xff09;
-      case KeyCode.KEYCODE_ESCAPE:
-        return 0xff1b;
-      case KeyCode.KEYCODE_DPAD_UP:
-        return 0xff52;
-      case KeyCode.KEYCODE_DPAD_DOWN:
-        return 0xff54;
-      case KeyCode.KEYCODE_DPAD_LEFT:
-        return 0xff51;
-      case KeyCode.KEYCODE_DPAD_RIGHT:
-        return 0xff53;
-      case KeyCode.KEYCODE_MOVE_HOME:
-        return 0xff50;
-      case KeyCode.KEYCODE_MOVE_END:
-        return 0xff57;
-      case KeyCode.KEYCODE_PAGE_UP:
-        return 0xff55;
-      case KeyCode.KEYCODE_PAGE_DOWN:
-        return 0xff56;
-      case KeyCode.KEYCODE_SHIFT_LEFT:
-        return 0xffe1;
-      case KeyCode.KEYCODE_SHIFT_RIGHT:
-        return 0xffe2;
-      case KeyCode.KEYCODE_CTRL_LEFT:
-        return 0xffe3;
-      case KeyCode.KEYCODE_CTRL_RIGHT:
-        return 0xffe4;
-      case KeyCode.KEYCODE_ALT_LEFT:
-        return 0xffe9;
-      case KeyCode.KEYCODE_ALT_RIGHT:
-        return 0xffea;
-      default:
-        break;
+    const mapped = KEYCODE_KEYSYM.get(event.keyCode);
+    if (mapped !== undefined) {
+      return mapped;
     }
-    // HarmonyOS reports letters/digits as ranges, and keyText holds the constant
-    // name ("KEYCODE_A") rather than the character, so map by key code.
-    const kc = event.keyCode;
-    if (kc >= KeyCode.KEYCODE_A && kc <= KeyCode.KEYCODE_Z) {
-      return 0x61 + (kc - KeyCode.KEYCODE_A);
-    }
-    if (kc >= KeyCode.KEYCODE_0 && kc <= KeyCode.KEYCODE_9) {
-      return 0x30 + (kc - KeyCode.KEYCODE_0);
-    }
-    const punctuation: Map<number, number> = new Map<number, number>([
-      [KeyCode.KEYCODE_SPACE, 0x20],
-      [KeyCode.KEYCODE_MINUS, 0x2d],
-      [KeyCode.KEYCODE_EQUALS, 0x3d],
-      [KeyCode.KEYCODE_LEFT_BRACKET, 0x5b],
-      [KeyCode.KEYCODE_RIGHT_BRACKET, 0x5d],
-      [KeyCode.KEYCODE_BACKSLASH, 0x5c],
-      [KeyCode.KEYCODE_SEMICOLON, 0x3b],
-      [KeyCode.KEYCODE_APOSTROPHE, 0x27],
-      [KeyCode.KEYCODE_COMMA, 0x2c],
-      [KeyCode.KEYCODE_PERIOD, 0x2e],
-      [KeyCode.KEYCODE_SLASH, 0x2f],
-      [KeyCode.KEYCODE_GRAVE, 0x60]
-    ]);
-    const punctuationSym = punctuation.get(kc);
-    if (punctuationSym !== undefined) {
-      return punctuationSym;
-    }
+    // Last resort for layout-specific printable keys missing from the table.
+    // keyText for letters/digits is the constant name ("KEYCODE_A"), never a
+    // single character, so it cannot mis-map anything the table covers.
     const text = event.keyText;
     if (text !== undefined && text.length === 1) {
       const code = text.charCodeAt(0);
@@ -3279,41 +3566,157 @@ struct Remote {
     return 0;
   }
 
-  private forwardKey(event: KeyEvent): void {
-    // The page root stays mounted when resolution failed; never forward keys to
-    // a session this page could not bind itself to.
-    if (this.sessionId.length === 0 || !this.sessionResolved) {
+  // The KeyEvent lock flags are a one-shot initialiser, not a per-event source:
+  // on this platform they may be present but never change with the key. They
+  // are read only after page start / window inactive / page hidden, and only
+  // until one event has provided a defined value; the local toggle then owns
+  // the state. If an event lacks both flags the marker stays set for next time.
+  private syncLockStateIfNeeded(event: KeyEvent): void {
+    if (!this.lockStateNeedsSync) {
       return;
     }
+    let synced = false;
+    if (event.isCapsLockOn !== undefined) {
+      this.capsLockLocal = event.isCapsLockOn;
+      synced = true;
+    }
+    if (event.isNumLockOn !== undefined) {
+      this.numLockLocal = event.isNumLockOn;
+      synced = true;
+    }
+    if (synced) {
+      this.lockStateNeedsSync = false;
+      // The initial value is now known: make the RDP side match it before the
+      // current key is forwarded (absolute state, not a relative toggle).
+      this.pushLockStateToRemote();
+    }
+  }
+
+  // RDP keeps its own CapsLock/NumLock state; VNC treats keysyms as final
+  // characters. Push the absolute local mirrors so a session that starts with
+  // CapsLock already on is consistent (VNC returns 'OK' and does nothing).
+  // Called only when the mirror changes, and only while connected.
+  private pushLockStateToRemote(): void {
+    if (!this.keyForwardingActive()) {
+      return;
+    }
+    const reply = syncRemoteLockState(this.sessionId, this.capsLockLocal, this.numLockLocal);
+    if (reply === 'OK') {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastLockSyncFailureLogMs >= KEY_LOG_INTERVAL_MS) {
+      this.lastLockSyncFailureLogMs = now;
+      hilog.warn(DOMAIN, TAG,
+        '同步远端锁定状态失败 caps=%{public}d num=%{public}d 返回=%{public}s session=%{public}s',
+        this.capsLockLocal ? 1 : 0, this.numLockLocal ? 1 : 0, reply, this.sessionId);
+    }
+  }
+
+  // Returns true when the key produced a keysym and was forwarded; false when
+  // it has no mapping (the caller then lets the platform keep its default
+  // behaviour). KeyType.CANCEL always returns true: it is handled here as
+  // "all held keys cancelled".
+  private forwardKey(event: KeyEvent): boolean {
+    // KeyType.CANCEL means every key that was down has been cancelled: release
+    // them on the server through the same path as focus loss.
+    if (event.type === KeyType.CANCEL) {
+      this.releaseAllInputs('key-cancel');
+      return true;
+    }
+    // One-shot initialisation from the KeyEvent flags after page start / focus
+    // loss / hide; from then on the local mirror below is the only source.
+    this.syncLockStateIfNeeded(event);
     // Track modifiers locally: the server did not apply the Shift keysym we
     // sent, so shifted characters are translated to their own keysym instead.
     if (event.keyCode === KeyCode.KEYCODE_SHIFT_LEFT ||
         event.keyCode === KeyCode.KEYCODE_SHIFT_RIGHT) {
       this.shiftDown = event.type === KeyType.Down;
     }
+    // The lock mirror flips on the first Down of a physical press only, so key
+    // auto-repeat cannot flip it repeatedly.
+    if (event.keyCode === KeyCode.KEYCODE_CAPS_LOCK) {
+      if (event.type === KeyType.Down && !this.capsLockDown) {
+        this.capsLockLocal = !this.capsLockLocal;
+        this.pushLockStateToRemote();
+      }
+      this.capsLockDown = event.type === KeyType.Down;
+    } else if (event.keyCode === KeyCode.KEYCODE_NUM_LOCK) {
+      if (event.type === KeyType.Down && !this.numLockDown) {
+        this.numLockLocal = !this.numLockLocal;
+        this.pushLockStateToRemote();
+      }
+      this.numLockDown = event.type === KeyType.Down;
+    }
     let keysym = this.keysymFor(event);
     const down = event.type === KeyType.Down;
-    if (this.shiftDown && keysym > 0) {
+    // The remote treats the keysym as the final character and does not apply
+    // its own lock state, so CapsLock / NumLock are translated here too.
+    // Letters: uppercase = Shift XOR CapsLock. Other printable ASCII keeps the
+    // existing Shift-only upper-case conversion (CapsLock never affects them).
+    if (keysym >= 0x61 && keysym <= 0x7a) {
+      const upper = this.shiftDown !== this.capsLockLocal;
+      keysym = upper ? keysym - 0x20 : keysym;
+    } else if (this.shiftDown && keysym >= 0x20 && keysym <= 0x7e) {
       const shifted = Remote.shiftedKeysym(keysym);
       if (shifted !== 0) {
         keysym = shifted;
       }
     }
+    // NumLock off turns the keypad digits/decimal into navigation keys.
+    if (!this.numLockLocal) {
+      const navKeysym = NUMPAD_NAV_KEYSYM.get(event.keyCode);
+      if (navKeysym !== undefined) {
+        keysym = navKeysym;
+      }
+    }
     if (keysym === 0) {
-      return;
+      // No keysym: the caller returns false so the platform keeps its default
+      // behaviour for this key. Only the rate-limited diagnostic remains.
+      this.logUnmappedKey(event.keyCode);
+      return false;
     }
     if (down) {
       // Remember what was pressed per physical key so the release always uses
       // the same keysym even if the modifiers changed in between.
       this.pressedKeysym.set(event.keyCode, keysym);
-      sendKey(this.sessionId, keysym, 1);
+      this.sendForwardedKey(keysym, 1);
     } else if (event.type === KeyType.Up) {
       const pressedSym = this.pressedKeysym.get(event.keyCode);
       if (pressedSym !== undefined) {
         keysym = pressedSym;
         this.pressedKeysym.delete(event.keyCode);
       }
-      sendKey(this.sessionId, keysym, 0);
+      this.sendForwardedKey(keysym, 0);
+    }
+    return true;
+  }
+
+  // sendKey's non-QUEUED replies (NOT_CONNECTED / NOT_READY / INVALID_SESSION)
+  // are otherwise silent and indistinguishable from "the key did nothing".
+  private sendForwardedKey(keysym: number, pressed: number): void {
+    const reply = sendKey(this.sessionId, keysym, pressed);
+    if (reply === 'QUEUED') {
+      return;
+    }
+    const now = Date.now();
+    if (keysym !== this.lastSendFailureKeysym ||
+        now - this.lastSendFailureLogMs >= KEY_LOG_INTERVAL_MS) {
+      this.lastSendFailureKeysym = keysym;
+      this.lastSendFailureLogMs = now;
+      hilog.warn(DOMAIN, TAG,
+        '转发按键未入队 keysym=%{public}d pressed=%{public}d 返回=%{public}s session=%{public}s',
+        keysym, pressed, reply, this.sessionId);
+    }
+  }
+
+  private logUnmappedKey(keyCode: number): void {
+    const now = Date.now();
+    if (keyCode !== this.lastUnmappedKeyCode ||
+        now - this.lastUnmappedLogMs >= KEY_LOG_INTERVAL_MS) {
+      this.lastUnmappedKeyCode = keyCode;
+      this.lastUnmappedLogMs = now;
+      hilog.info(DOMAIN, TAG, '按键无 keysym 映射，保持本机行为 keyCode=%{public}d', keyCode);
     }
   }
 
@@ -3788,7 +4191,7 @@ struct Remote {
             this.placeCursor();
             if (event.action === MouseAction.Press) {
               // Focus normally follows touch, not mouse clicks, so grab it here;
-              // otherwise key events never reach onKeyEvent.
+              // otherwise key events never reach onKeyPreIme.
               this.requestViewFocus();
               this.pointerDown(event.x, event.y, Remote.buttonMask(event.button));
             } else if (event.action === MouseAction.Release) {
@@ -4024,14 +4427,14 @@ struct Remote {
       .height('100%')
       .backgroundColor($r('app.color.page_background'))
       .alignItems(HorizontalAlign.Start)
-      // The page root also watches keys: key events bubble up from whichever
-      // child holds focus, so this path does not depend on the view itself.
+      // The page root is the only keyboard entry point. onKeyPreIme runs
+      // before the input method and before onKeyEvent; returning true from it
+      // consumes the key there, so there must be no second (onKeyEvent)
+      // forwarding path or every key would be sent twice.
       .id('page_root')
       .key('page_root')
       .focusable(true)
       .defaultFocus(true)
-      .onKeyEvent((event: KeyEvent) => {
-        this.forwardKey(event);
-      })
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleKeyPreIme(event))
   }
 }
