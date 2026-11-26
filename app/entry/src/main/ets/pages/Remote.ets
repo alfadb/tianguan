@@ -439,16 +439,20 @@ const TOOLBAR_HOTZONE_HEIGHT_VP: number = 6;
 const TOOLBAR_HANDLE_WIDTH_VP: number = 64;
 const TOOLBAR_HANDLE_HEIGHT_VP: number = 20;
 
-// --- PC remote-resolution follow -------------------------------------------
-// On a 2-in-1 the remote desktop is asked to match the picture area, capped at
-// 1920x1200 physical pixels. Requests are debounced so a drag does not emit
-// one per frame, and a session stops following for good after a refusal /
-// timeout. Phones/tablets never request: their window is the screen and the
-// remote picture is scaled to fit instead.
+// --- Remote-resolution follow ----------------------------------------------
+// The remote desktop is asked to match the picture area. On a 2-in-1 it is
+// capped at 1920x1200 physical pixels (the verified PC rule); on a phone or
+// tablet only the long side is capped at 1920 px, so a portrait screen gets a
+// portrait remote desktop and the screen aspect ratio is preserved. Requests
+// are debounced so a drag does not emit one per frame, and a session stops
+// following for good after a refusal / timeout.
 const FOLLOW_MAX_WIDTH_PX: number = 1920;
 const FOLLOW_MAX_HEIGHT_PX: number = 1200;
 const FOLLOW_MIN_WIDTH_PX: number = 640;
 const FOLLOW_MIN_HEIGHT_PX: number = 400;
+// Phone / tablet rule: long side <= 1920 px, short side >= 480 px.
+const FOLLOW_MAX_LONG_SIDE_PX: number = 1920;
+const FOLLOW_MOBILE_MIN_SHORT_SIDE_PX: number = 480;
 const FOLLOW_SETTLE_MS: number = 500;
 const FOLLOW_TIMEOUT_MS: number = 3000;
 const FOLLOW_TOLERANCE_PX: number = 2;
@@ -650,11 +654,17 @@ struct Remote {
   private readonly touchUi: boolean =
     deviceInfo.deviceType === 'phone' || deviceInfo.deviceType === 'tablet';
   private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
-  // --- PC remote-resolution follow -------------------------------------------
-  // 2in1 only. resizeDisabled is sticky for this page/window: a refusal, a
-  // timeout or a false return permanently stops automatic requests here, even
-  // across a reconnect (the page instance survives reconnects).
-  private readonly followRemoteSize: boolean = deviceInfo.deviceType === '2in1';
+  // --- Remote-resolution follow ---------------------------------------------
+  // PC, phone and tablet. resizeDisabled is sticky for this page/window: a
+  // refusal, a timeout or a false return permanently stops automatic requests
+  // here, even across a reconnect (the page instance survives reconnects).
+  private readonly followRemoteSize: boolean =
+    deviceInfo.deviceType === '2in1' ||
+    deviceInfo.deviceType === 'phone' ||
+    deviceInfo.deviceType === 'tablet';
+  // PC keeps its verified 1920x1200 rule; phone / tablet use the long-side rule.
+  private readonly resizePcForm: boolean = deviceInfo.deviceType === '2in1';
+  private readonly resizeForm: string = deviceInfo.deviceType === '2in1' ? 'pc' : 'mobile';
   private resizeDisabled: boolean = false;
   private resizeFollowTimer: number = -1;
   private resizeTimeoutTimer: number = -1;
@@ -665,6 +675,13 @@ struct Remote {
   private remoteDesktopH: number = 0;
   private resizeBaselineW: number = 0;
   private resizeBaselineH: number = 0;
+  // Picture area in physical px at the latest computed target, and the same
+  // values from the previous request. Logged together so a rotation shows up
+  // as "prevArea -> area" on a single request line.
+  private resizeAreaW: number = 0;
+  private resizeAreaH: number = 0;
+  private resizeLastAreaW: number = 0;
+  private resizeLastAreaH: number = 0;
   // Last target actually sent. A given target is sent at most once; this is
   // what prevents "still a few pixels off" request loops.
   private resizeRequestedW: number = 0;
@@ -1393,10 +1410,12 @@ struct Remote {
   }
 
   // -------------------------------------------------------------------------
-  // Remote resolution follow (PC / 2-in-1 only).
+  // Remote resolution follow (PC, phone and tablet).
   //
-  // Target = the XComponent surface in PHYSICAL pixels, proportionally scaled
-  // down to 1920x1200 and rounded to even numbers. A session that is refused,
+  // Target = the XComponent surface in PHYSICAL pixels. PC is proportionally
+  // scaled down to 1920x1200; phone / tablet keep the screen aspect ratio and
+  // only cap the long side at 1920, so a portrait window asks for a portrait
+  // remote desktop. Both round to even numbers. A session that is refused,
   // times out or whose request is not accepted stops following permanently;
   // a target is sent at most once, so an approximate server answer cannot
   // trigger a "few pixels off" loop.
@@ -1425,11 +1444,24 @@ struct Remote {
     if (width <= 0 || height <= 0) {
       return [];
     }
-    const scale = Math.min(1, FOLLOW_MAX_WIDTH_PX / width, FOLLOW_MAX_HEIGHT_PX / height);
-    // Round, then keep the value even and never above the rounded cap.
+    this.resizeAreaW = width;
+    this.resizeAreaH = height;
+    if (this.resizePcForm) {
+      const scale = Math.min(1, FOLLOW_MAX_WIDTH_PX / width, FOLLOW_MAX_HEIGHT_PX / height);
+      // Round, then keep the value even and never above the rounded cap.
+      const targetW = Math.floor(Math.round(width * scale) / 2) * 2;
+      const targetH = Math.floor(Math.round(height * scale) / 2) * 2;
+      if (targetW < FOLLOW_MIN_WIDTH_PX || targetH < FOLLOW_MIN_HEIGHT_PX) {
+        return [];
+      }
+      return [targetW, targetH];
+    }
+    // Phone / tablet: preserve the screen aspect ratio. Portrait stays
+    // portrait (the short side becomes the remote width).
+    const scale = Math.min(1, FOLLOW_MAX_LONG_SIDE_PX / Math.max(width, height));
     const targetW = Math.floor(Math.round(width * scale) / 2) * 2;
     const targetH = Math.floor(Math.round(height * scale) / 2) * 2;
-    if (targetW < FOLLOW_MIN_WIDTH_PX || targetH < FOLLOW_MIN_HEIGHT_PX) {
+    if (Math.min(targetW, targetH) < FOLLOW_MOBILE_MIN_SHORT_SIDE_PX) {
       return [];
     }
     return [targetW, targetH];
@@ -1489,13 +1521,23 @@ struct Remote {
   private requestRemoteSize(targetW: number, targetH: number): void {
     const beforeW = this.remoteDesktopW;
     const beforeH = this.remoteDesktopH;
+    // Picture area in physical px; prevArea is the area of the previous
+    // request, so a rotation reads directly as prevArea -> area on one line.
+    const areaW = this.resizeAreaW;
+    const areaH = this.resizeAreaH;
+    const prevAreaW = this.resizeLastAreaW;
+    const prevAreaH = this.resizeLastAreaH;
     const accepted = requestDesktopSize(this.sessionId, targetW, targetH);
     this.resizeRequestedW = targetW;
     this.resizeRequestedH = targetH;
+    this.resizeLastAreaW = areaW;
+    this.resizeLastAreaH = areaH;
     if (!accepted) {
       hilog.warn(DOMAIN, TAG,
-        'remote resize 请求未被受理 session=%{public}s target=%{public}dx%{public}d remote=%{public}dx%{public}d',
-        this.sessionId, targetW, targetH, beforeW, beforeH);
+        'remote resize 请求未被受理 session=%{public}s form=%{public}s area=%{public}dx%{public}d' +
+        ' prevArea=%{public}dx%{public}d target=%{public}dx%{public}d remote=%{public}dx%{public}d',
+        this.sessionId, this.resizeForm, areaW, areaH, prevAreaW, prevAreaH,
+        targetW, targetH, beforeW, beforeH);
       this.disableResizeFollow('requestDesktopSize returned false');
       return;
     }
@@ -1504,8 +1546,10 @@ struct Remote {
     this.resizeBaselineW = beforeW;
     this.resizeBaselineH = beforeH;
     hilog.info(DOMAIN, TAG,
-      'remote resize request session=%{public}s target=%{public}dx%{public}d remoteBefore=%{public}dx%{public}d',
-      this.sessionId, targetW, targetH, beforeW, beforeH);
+      'remote resize request session=%{public}s form=%{public}s area=%{public}dx%{public}d' +
+      ' prevArea=%{public}dx%{public}d target=%{public}dx%{public}d remoteBefore=%{public}dx%{public}d',
+      this.sessionId, this.resizeForm, areaW, areaH, prevAreaW, prevAreaH,
+      targetW, targetH, beforeW, beforeH);
     if (this.resizeTimeoutTimer >= 0) {
       clearTimeout(this.resizeTimeoutTimer);
     }
@@ -1695,7 +1739,7 @@ struct Remote {
     if (stats.frames > 0 && !this.canvasShown) {
       this.canvasShown = true;
       // First frame on the GL path: give the status one poll to report the
-      // remote size, then issue the PC resolution-follow request once.
+      // remote size, then issue the resolution-follow request once.
       this.scheduleResizeFollow();
     }
     // Input mapping and cursor placement must follow the PRESENTED geometry
@@ -4072,7 +4116,8 @@ struct Remote {
             this.viewHeight = height;
             // A pure window move also fires onAreaChange; a real size change
             // only changes how the existing mirror is scaled. Resizing this
-            // window does NOT change the remote resolution, so the complete
+            // window does not by itself change the remote resolution (the
+            // follow request below does, once it settles), so the complete
             // picture is already here: repaint it at the new scale instead of
             // asking the server for a redundant full frame. Full-frame requests
             // remain on the first frame, generation changes, desktop-size
@@ -4085,8 +4130,9 @@ struct Remote {
               if (USE_GL_RENDER) {
                 this.handleViewResize();
               }
-              // PC: ask the remote desktop to match this new picture size once
-              // the drag settles. Fullscreen/maximize go through the same path.
+              // Ask the remote desktop to match this new picture size once the
+              // drag / rotation settles. Fullscreen/maximize/rotation all go
+              // through this path.
               this.scheduleResizeFollow();
             }
             this.placeCursor();
@@ -4298,6 +4344,16 @@ struct Remote {
           // Terminal failure overlay: works both before the first frame and over
           // the last rendered frame (a taken-over session never gets a new
           // one). It is interactive, unlike the old plain failure text.
+          //
+          // Every overlay control below (this failure overlay and its buttons,
+          // the operation bar and its buttons, the touch handle, the PC top-edge
+          // hot zone) is explicitly .focusable(false). They are driven only by
+          // clicks / hover and never need focus; without this they become the
+          // page's only focusable small controls, so the system draws its blue
+          // focus box around the touch handle whenever the page / window regains
+          // focus, and clicking one then also moves keyboard focus off
+          // remote_area / page_root, which is what onKeyPreIme listens on. The
+          // two keyboard entry points keep their focus attributes unchanged.
           if (this.failureVisible) {
             Column({ space: 18 }) {
               Text('连接已断开：' + this.failureDetail)
@@ -4313,11 +4369,13 @@ struct Remote {
                   .backgroundColor($r('app.color.brand'))
                   .height(40)
                   .borderRadius(12)
+                  .focusable(false)
                   .onClick(() => { this.retryFromFailure(); })
                 Button('返回连接列表')
                   .fontSize(14)
                   .height(40)
                   .borderRadius(12)
+                  .focusable(false)
                   .onClick(() => { this.leavePage(); })
               }
             }
@@ -4326,6 +4384,7 @@ struct Remote {
             .padding({ left: 24, right: 24 })
             .justifyContent(FlexAlign.Center)
             .backgroundColor('rgba(0,0,0,0.55)')
+            .focusable(false)
             // Swallow taps outside the two buttons so a click cannot fall
             // through onto the remote picture underneath.
             .onClick(() => {})
@@ -4341,6 +4400,7 @@ struct Remote {
               .height(TOOLBAR_HOTZONE_HEIGHT_VP)
               .position({ x: 0, y: 0 })
               .backgroundColor(Color.Transparent)
+              .focusable(false)
               .onHover((isHover: boolean) => {
                 if (isHover) {
                   this.cursorOverlayHidden = true;
@@ -4363,6 +4423,7 @@ struct Remote {
             .height(TOOLBAR_HANDLE_HEIGHT_VP)
             .position({ x: '50%', y: 0 })
             .translate({ x: '-50%' })
+            .focusable(false)
             .onClick(() => {
               this.cursorOverlayHidden = true;
               this.showToolbar();
@@ -4378,6 +4439,7 @@ struct Remote {
                 .height('100%')
                 .borderRadius(12)
                 .backgroundColor(this.toolbarPinned ? '#33FFFFFF' : Color.Transparent)
+                .focusable(false)
                 .onClick(() => {
                   this.toggleToolbarPinned();
                 })
@@ -4397,6 +4459,7 @@ struct Remote {
                 .layoutWeight(1)
                 .height('100%')
                 .borderRadius(12)
+                .focusable(false)
                 .onClick(() => {
                   this.minimizeThisWindow();
                   if (this.touchUi) {
@@ -4420,6 +4483,7 @@ struct Remote {
                   .layoutWeight(1)
                   .height('100%')
                   .borderRadius(12)
+                  .focusable(false)
                   .onClick(() => {
                     this.toggleFullscreen();
                     if (this.touchUi) {
@@ -4443,6 +4507,7 @@ struct Remote {
                 .layoutWeight(1)
                 .height('100%')
                 .borderRadius(12)
+                .focusable(false)
                 .onClick(() => {
                   this.disconnectThisSession();
                 })
@@ -4461,6 +4526,7 @@ struct Remote {
             .height(TOOLBAR_HEIGHT_VP)
             .padding({ left: 6, right: 6 })
             .alignItems(VerticalAlign.Center)
+            .focusable(false)
             .backgroundColor('#CC202124')
             .borderRadius(TOOLBAR_HEIGHT_VP / 2)
             .position({ x: '50%', y: TOOLBAR_TOP_VP })
