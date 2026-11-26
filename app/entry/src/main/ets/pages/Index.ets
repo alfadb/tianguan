@@ -20,12 +20,12 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import type { common } from '@kit.AbilityKit';
 import {
-  createSession, diagMultiSessionAvailable
+  createSession, diagMultiSessionAvailable, forgetTrustedFingerprint
 } from '../diag/SessionApi';
 import type { SessionOptions } from '../diag/SessionApi';
 import {
-  findConnection, loadPassword, newConnectionId, pinKeyFor, readTrustedFingerprint,
-  removeConnection, removePassword, savePassword, savedConnections,
+  findConnection, forgetFingerprint, loadPassword, newConnectionId, passwordAliasFor, pinKeyFor,
+  readTrustedFingerprint, removeConnection, removePassword, savePassword, savedConnections,
   trustFingerprint, upsertConnection, DEFAULT_PORT, defaultPortFor, UNGROUPED
 } from '../model/ConnectionStore';
 import type { ConnectionEntry } from '../model/ConnectionStore';
@@ -57,6 +57,8 @@ interface RowStatus {
   label: string;
   count: number;
   fingerprint: string;
+  /** Native failure code of the failed session ('' otherwise). */
+  errorCode: string;
 }
 
 /**
@@ -77,6 +79,10 @@ class ConnectionView {
   statusKind: string;
   statusLabel: string;
   statusFingerprint: string;
+  /** Failed-session error code; only 'fingerprint-mismatch' gets a panel. */
+  statusErrorCode: string;
+  /** Pin the trust store held when the mismatch panel appeared ('' = none). */
+  mismatchTrusted: string;
   hasSessions: boolean;
 
   constructor(entry: ConnectionEntry) {
@@ -89,6 +95,8 @@ class ConnectionView {
     this.statusKind = 'idle';
     this.statusLabel = '未连接';
     this.statusFingerprint = '';
+    this.statusErrorCode = '';
+    this.mismatchTrusted = '';
     this.hasSessions = false;
   }
 }
@@ -112,6 +120,7 @@ struct ConnectionCard {
   onMove: (id: string) => void = (): void => {};
   onDelete: (id: string) => void = (): void => {};
   onConfirmTrust: (id: string, fingerprint: string) => void = (): void => {};
+  onResetTrust: (id: string) => void = (): void => {};
 
   private reconnectable(): boolean {
     return this.view.statusKind === 'failed' || this.view.statusKind === 'disconnected' ||
@@ -343,6 +352,42 @@ struct ConnectionCard {
         .backgroundColor($r('app.color.warning_surface'))
         .alignItems(HorizontalAlign.Start)
       }
+
+      // Fingerprint changed since it was trusted: tell the user both values and
+      // offer a re-confirmation. Resetting only makes the server show its
+      // fingerprint again; nothing is trusted until 确认并信任 is pressed.
+      if (this.view.statusKind === 'failed' &&
+          this.view.statusErrorCode === 'fingerprint-mismatch') {
+        Column({ space: 8 }) {
+          Text('服务端指纹与已信任值不一致，已拒绝连接')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.danger'))
+          Text('已信任：' + (this.view.mismatchTrusted.length > 0
+            ? this.view.mismatchTrusted : '（未取到）'))
+            .fontSize(12)
+          Text('当前看到：' + (this.view.statusFingerprint.length > 0
+            ? this.view.statusFingerprint : '（未取到）'))
+            .fontSize(12)
+          Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          Button('重新确认指纹')
+            .fontSize(14)
+            .fontColor(Color.White)
+            .backgroundColor($r('app.color.brand'))
+            .height(40)
+            .borderRadius(12)
+            .onClick(() => {
+              this.onResetTrust(this.view.id);
+            })
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.warning_surface'))
+        .alignItems(HorizontalAlign.Start)
+      }
     }
     .width('100%')
     .padding(12)
@@ -484,9 +529,9 @@ struct Index {
       const failure = this.failureText.get(entry.id);
       if (failure !== undefined) {
         const label = failure.length > 0 ? '失败：' + failure : '失败';
-        return { kind: 'failed', label: label, count: 0, fingerprint: '' };
+        return { kind: 'failed', label: label, count: 0, fingerprint: '', errorCode: '' };
       }
-      return { kind: 'idle', label: '未连接', count: 0, fingerprint: '' };
+      return { kind: 'idle', label: '未连接', count: 0, fingerprint: '', errorCode: '' };
     }
     let connected = 0;
     for (let i = 0; i < sessions.length; i++) {
@@ -494,29 +539,46 @@ struct Index {
       if (state === 'trust-required') {
         return {
           kind: 'trust', label: '需要确认身份', count: sessions.length,
-          fingerprint: sessions[i].fingerprint
+          fingerprint: sessions[i].fingerprint, errorCode: ''
         };
       }
       if (state === 'failed') {
-        return { kind: 'failed', label: '失败', count: sessions.length, fingerprint: '' };
+        // errorCode and the fingerprint the server presented travel with the
+        // failed status so the card can explain a mismatch and offer a reset.
+        return {
+          kind: 'failed', label: '失败', count: sessions.length,
+          fingerprint: sessions[i].fingerprint, errorCode: sessions[i].errorCode
+        };
       }
       if (state === 'reconnecting') {
-        return { kind: 'reconnecting', label: '重连中', count: sessions.length, fingerprint: '' };
+        return {
+          kind: 'reconnecting', label: '重连中', count: sessions.length,
+          fingerprint: '', errorCode: ''
+        };
       }
       if (state === 'connecting') {
-        return { kind: 'connecting', label: '连接中', count: sessions.length, fingerprint: '' };
+        return {
+          kind: 'connecting', label: '连接中', count: sessions.length,
+          fingerprint: '', errorCode: ''
+        };
       }
       if (state === 'disconnected') {
-        return { kind: 'disconnected', label: '已断开', count: sessions.length, fingerprint: '' };
+        return {
+          kind: 'disconnected', label: '已断开', count: sessions.length,
+          fingerprint: '', errorCode: ''
+        };
       }
       if (state === 'connected') {
         connected += 1;
       }
     }
     if (connected > 0) {
-      return { kind: 'connected', label: '已连接·' + connected + '个', count: connected, fingerprint: '' };
+      return {
+        kind: 'connected', label: '已连接·' + connected + '个', count: connected,
+        fingerprint: '', errorCode: ''
+      };
     }
-    return { kind: 'idle', label: '未连接', count: 0, fingerprint: '' };
+    return { kind: 'idle', label: '未连接', count: 0, fingerprint: '', errorCode: '' };
   }
 
   private groupOf(entry: ConnectionEntry): string {
@@ -623,6 +685,20 @@ struct Index {
     }
     if (view.statusFingerprint !== status.fingerprint) {
       view.statusFingerprint = status.fingerprint;
+    }
+    // The trusted value is only needed while the mismatch panel is up. Read it
+    // once when that state is entered (the store cannot change underneath the
+    // panel unless the user resets the trust), not on every 2 s status tick.
+    // This must run BEFORE statusErrorCode is updated: the comparison is what
+    // detects the transition.
+    const mismatch = status.kind === 'failed' && status.errorCode === 'fingerprint-mismatch';
+    if (mismatch && view.statusErrorCode !== 'fingerprint-mismatch') {
+      view.mismatchTrusted = readTrustedFingerprint(pinKeyFor(entry));
+    } else if (!mismatch && view.mismatchTrusted.length > 0) {
+      view.mismatchTrusted = '';
+    }
+    if (view.statusErrorCode !== status.errorCode) {
+      view.statusErrorCode = status.errorCode;
     }
     if (view.hasSessions !== hasSessions) {
       view.hasSessions = hasSessions;
@@ -841,10 +917,50 @@ struct Index {
       closeRemoteWindow(sessionId).then((): void => {});
     }
     removeConnection(entry.id);
-    removePassword(entry);
+    // Drop the endpoint's pin only when no other saved connection still uses
+    // the same trust key (protocol + host + port): a 复制 copy shares it and
+    // must keep the trust anchor.
+    this.forgetTrustIfUnshared(entry);
+    // The saved password lives under a shared alias too, so deleting a 复制 copy
+    // must not take the original's password with it.
+    this.forgetPasswordIfUnshared(entry);
     this.connections = savedConnections();
     this.syncViews();
     this.showHint('已删除连接');
+  }
+
+  /**
+   * Removes the deleted entry's fingerprint from the trust store unless another
+   * saved connection maps to the same pin key. Runs after removeConnection, so
+   * only the surviving list decides.
+   */
+  private forgetTrustIfUnshared(entry: ConnectionEntry): void {
+    const key = pinKeyFor(entry);
+    const remaining = savedConnections();
+    for (let i = 0; i < remaining.length; i++) {
+      if (remaining[i].id !== entry.id && pinKeyFor(remaining[i]) === key) {
+        return;
+      }
+    }
+    forgetFingerprint(key);
+  }
+
+  /**
+   * Removes the deleted entry's saved password unless another saved connection
+   * maps to the same key-store alias (protocol + host + port). A 复制 copy
+   * shares that alias without carrying the secret, so deleting the copy used to
+   * wipe the original's password. Runs after removeConnection, like the pin
+   * check above.
+   */
+  private forgetPasswordIfUnshared(entry: ConnectionEntry): void {
+    const alias = passwordAliasFor(entry);
+    const remaining = savedConnections();
+    for (let i = 0; i < remaining.length; i++) {
+      if (remaining[i].id !== entry.id && passwordAliasFor(remaining[i]) === alias) {
+        return;
+      }
+    }
+    removePassword(entry);
   }
 
   /**
@@ -991,6 +1107,13 @@ struct Index {
     const entry = findConnection(id);
     if (entry !== undefined) {
       this.confirmTrust(entry, fingerprint);
+    }
+  }
+
+  private resetTrustById(id: string): void {
+    const entry = findConnection(id);
+    if (entry !== undefined) {
+      this.resetTrust(entry);
     }
   }
 
@@ -1279,6 +1402,47 @@ struct Index {
       }
     }
     this.showHint('已信任指纹，正在重连');
+  }
+
+  /**
+   * 重新确认指纹 (inline on a fingerprint-mismatch row). Only the sessions that
+   * are actually in the mismatch state are asked to forget the trusted pin and
+   * reconnect with no expected fingerprint: a session that is still connected
+   * must keep running untouched. Nothing is trusted here.
+   */
+  private resetTrust(entry: ConnectionEntry): void {
+    const sessions = sessionsForConnection(entry.id);
+    const mismatchSessions: RuntimeSession[] = [];
+    for (let i = 0; i < sessions.length; i++) {
+      if (sessions[i].state === 'failed' &&
+          sessions[i].errorCode === 'fingerprint-mismatch') {
+        mismatchSessions.push(sessions[i]);
+      }
+    }
+    if (mismatchSessions.length === 0) {
+      this.showHint('没有需要重新确认指纹的会话', true);
+      return;
+    }
+    let accepted = 0;
+    let error = '';
+    for (let i = 0; i < mismatchSessions.length; i++) {
+      const result = forgetTrustedFingerprint(mismatchSessions[i].sessionId);
+      if (result === 'OK') {
+        accepted += 1;
+      } else if (error.length === 0) {
+        error = result.length > 0 ? result : '未知错误';
+      }
+    }
+    if (accepted === 0) {
+      this.showHint('重新确认指纹失败：' + error, true);
+      return;
+    }
+    if (error.length > 0) {
+      this.showHint('部分会话未能重新确认指纹：' + error, true);
+    } else {
+      this.showHint('已清除本机信任，等待重新确认指纹');
+    }
+    this.syncViews();
   }
 
   // -------------------------------------------------------------------------
@@ -2038,6 +2202,9 @@ struct Index {
                       },
                       onConfirmTrust: (id: string, fingerprint: string): void => {
                         this.confirmTrustById(id, fingerprint);
+                      },
+                      onResetTrust: (id: string): void => {
+                        this.resetTrustById(id);
                       }
                     })
                   }, (view: ConnectionView) => view.id)

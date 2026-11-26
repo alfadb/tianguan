@@ -260,6 +260,34 @@ export function trustFingerprint(endpoint: string, fingerprint: string): void {
   }
 }
 
+/**
+ * Forgets one endpoint's pin, so the next connection to it shows the server
+ * fingerprint for confirmation again. Missing file or key is a no-op; other
+ * keys are kept verbatim.
+ */
+export function forgetFingerprint(endpoint: string): void {
+  try {
+    const text = readText('vnc-pins.json');
+    if (text.trim().length === 0) {
+      return;
+    }
+    const pins = JSON.parse(text) as Record<string, string>;
+    if (pins[endpoint] === undefined) {
+      return;
+    }
+    const kept: Record<string, string> = {};
+    const keys = Object.keys(pins);
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] !== endpoint) {
+        kept[keys[i]] = pins[keys[i]];
+      }
+    }
+    writeText('vnc-pins.json', JSON.stringify(kept));
+  } catch (error) {
+    hilog.error(DOMAIN, TAG, '删除指纹失败：%{public}s', String(error));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Passwords in the asset key store.
 // ---------------------------------------------------------------------------

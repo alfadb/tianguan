@@ -73,14 +73,16 @@ import { KeyCode } from '@ohos.multimodalInput.keyCode';
 import pointer from '@ohos.multimodalInput.pointer';
 import { display, window } from '@kit.ArkUI';
 import {
-  copyCursor, parseFrameMeta, reconnectSession, releaseSessionInput, requestFullFrame,
-  requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
+  copyCursor, forgetTrustedFingerprint, parseFrameMeta, reconnectSession, releaseSessionInput,
+  requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
-  SESSION_STATE_CONNECTED, SESSION_STATE_TRUST_REQUIRED
+  SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
 import { findSession, markWindowOpen, closeSessionById } from '../model/SessionRegistry';
-import { findConnection, pinKeyFor, trustFingerprint } from '../model/ConnectionStore';
+import {
+  findConnection, pinKeyFor, readTrustedFingerprint, trustFingerprint
+} from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession, clipboardSetSessionVisible,
   clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
@@ -241,6 +243,14 @@ struct Remote {
   private cursorUsable: boolean = false;
   @State private fingerprint: string = '';
   @State private needsTrust: boolean = false;
+  // Fingerprint mismatch (failed, errorCode=fingerprint-mismatch): the trusted
+  // pin differs from what the server presents. This is a separate interactive
+  // panel from the non-interactive failure text; resetting only makes the
+  // server show its fingerprint again, it never trusts anything by itself.
+  @State private needsTrustReset: boolean = false;
+  @State private mismatchCurrent: string = '';
+  @State private mismatchTrusted: string = '';
+  @State private mismatchError: string = '';
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private canvasReady: boolean = false;
@@ -2011,6 +2021,7 @@ struct Remote {
     }
     // State machine -> status text.
     if (status.state === SESSION_STATE_TRUST_REQUIRED) {
+      this.clearTrustMismatch();
       this.needsTrust = true;
       this.fingerprint = status.fingerprint === undefined ? '' : status.fingerprint;
       this.statusText = '需要确认身份';
@@ -2018,6 +2029,24 @@ struct Remote {
     }
     this.needsTrust = false;
     this.fingerprint = '';
+    // The server now presents a different fingerprint than the trusted one and
+    // the connection was refused. The status carries the seen fingerprint, so
+    // show both values and a way to re-run the confirmation. Read the trusted
+    // value once, on entering the state (file read, not every poll).
+    if (status.state === SESSION_STATE_FAILED &&
+        status.errorCode === 'fingerprint-mismatch') {
+      if (!this.needsTrustReset) {
+        this.mismatchTrusted = this.trustedFingerprintForSession();
+        this.mismatchError = '';
+      }
+      const seen = status.fingerprint === undefined ? '' : status.fingerprint;
+      if (this.mismatchCurrent !== seen) {
+        this.mismatchCurrent = seen;
+      }
+      this.needsTrustReset = true;
+    } else if (this.needsTrustReset) {
+      this.clearTrustMismatch();
+    }
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
         this.statusText = '已连接（实时刷新）';
@@ -3339,6 +3368,48 @@ struct Remote {
   }
 
   /**
+   * Trust-store pin of the saved connection this session belongs to. An orphan
+   * session (no connection entry) falls back to the endpoint it was adopted
+   * with, the same key trustAndReconnect writes for that case.
+   */
+  private trustedFingerprintForSession(): string {
+    const session = findSession(this.sessionId);
+    if (session === undefined) {
+      return '';
+    }
+    if (session.connectionId.length > 0) {
+      const entry = findConnection(session.connectionId);
+      if (entry !== undefined) {
+        return readTrustedFingerprint(pinKeyFor(entry));
+      }
+    }
+    return session.endpoint.length > 0 ? readTrustedFingerprint(session.endpoint) : '';
+  }
+
+  private clearTrustMismatch(): void {
+    this.needsTrustReset = false;
+    this.mismatchCurrent = '';
+    this.mismatchTrusted = '';
+    this.mismatchError = '';
+  }
+
+  /**
+   * 重新确认指纹: make this session forget the trusted pin and reconnect with no
+   * expected fingerprint. It then enters trust-required and the existing
+   * 确认并信任 panel appears with the server's current fingerprint; this action
+   * alone never trusts a fingerprint.
+   */
+  private resetTrustedFingerprint(): void {
+    const result = forgetTrustedFingerprint(this.sessionId);
+    if (result !== 'OK') {
+      this.mismatchError = result.length > 0 ? result : '未知错误';
+      return;
+    }
+    this.mismatchError = '';
+    this.statusText = '已清除本机信任，等待重新确认指纹…';
+  }
+
+  /**
    * The only action left when this page could not attribute itself to a
    * session. The page always lives in its own ability window, so there is no
    * list to go back to: try to close this window. Closing it also drops the
@@ -3428,6 +3499,50 @@ struct Remote {
         .width('100%')
         .borderRadius(12)
         .backgroundColor($r('app.color.warning_surface'))
+      }
+      // Fingerprint mismatch: a separate interactive panel (the plain failure
+      // text is non-interactive). It offers a reset that only makes the server
+      // present its fingerprint again; 确认并信任 stays a separate user action.
+      if (this.needsTrustReset) {
+        Column({ space: 8 }) {
+          Text('服务端指纹与已信任值不一致，已拒绝连接')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.danger'))
+          Text('已信任：' + (this.mismatchTrusted.length > 0
+            ? this.mismatchTrusted : '（未取到）'))
+            .fontSize(13)
+          Text('当前看到：' + (this.mismatchCurrent.length > 0
+            ? this.mismatchCurrent : '（未取到）'))
+            .fontSize(13)
+          Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          if (this.mismatchError.length > 0) {
+            Text('重新确认指纹失败：' + this.mismatchError)
+              .fontSize(12)
+              .fontColor($r('app.color.danger'))
+          }
+          Row({ space: 8 }) {
+            Button('重新确认指纹')
+              .fontSize(14)
+              .fontColor(Color.White)
+              .backgroundColor($r('app.color.brand'))
+              .height(40)
+              .borderRadius(12)
+              .onClick(() => { this.resetTrustedFingerprint(); })
+            Button('返回连接列表')
+              .fontSize(14)
+              .height(40)
+              .borderRadius(12)
+              .onClick(() => { this.leavePage(); })
+          }
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.warning_surface'))
+        .alignItems(HorizontalAlign.Start)
       }
       if (this.resolutionFailed) {
         Column({ space: 12 }) {
