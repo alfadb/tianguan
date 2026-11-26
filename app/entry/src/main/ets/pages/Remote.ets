@@ -428,14 +428,15 @@ const DEVICE_CONTROL_KEYS: Set<number> = new Set<number>([
 const TOOLBAR_WIDTH_VP: number = 336;
 const TOOLBAR_HEIGHT_VP: number = 38;
 const TOOLBAR_TOP_VP: number = 6;
-// Mouse: retract ~1 s after the pointer has left both the bar and the top hot
-// zone. Intro: show once for ~3 s after the session resolves.
+// Retract ~1 s after the pointer leaves the bar. There is deliberately no
+// full-width top-edge hot zone and no intro auto-show: a hover-summoned bar
+// appears too easily and covers the remote content along the picture's top
+// edge (a remote browser's tab strip, for example), so the bar opens only on
+// an explicit handle click.
 const TOOLBAR_HIDE_DELAY_MS: number = 1000;
-const TOOLBAR_INTRO_VISIBLE_MS: number = 3000;
-// Mouse-only hot zone: a thin strip along the window's top edge. Touch devices
-// do NOT get this strip (it would steal touches aimed at the remote top edge);
-// they get the small centre handle instead.
-const TOOLBAR_HOTZONE_HEIGHT_VP: number = 6;
+// Small centre handle, the only way to summon the bar, on mouse and touch
+// alike. It is hidden while the bar is open and fades back in when the bar
+// retracts.
 const TOOLBAR_HANDLE_WIDTH_VP: number = 64;
 const TOOLBAR_HANDLE_HEIGHT_VP: number = 20;
 
@@ -639,18 +640,22 @@ struct Remote {
   @State private toolbarVisible: boolean = false;
   // Pinned = no automatic retraction; a second press on "固定" restores it.
   @State private toolbarPinned: boolean = false;
-  // While the pointer is over the bar / hot zone the locally drawn remote
-  // cursor is unmounted: the system pointer is visible there and a stale
-  // remote cursor image would be left floating over the picture.
+  // While the pointer is over the bar / handle the locally drawn remote cursor
+  // is unmounted: the system pointer is visible there and a stale remote
+  // cursor image would be left floating over the picture.
   @State private cursorOverlayHidden: boolean = false;
   private toolbarHideTimer: number = -1;
-  private toolbarIntroShown: boolean = false;
   // True while the pointer is over the bar itself: re-arming auto-hide (unpin)
   // must not retract the bar under the cursor.
   private toolbarHovered: boolean = false;
+  // Pointer is over the centre handle. Hover only brightens the grab bar; it
+  // never opens the operation bar (opening is click-only, see the handle).
+  @State private toolbarHandleHovered: boolean = false;
   private disconnectRequested: boolean = false;
-  // Touch-first layout: no mouse hot zone, a centre handle instead. A phone has
-  // no title bar at all, so the fullscreen button is meaningless there.
+  // Touch-first layout: acting on a bar button retracts the bar and tapping the
+  // picture closes it. A phone has no title bar at all, so the fullscreen
+  // button is meaningless there. Summoning is the same centre handle on every
+  // device.
   private readonly touchUi: boolean =
     deviceInfo.deviceType === 'phone' || deviceInfo.deviceType === 'tablet';
   private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
@@ -897,14 +902,6 @@ struct Remote {
     // even before the first connection status arrives.
     this.sessionResolved = true;
     this.startPolling();
-    // Introduce the floating bar once: show it for a few seconds so the user
-    // knows it exists, then let the normal auto-hide timer retract it (unless
-    // the user pins it or moves the pointer into the hot zone meanwhile).
-    if (!this.toolbarIntroShown) {
-      this.toolbarIntroShown = true;
-      this.showToolbar();
-      this.scheduleToolbarHide(TOOLBAR_INTRO_VISIBLE_MS);
-    }
   }
 
   /**
@@ -1228,6 +1225,7 @@ struct Remote {
       hilog.warn(DOMAIN, TAG, 'remote fullscreen 进入失败：%{public}s', String(error));
     } finally {
       this.fullscreenBusy = false;
+      this.settleToolbarAfterFullscreen();
     }
   }
 
@@ -1275,6 +1273,24 @@ struct Remote {
       hilog.warn(DOMAIN, TAG, 'remote fullscreen 退出失败：%{public}s', String(error));
     } finally {
       this.fullscreenBusy = false;
+      this.settleToolbarAfterFullscreen();
+    }
+  }
+
+  /**
+   * A full-screen enter / exit relayouts the window under the pointer, and the
+   * system may then never deliver the onHover(false) that normally re-arms
+   * auto-hide. The pointer was on the bar when the button was pressed
+   * (toolbarHovered = true), so without this the bar would stay open until the
+   * pointer enters and leaves it again. Treat the completed transition as the
+   * pointer leaving: re-arm the normal retraction timer unless the user pinned
+   * the bar. Called from the finally blocks, so a failed transition also ends
+   * this way (the button action is complete either way).
+   */
+  private settleToolbarAfterFullscreen(): void {
+    this.toolbarHovered = false;
+    if (!this.toolbarPinned) {
+      this.scheduleToolbarHide();
     }
   }
 
@@ -1301,11 +1317,14 @@ struct Remote {
     // The pointer is not assumed to be over the bar: the bar's own hover
     // handler sets this as soon as it actually is.
     this.toolbarHovered = false;
+    // The clicked handle is about to unmount; drop its hover highlight so it
+    // does not reappear bright when the bar retracts.
+    this.toolbarHandleHovered = false;
     this.toolbarVisible = true;
   }
 
   /** Retracts the bar unless it is pinned; delay lets the pointer cross gaps. */
-  private scheduleToolbarHide(delayMs: number = TOOLBAR_HIDE_DELAY_MS): void {
+  private scheduleToolbarHide(): void {
     if (this.disposed || this.toolbarPinned || this.toolbarHovered) {
       return;
     }
@@ -1316,7 +1335,7 @@ struct Remote {
         this.toolbarHovered = false;
         this.toolbarVisible = false;
       }
-    }, delayMs);
+    }, TOOLBAR_HIDE_DELAY_MS);
   }
 
   private cancelToolbarHide(): void {
@@ -4145,7 +4164,7 @@ struct Remote {
           .onHover((isHover: boolean) => {
             // The system pointer is shown outside the picture; the locally
             // drawn remote cursor must not stay behind as a ghost when the
-            // pointer moves up into the hot zone / operation bar.
+            // pointer moves up into the handle / operation bar.
             this.cursorOverlayHidden = !isHover;
             this.setHostCursorVisible(!isHover);
           })
@@ -4346,13 +4365,13 @@ struct Remote {
           // one). It is interactive, unlike the old plain failure text.
           //
           // Every overlay control below (this failure overlay and its buttons,
-          // the operation bar and its buttons, the touch handle, the PC top-edge
-          // hot zone) is explicitly .focusable(false). They are driven only by
-          // clicks / hover and never need focus; without this they become the
-          // page's only focusable small controls, so the system draws its blue
-          // focus box around the touch handle whenever the page / window regains
-          // focus, and clicking one then also moves keyboard focus off
-          // remote_area / page_root, which is what onKeyPreIme listens on. The
+          // the operation bar and its buttons, the centre handle) is explicitly
+          // .focusable(false). They are driven only by clicks / hover and never
+          // need focus; without this they become the page's only focusable
+          // small controls, so the system draws its blue focus box around the
+          // handle whenever the page / window regains focus, and clicking one
+          // then also moves keyboard focus off remote_area / page_root, which is
+          // what onKeyPreIme listens on. The
           // two keyboard entry points keep their focus attributes unchanged.
           if (this.failureVisible) {
             Column({ space: 18 }) {
@@ -4393,41 +4412,41 @@ struct Remote {
           // Everything below is a SIBLING of remote_area inside this Stack, so
           // its mouse/touch events are hit-tested here and never enter the
           // remote pointer/key paths bound to remote_area or the page root.
-          if (!this.touchUi) {
-            // Mouse: a thin top-edge hot zone summons the bar.
-            Row()
-              .width('100%')
-              .height(TOOLBAR_HOTZONE_HEIGHT_VP)
-              .position({ x: 0, y: 0 })
-              .backgroundColor(Color.Transparent)
-              .focusable(false)
-              .onHover((isHover: boolean) => {
-                if (isHover) {
-                  this.cursorOverlayHidden = true;
-                  this.showToolbar();
-                } else {
-                  this.scheduleToolbarHide();
-                }
-              })
-          } else {
-            // Touch: a small centre handle instead of a full-width hot zone, so
-            // touches aimed at the remote top edge are not stolen.
+          // The only way to summon the bar on every device: a small centre
+          // handle. A full-width top-edge hover hot zone was removed on purpose
+          // -- it made the bar slide out whenever the pointer merely crossed
+          // the remote picture's top edge (e.g. aiming for a remote browser
+          // tab), covering exactly what the user was about to click. Hovering
+          // the handle only brightens it; opening is click-only.
+          //
+          // Hidden while the bar is open (the bar occupies the same spot) and
+          // faded back in as the bar retracts, so the two never swap abruptly.
+          if (!this.toolbarVisible) {
             Stack({ alignContent: Alignment.Center }) {
               Row()
-                .width(48)
+                .width(this.toolbarHandleHovered ? 56 : 48)
                 .height(4)
                 .borderRadius(2)
-                .backgroundColor('#66FFFFFF')
+                .backgroundColor(this.toolbarHandleHovered ? '#C0FFFFFF' : '#66FFFFFF')
             }
             .width(TOOLBAR_HANDLE_WIDTH_VP)
             .height(TOOLBAR_HANDLE_HEIGHT_VP)
             .position({ x: '50%', y: 0 })
             .translate({ x: '-50%' })
             .focusable(false)
+            .onHover((isHover: boolean) => {
+              // Visual feedback only: hovering must never call showToolbar().
+              this.toolbarHandleHovered = isHover;
+              if (isHover) {
+                this.cursorOverlayHidden = true;
+              }
+            })
             .onClick(() => {
               this.cursorOverlayHidden = true;
               this.showToolbar();
             })
+            .transition(TransitionEffect.OPACITY
+              .animation({ duration: 200, curve: Curve.EaseOut }))
           }
           if (this.toolbarVisible) {
             Row() {
@@ -4534,7 +4553,7 @@ struct Remote {
             .shadow({ radius: 8, color: '#66000000', offsetY: 2 })
             // Any mouse movement over the bar (including over its buttons)
             // keeps it alive; the retraction timer only wins once the pointer
-            // has left the bar and the hot zone.
+            // has left the bar.
             .onMouse((event: MouseEvent) => {
               this.cursorOverlayHidden = true;
               this.cancelToolbarHide();
