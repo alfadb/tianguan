@@ -27,17 +27,23 @@ import { util } from '@kit.ArkTS';
 // SDK module so the host unit test can run it under Node. Everything is
 // re-exported here so existing imports from ConnectionStore keep working.
 import {
-  defaultPortFor, newConnectionId, parseConnectionRecords, passwordAliasFor,
-  serializeConnectionRecords
+  defaultPortFor, newConnectionId, normalizeSunshineQuality, parseConnectionRecords,
+  passwordAliasFor, serializeConnectionRecords, sunshineFormatsFor, sunshinePresetFor
 } from './ConnectionCodec';
 import type { ConnectionEntry } from './ConnectionCodec';
 
 export {
-  defaultPortFor, newConnectionId, parseConnectionRecords, passwordAliasFor,
-  serializeConnectionRecords
+  defaultPortFor, newConnectionId, normalizeSunshineQuality, parseConnectionRecords,
+  passwordAliasFor, serializeConnectionRecords, sunshineFormatsFor, sunshinePresetFor
 };
-export { DEFAULT_PORT, DEFAULT_RDP_PORT, UNGROUPED, connectionIdOf, pinKeyFor } from './ConnectionCodec';
-export type { ConnectionEntry } from './ConnectionCodec';
+export { DEFAULT_PORT, DEFAULT_RDP_PORT, DEFAULT_SUNSHINE_PORT, UNGROUPED, connectionIdOf,
+  pinKeyFor } from './ConnectionCodec';
+export { SUNSHINE_CODEC_AUTO, SUNSHINE_CODEC_H264, SUNSHINE_CODEC_HEVC,
+  SUNSHINE_PRESET_BALANCED, SUNSHINE_PRESET_CUSTOM, SUNSHINE_PRESET_HD,
+  SUNSHINE_PRESET_SMOOTH, SUNSHINE_PRESET_UHD, SUNSHINE_PRESETS,
+  isSunshineCodec, isSunshinePreset, isValidSunshineBitrateMbps, isValidSunshineFps,
+  isValidSunshineSize } from './ConnectionCodec';
+export type { ConnectionEntry, SunshinePreset, SunshineQuality } from './ConnectionCodec';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -111,7 +117,11 @@ function sameConnection(a: ConnectionEntry, b: ConnectionEntry): boolean {
   return a.id === b.id && a.name === b.name && a.host === b.host && a.port === b.port &&
     a.group === b.group && a.savePassword === b.savePassword &&
     a.noPassword === b.noPassword && a.lastConnectedAt === b.lastConnectedAt &&
-    a.protocol === b.protocol && a.username === b.username && a.domain === b.domain;
+    a.protocol === b.protocol && a.username === b.username && a.domain === b.domain &&
+    a.sunshineApp === b.sunshineApp && a.sunshinePreset === b.sunshinePreset &&
+    a.sunshineWidth === b.sunshineWidth && a.sunshineHeight === b.sunshineHeight &&
+    a.sunshineFps === b.sunshineFps && a.sunshineBitrate === b.sunshineBitrate &&
+    a.sunshineCodec === b.sunshineCodec;
 }
 
 function connectionsRoundTripEqual(expected: ConnectionEntry[],
@@ -156,15 +166,25 @@ function normalizePort(port: string, protocol: string): string {
  */
 export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
   const host = entry.host.trim();
-  const protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+  const protocol = entry.protocol === 'rdp' ? 'rdp' :
+    (entry.protocol === 'sunshine' ? 'sunshine' : 'vnc');
   const port = normalizePort(entry.port, protocol);
   const id = typeof entry.id === 'string' && entry.id.length > 0 ? entry.id : newConnectionId();
   const noPassword = entry.noPassword === true;
-  // username/domain only mean something for RDP; a VNC record keeps them empty.
+  // username/domain only mean something for RDP; a VNC/Sunshine record keeps
+  // them empty.
   const username = protocol === 'rdp' && typeof entry.username === 'string' ?
     entry.username.trim() : '';
   const domain = protocol === 'rdp' && typeof entry.domain === 'string' ?
     entry.domain.trim() : '';
+  // Only Sunshine launches a named app; every other protocol stores ''.
+  const sunshineApp = protocol === 'sunshine' && typeof entry.sunshineApp === 'string' ?
+    entry.sunshineApp.trim() : '';
+  // Quality resolves once here (tier numbers for presets, stored values for
+  // 'custom'); an invalid/missing field falls back to the tier, so a bad value
+  // can never reach createSession as "invalid sunshine width".
+  const quality = normalizeSunshineQuality(entry.sunshinePreset, entry.sunshineWidth,
+    entry.sunshineHeight, entry.sunshineFps, entry.sunshineBitrate, entry.sunshineCodec);
   const normalized: ConnectionEntry = {
     id: id,
     name: entry.name.trim().length > 0 ? entry.name.trim() : host,
@@ -176,7 +196,14 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
     lastConnectedAt: entry.lastConnectedAt,
     protocol: protocol,
     username: username,
-    domain: domain
+    domain: domain,
+    sunshineApp: sunshineApp,
+    sunshinePreset: quality.preset,
+    sunshineWidth: quality.width,
+    sunshineHeight: quality.height,
+    sunshineFps: quality.fps,
+    sunshineBitrate: quality.bitrateMbps,
+    sunshineCodec: quality.codec
   };
   const kept: ConnectionEntry[] = [];
   let replaced = false;

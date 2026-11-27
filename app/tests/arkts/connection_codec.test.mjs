@@ -71,10 +71,16 @@ try {
 }
 
 const {
-  DEFAULT_PORT, DEFAULT_RDP_PORT, UNGROUPED,
+  DEFAULT_PORT, DEFAULT_RDP_PORT, DEFAULT_SUNSHINE_PORT, UNGROUPED,
   defaultPortFor, newConnectionId, connectionIdOf,
   parseConnectionRecords, serializeConnectionRecords,
-  pinKeyFor, passwordAliasFor
+  pinKeyFor, passwordAliasFor,
+  SUNSHINE_PRESETS, SUNSHINE_PRESET_BALANCED, SUNSHINE_PRESET_CUSTOM,
+  SUNSHINE_PRESET_SMOOTH, SUNSHINE_PRESET_HD, SUNSHINE_PRESET_UHD,
+  SUNSHINE_CODEC_AUTO, SUNSHINE_CODEC_H264, SUNSHINE_CODEC_HEVC,
+  sunshinePresetFor, sunshineFormatsFor, normalizeSunshineQuality,
+  isSunshinePreset, isSunshineCodec, isValidSunshineSize,
+  isValidSunshineFps, isValidSunshineBitrateMbps
 } = codec;
 
 let passed = 0;
@@ -93,12 +99,18 @@ function test(name, fn) {
   }
 }
 
-/** A fully populated entry; override only the fields a test cares about. */
+/**
+ * A fully populated entry; override only the fields a test cares about. The
+ * Sunshine quality fields carry the 均衡 defaults because every loaded record
+ * has them (old files without them are filled in by the parser).
+ */
 function entry(overrides) {
   return Object.assign({
     id: 'cbase', name: 'base', host: 'example.test', port: '5901',
     group: '', savePassword: false, noPassword: false, lastConnectedAt: 0,
-    protocol: 'vnc', username: '', domain: ''
+    protocol: 'vnc', username: '', domain: '', sunshineApp: '',
+    sunshinePreset: 'balanced', sunshineWidth: 1920, sunshineHeight: 1080,
+    sunshineFps: 60, sunshineBitrate: 20, sunshineCodec: 'auto'
   }, overrides || {});
 }
 
@@ -168,6 +180,151 @@ test('missing or unknown protocol normalises to vnc; only exact "rdp" is rdp', (
     { id: 'c5', host: 'e', protocol: '' }
   ]));
   assert.deepEqual(parsed.map((record) => record.protocol), ['vnc', 'vnc', 'vnc', 'rdp', 'vnc']);
+});
+
+test('Sunshine normalisation: only exact "sunshine" selects it, case variants are vnc', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'c1', host: 'a', protocol: 'sunshine' },
+    { id: 'c2', host: 'b', protocol: 'Sunshine' },
+    { id: 'c3', host: 'c', protocol: 'SUNSHINE' },
+    { id: 'c4', host: 'd', protocol: 'moonlight' },
+    { id: 'c5', host: 'e', protocol: 'rdp' }
+  ]));
+  assert.deepEqual(parsed.map((record) => record.protocol),
+    ['sunshine', 'vnc', 'vnc', 'vnc', 'rdp']);
+});
+
+test('sunshineApp is a Sunshine-only string field: defaults to "", rejects non-strings', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'c1', host: 'a', protocol: 'sunshine' },
+    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineApp: 'Steam Big Picture' },
+    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineApp: 42 },
+    { id: 'c4', host: 'd', protocol: 'vnc', sunshineApp: 'Desktop' }
+  ]));
+  assert.equal(parsed[0].sunshineApp, '');
+  assert.equal(parsed[1].sunshineApp, 'Steam Big Picture');
+  assert.equal(parsed[2].sunshineApp, '');
+  // The field survives parsing for any protocol (it is only read/sent for
+  // Sunshine); a legacy record simply has the default.
+  assert.equal(parsed[3].sunshineApp, 'Desktop');
+  assert.equal(parsed[0].protocol, 'sunshine');
+  assert.equal(parsed[0].username, '');
+  assert.equal(parsed[0].domain, '');
+});
+
+test('Sunshine ConnectionEntry round-trips through serialize -> parse', () => {
+  const expected = [entry({
+    id: 'csun1', name: 'Sunshine', host: '192.168.50.62', port: '47989',
+    group: '游戏', savePassword: false, noPassword: false,
+    lastConnectedAt: 1729000000002, protocol: 'sunshine',
+    sunshineApp: 'Desktop'
+  })];
+  const text = serializeConnectionRecords(expected);
+  assert.deepEqual(parseConnectionRecords(text), expected);
+  // Stable on a second round trip and never carries a password.
+  assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(parseConnectionRecords(text))),
+    expected);
+  assert.equal(Object.prototype.hasOwnProperty.call(JSON.parse(text)[0], 'password'), false);
+  assert.equal(JSON.parse(text)[0].protocol, 'sunshine');
+  assert.equal(JSON.parse(text)[0].sunshineApp, 'Desktop');
+});
+
+// ---------------------------------------------------------------------------
+// Sunshine quality: the single tier table, option mapping and persistence
+// ---------------------------------------------------------------------------
+
+test('Sunshine quality tiers match the agreed numbers (流畅/均衡/高清/超清)', () => {
+  assert.deepEqual(SUNSHINE_PRESETS.map((tier) => [tier.id, tier.label]),
+    [['smooth', '流畅'], ['balanced', '均衡'], ['hd', '高清'], ['uhd', '超清']]);
+  assert.deepEqual(SUNSHINE_PRESETS.map((tier) => [tier.width, tier.height, tier.fps,
+    tier.bitrateMbps]),
+  [[1280, 720, 60, 15], [1920, 1080, 60, 20], [2560, 1440, 60, 40], [3840, 2160, 60, 80]]);
+});
+
+test('sunshinePresetFor: known id wins, missing/unknown falls back to 均衡', () => {
+  assert.equal(sunshinePresetFor('uhd').width, 3840);
+  assert.equal(sunshinePresetFor(SUNSHINE_PRESET_SMOOTH).bitrateMbps, 15);
+  assert.equal(sunshinePresetFor(undefined).id, SUNSHINE_PRESET_BALANCED);
+  assert.equal(sunshinePresetFor('').id, SUNSHINE_PRESET_BALANCED);
+  assert.equal(sunshinePresetFor('4k').id, SUNSHINE_PRESET_BALANCED);
+  assert.equal(sunshinePresetFor('custom').id, SUNSHINE_PRESET_BALANCED);
+  assert.equal(isSunshinePreset(SUNSHINE_PRESET_CUSTOM), true);
+  assert.equal(isSunshinePreset('4k'), false);
+  assert.equal(isSunshinePreset(undefined), false);
+});
+
+test('sunshineFormatsFor: 自动 omits, H.264 sends h264, HEVC sends h264,hevc', () => {
+  assert.equal(sunshineFormatsFor(SUNSHINE_CODEC_AUTO), '');
+  assert.equal(sunshineFormatsFor(undefined), '');
+  assert.equal(sunshineFormatsFor('unknown'), '');
+  assert.equal(sunshineFormatsFor(SUNSHINE_CODEC_H264), 'h264');
+  assert.equal(sunshineFormatsFor(SUNSHINE_CODEC_HEVC), 'h264,hevc');
+  assert.equal(isSunshineCodec(SUNSHINE_CODEC_HEVC), true);
+  assert.equal(isSunshineCodec('vp9'), false);
+});
+
+test('normalizeSunshineQuality: tier numbers for presets, stored values for custom', () => {
+  const preset = normalizeSunshineQuality('hd', undefined, undefined, undefined, undefined,
+    undefined);
+  assert.deepEqual(preset, {
+    preset: 'hd', width: 2560, height: 1440, fps: 60, bitrateMbps: 40, codec: 'auto'
+  });
+  const custom = normalizeSunshineQuality('custom', 1600, 900, 30, 12, 'hevc');
+  assert.deepEqual(custom, {
+    preset: 'custom', width: 1600, height: 900, fps: 30, bitrateMbps: 12, codec: 'hevc'
+  });
+  // Invalid/out-of-range values fall back to the record's own tier (or 均衡),
+  // never to something createSession would reject.
+  const broken = normalizeSunshineQuality('4k', 0, 99999, -1, 500, 'vp9');
+  assert.deepEqual(broken, {
+    preset: 'balanced', width: 1920, height: 1080, fps: 60, bitrateMbps: 20, codec: 'auto'
+  });
+});
+
+test('native quality limits are exposed as validators (form rejects, never clamps)', () => {
+  assert.equal(isValidSunshineSize(1), true);
+  assert.equal(isValidSunshineSize(4096), true);
+  assert.equal(isValidSunshineSize(0), false);
+  assert.equal(isValidSunshineSize(4097), false);
+  assert.equal(isValidSunshineSize(1920.5), false);
+  assert.equal(isValidSunshineFps(60), true);
+  assert.equal(isValidSunshineFps(481), false);
+  assert.equal(isValidSunshineBitrateMbps(1), true);
+  assert.equal(isValidSunshineBitrateMbps(200), true);
+  assert.equal(isValidSunshineBitrateMbps(201), false);
+});
+
+test('custom quality fields round-trip; presets keep their stored numbers', () => {
+  const expected = [entry({
+    id: 'csun2', name: 'Sunshine', host: '192.168.50.62', port: '47989',
+    protocol: 'sunshine', sunshineApp: 'Desktop',
+    sunshinePreset: 'custom', sunshineWidth: 1600, sunshineHeight: 900,
+    sunshineFps: 30, sunshineBitrate: 12, sunshineCodec: 'hevc'
+  })];
+  const text = serializeConnectionRecords(expected);
+  assert.deepEqual(parseConnectionRecords(text), expected);
+  const uhd = [entry({
+    id: 'csun3', host: '10.0.0.3', port: '47989', protocol: 'sunshine',
+    sunshinePreset: 'uhd', sunshineWidth: 3840, sunshineHeight: 2160,
+    sunshineFps: 60, sunshineBitrate: 80, sunshineCodec: 'h264'
+  })];
+  assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(uhd)), uhd);
+});
+
+test('legacy record without quality fields loads as 均衡 and keeps its id', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'cold', host: '10.0.0.4', port: '47989', protocol: 'sunshine',
+      sunshineApp: 'Desktop' }
+  ]));
+  assert.equal(parsed.length, 1);
+  const record = parsed[0];
+  assert.equal(record.id, 'cold');
+  assert.equal(record.sunshinePreset, SUNSHINE_PRESET_BALANCED);
+  assert.equal(record.sunshineWidth, 1920);
+  assert.equal(record.sunshineHeight, 1080);
+  assert.equal(record.sunshineFps, 60);
+  assert.equal(record.sunshineBitrate, 20);
+  assert.equal(record.sunshineCodec, SUNSHINE_CODEC_AUTO);
 });
 
 test('username/domain default to empty string and reject non-strings', () => {
@@ -313,17 +470,35 @@ test('password alias and pin key are namespaced independently per protocol', () 
   assert.equal(passwordAliasFor(vnc), 'tianguan:h:5901');
 });
 
+test('Sunshine pins/passwords never share a VNC/RDP key on the same host:port', () => {
+  const host = '192.168.50.62';
+  const port = '47989';
+  const sunshine = entry({ protocol: 'sunshine', host: host, port: port });
+  // Sunshine is pinned natively inside sunshineStateDir: its keys are a guard
+  // namespace, never a VNC/RDP trust anchor or password alias.
+  assert.equal(pinKeyFor(sunshine), 'sunshine:' + host + ':' + port);
+  assert.equal(passwordAliasFor(sunshine), 'tianguan:sunshine:' + host + ':' + port);
+  const vnc = entry({ protocol: 'vnc', host: host, port: port });
+  const rdp = entry({ protocol: 'rdp', host: host, port: port });
+  assert.notEqual(pinKeyFor(sunshine), pinKeyFor(vnc));
+  assert.notEqual(pinKeyFor(sunshine), pinKeyFor(rdp));
+  assert.notEqual(passwordAliasFor(sunshine), passwordAliasFor(vnc));
+  assert.notEqual(passwordAliasFor(sunshine), passwordAliasFor(rdp));
+});
+
 // ---------------------------------------------------------------------------
 // Constants and id helpers
 // ---------------------------------------------------------------------------
 
-test('defaultPortFor: RDP 3389, VNC/unknown 5901; constants match the UI defaults', () => {
+test('defaultPortFor: RDP 3389, Sunshine 47989, VNC/unknown 5901', () => {
   assert.equal(defaultPortFor('rdp'), '3389');
+  assert.equal(defaultPortFor('sunshine'), '47989');
   assert.equal(defaultPortFor('vnc'), '5901');
   assert.equal(defaultPortFor(''), '5901');
   assert.equal(defaultPortFor('ssh'), '5901');
   assert.equal(DEFAULT_PORT, '5901');
   assert.equal(DEFAULT_RDP_PORT, '3389');
+  assert.equal(DEFAULT_SUNSHINE_PORT, '47989');
   assert.equal(UNGROUPED, '未分组');
 });
 

@@ -20,8 +20,9 @@ export interface SessionOptions {
   password?: string;
   expectedFingerprint?: string;
   name?: string;
-  // Backend selector: "rdp" for the FreeRDP client. Omitted means the default
-  // "vnc" (RFB), so VNC callers do not need to set it.
+  // Backend selector: "rdp" for the FreeRDP client, "sunshine" for the
+  // Moonlight/Sunshine client. Omitted means the default "vnc" (RFB), so VNC
+  // callers do not need to set it.
   protocol?: string;
   // RDP only: user name (the RDP backend requires one) and optional domain.
   username?: string;
@@ -30,6 +31,37 @@ export interface SessionOptions {
   // encrypted family (RA2_256,RA2); use "None" for a server that requires no
   // authentication (it advertises type 1 only). VNC only.
   security?: string;
+  // ---------------------------------------------------------------------
+  // Sunshine/Moonlight only (protocol="sunshine"). Key names are copied from
+  // app/native/diagnostics.cxx parseSessionOptions() and must stay identical.
+  // ---------------------------------------------------------------------
+  // Required app-sandbox absolute path: client certificate/private key,
+  // uniqueid and the pinned server certificate live there. Missing => the
+  // session starts and fails with errorCode="protocol".
+  sunshineStateDir?: string;
+  // /applist title to launch (case-insensitive substring match, first app when
+  // nothing matches). Native default "Desktop".
+  sunshineApp?: string;
+  // /launch mode WxHxFPS and stream bitrate (kbps). Native defaults
+  // 1280 / 720 / 60 / 5000.
+  sunshineWidth?: number;
+  sunshineHeight?: number;
+  sunshineFps?: number;
+  sunshineBitrate?: number;
+  // "h264,hevc"; omit to let native pick H.264 plus HEVC when the device has a
+  // hardware HEVC decoder.
+  sunshineFormats?: string;
+  // "none" disables Moonlight stream encryption (ENCFLG_NONE); omit for the
+  // native default (encrypted).
+  sunshineEncryption?: string;
+}
+
+/** Sunshine pairing info attached to state="pairing-required". */
+export interface PairingInfo {
+  /** Host whose Sunshine web page shows the PIN. */
+  host: string;
+  /** Sunshine appversion reported by /serverinfo. */
+  appVersion: string;
 }
 
 /** cursor object inside the status JSON. */
@@ -69,6 +101,13 @@ export interface SessionStatus {
    * server refused one; RDP has no reject answer).
    */
   resizeSupport?: string;
+  /**
+   * Sunshine only: present while the session waits for the 4-digit PIN shown by
+   * the server's web page (state="pairing-required").
+   */
+  pairing?: PairingInfo;
+  /** Sunshine only: the /applist title that was actually launched. */
+  app?: string;
 }
 
 /** takeFrame metadata JSON (docs/napi-contract.md §画面). */
@@ -102,6 +141,8 @@ export const SESSION_STATE_DISCONNECTED: string = 'disconnected';
 export const SESSION_STATE_FAILED: string = 'failed';
 export const SESSION_STATE_TRUST_REQUIRED: string = 'trust-required';
 export const SESSION_STATE_RECONNECTING: string = 'reconnecting';
+/** Sunshine only: waiting for the web page's 4-digit PIN (submitPin). */
+export const SESSION_STATE_PAIRING_REQUIRED: string = 'pairing-required';
 
 /**
  * errorCode of a failed session whose RDP account was taken over by another
@@ -109,6 +150,13 @@ export const SESSION_STATE_RECONNECTING: string = 'reconnecting';
  * native side does not reconnect from this state on its own.
  */
 export const SESSION_ERROR_SESSION_TAKEN_OVER: string = 'session-taken-over';
+
+/**
+ * Sunshine only: the previous pairing attempt failed (wrong PIN or the web page
+ * did not confirm in time). The state stays "pairing-required", so a new PIN
+ * can be submitted without reconnecting.
+ */
+export const SESSION_ERROR_PAIR_FAILED: string = 'pair-failed';
 
 export function buildOptionsJson(options: SessionOptions): string {
   return JSON.stringify(options);
@@ -308,6 +356,22 @@ export function forgetTrustedFingerprint(sessionId: string): string {
   } catch (error) {
     warn('forgetTrustedFingerprint', error);
     return '';
+  }
+}
+
+/**
+ * Sunshine only: hands the 4-digit PIN shown by the server's web page to a
+ * session whose state is "pairing-required". Synchronous boolean: true when the
+ * PIN entered that session's slot (the backend takes it once and clears it),
+ * false for an unknown/non-Sunshine session, a session not waiting for a PIN,
+ * or a value that is not exactly 4 ASCII digits. Never logged.
+ */
+export function submitPin(sessionId: string, pin: string): boolean {
+  try {
+    return diag.submitPin(sessionId, pin) === true;
+  } catch (error) {
+    warn('submitPin', error);
+    return false;
   }
 }
 

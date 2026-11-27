@@ -6,10 +6,11 @@
  *  - right: connection cards (name, host:port, status, last-connected time,
  *    primary action + more menu 重连/新建会话/编辑/复制/移组/删除);
  *  - top: search (name + host:port) and 新建连接;
- *  - new/edit form overlay: 名称/协议(VNC|RDP)/地址/端口/[RDP 用户名/域]/分组/
+ *  - new/edit form overlay: 名称/协议(VNC|RDP|Sunshine)/地址/端口/[RDP 用户名/域]/
+ *    [Sunshine 应用名 + 画质档位/自定义宽高帧率码率编码]/分组/
  *    无需密码(VNC)/密码/保存密码 + 保存 / 保存并连接;
  *  - per-connection live status from the SessionRegistry (未连接/连接中/已连接·N个/
- *    重连中/已断开/需要确认身份/失败), fingerprint confirm inline.
+ *    重连中/已断开/需要确认身份/需要配对/失败), fingerprint confirm inline.
  *
  * Cards are keyed by entry.id only. Their live data (status, action label,
  * edited fields) lives in an @Observed ConnectionView that the card component
@@ -18,18 +19,23 @@
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
+import { fileIo as fs } from '@kit.CoreFileKit';
 import type { common } from '@kit.AbilityKit';
 import {
   createSession, diagMultiSessionAvailable, forgetTrustedFingerprint,
-  SESSION_ERROR_SESSION_TAKEN_OVER
+  SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_STATE_PAIRING_REQUIRED
 } from '../diag/SessionApi';
 import type { SessionOptions } from '../diag/SessionApi';
 import {
   findConnection, forgetFingerprint, loadPassword, newConnectionId, passwordAliasFor, pinKeyFor,
   readTrustedFingerprint, removeConnection, removePassword, savePassword, savedConnections,
-  trustFingerprint, upsertConnection, DEFAULT_PORT, defaultPortFor, UNGROUPED
+  trustFingerprint, upsertConnection, DEFAULT_PORT, defaultPortFor, UNGROUPED,
+  normalizeSunshineQuality, sunshineFormatsFor, sunshinePresetFor, isSunshineCodec,
+  isSunshinePreset, isValidSunshineBitrateMbps, isValidSunshineFps, isValidSunshineSize,
+  SUNSHINE_CODEC_AUTO, SUNSHINE_CODEC_H264, SUNSHINE_CODEC_HEVC,
+  SUNSHINE_PRESET_BALANCED, SUNSHINE_PRESET_CUSTOM, SUNSHINE_PRESETS
 } from '../model/ConnectionStore';
-import type { ConnectionEntry } from '../model/ConnectionStore';
+import type { ConnectionEntry, SunshinePreset } from '../model/ConnectionStore';
 import {
   addSessionsListener, removeSessionsListener, sessionsForConnection, allSessions, findSession,
   registerSession, closeSessionById, reconnectById
@@ -73,7 +79,7 @@ class ConnectionView {
   id: string;
   entry: ConnectionEntry;
   name: string;
-  /** 'vnc' | 'rdp' — shown as the label in front of the endpoint. */
+  /** 'vnc' | 'rdp' | 'sunshine' — shown as the label in front of the endpoint. */
   protocol: string;
   endpoint: string;
   lastConnectedText: string;
@@ -90,7 +96,8 @@ class ConnectionView {
     this.id = entry.id;
     this.entry = entry;
     this.name = entry.name;
-    this.protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+    this.protocol = entry.protocol === 'rdp' ? 'rdp' :
+      (entry.protocol === 'sunshine' ? 'sunshine' : 'vnc');
     this.endpoint = entry.host + ':' + entry.port;
     this.lastConnectedText = '';
     this.statusKind = 'idle';
@@ -135,9 +142,11 @@ struct ConnectionCard {
     return this.view.hasSessions ? '打开' : '连接';
   }
 
-  /** "RDP  192.168.50.12:3389" — protocol label in front of the endpoint. */
+  /** "Sunshine  192.168.50.62:47989" — protocol label before the endpoint. */
   private protocolEndpoint(): string {
-    return (this.view.protocol === 'rdp' ? 'RDP' : 'VNC') + '  ' + this.view.endpoint;
+    const label = this.view.protocol === 'rdp' ? 'RDP' :
+      (this.view.protocol === 'sunshine' ? 'Sunshine' : 'VNC');
+    return label + '  ' + this.view.endpoint;
   }
 
   private statusColor(): Resource {
@@ -148,6 +157,7 @@ struct ConnectionCard {
         return $r('app.color.brand');
       case 'reconnecting':
       case 'trust':
+      case 'pairing':
         return $r('app.color.warning');
       case 'failed':
         return $r('app.color.danger');
@@ -362,31 +372,42 @@ struct ConnectionCard {
       // Fingerprint changed since it was trusted: tell the user both values and
       // offer a re-confirmation. Resetting only makes the server show its
       // fingerprint again; nothing is trusted until 确认并信任 is pressed.
+      // Sunshine is different: its server certificate is pinned natively during
+      // pairing, so 重新确认指纹 does not apply (and this version has no NAPI to
+      // clear that pin) — only the native reason is shown.
       if (this.view.statusKind === 'failed' &&
           this.view.statusErrorCode === 'fingerprint-mismatch') {
         Column({ space: 8 }) {
-          Text('服务端指纹与已信任值不一致，已拒绝连接')
+          Text(this.view.protocol === 'sunshine'
+            ? 'Sunshine 的配对证书与已配对记录不一致，已拒绝连接'
+            : '服务端指纹与已信任值不一致，已拒绝连接')
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.danger'))
-          Text('已信任：' + (this.view.mismatchTrusted.length > 0
-            ? this.view.mismatchTrusted : '（未取到）'))
-            .fontSize(12)
-          Text('当前看到：' + (this.view.statusFingerprint.length > 0
-            ? this.view.statusFingerprint : '（未取到）'))
-            .fontSize(12)
-          Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-          Button('重新确认指纹')
-            .fontSize(14)
-            .fontColor(Color.White)
-            .backgroundColor($r('app.color.brand'))
-            .height(40)
-            .borderRadius(12)
-            .onClick(() => {
-              this.onResetTrust(this.view.id);
-            })
+          if (this.view.protocol === 'sunshine') {
+            Text('Sunshine 会在配对时固定服务端证书，本机无法在应用内重置该记录。请在主机端删除本客户端的配对后重试。')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          } else {
+            Text('已信任：' + (this.view.mismatchTrusted.length > 0
+              ? this.view.mismatchTrusted : '（未取到）'))
+              .fontSize(12)
+            Text('当前看到：' + (this.view.statusFingerprint.length > 0
+              ? this.view.statusFingerprint : '（未取到）'))
+              .fontSize(12)
+            Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+            Button('重新确认指纹')
+              .fontSize(14)
+              .fontColor(Color.White)
+              .backgroundColor($r('app.color.brand'))
+              .height(40)
+              .borderRadius(12)
+              .onClick(() => {
+                this.onResetTrust(this.view.id);
+              })
+          }
         }
         .width('100%')
         .padding(12)
@@ -425,6 +446,18 @@ struct Index {
   @State private formProtocol: string = 'vnc';
   @State private formUsername: string = '';
   @State private formDomain: string = '';
+  /** Sunshine only: /applist title to launch; '' = the native default Desktop. */
+  @State private formSunshineApp: string = '';
+  // Sunshine quality. The tier table itself lives in ConnectionCodec.ets
+  // (SUNSHINE_PRESETS) — this form only holds the selection and, for 'custom',
+  // the four edited numbers plus the codec.
+  @State private formSunshinePreset: string = SUNSHINE_PRESET_BALANCED;
+  @State private formSunshineWidth: string = '1920';
+  @State private formSunshineHeight: string = '1080';
+  @State private formSunshineFps: string = '60';
+  /** Form-facing bitrate unit is Mbps; connect() converts it to native kbps. */
+  @State private formSunshineBitrate: string = '20';
+  @State private formSunshineCodec: string = SUNSHINE_CODEC_AUTO;
   @State private formPort: string = DEFAULT_PORT;
   @State private formGroup: string = '';
   @State private formPassword: string = '';
@@ -577,6 +610,15 @@ struct Index {
           fingerprint: sessions[i].fingerprint, errorCode: ''
         };
       }
+      if (state === SESSION_STATE_PAIRING_REQUIRED) {
+        // Sunshine is waiting for the PIN from the server's web page. Not a
+        // failure: the session window shows the PIN panel and connecting
+        // finishes without a reconnect.
+        return {
+          kind: 'pairing', label: '需要配对', count: sessions.length,
+          fingerprint: '', errorCode: ''
+        };
+      }
       if (state === 'failed') {
         // errorCode and the fingerprint the server presented travel with the
         // failed status so the card can explain a mismatch and offer a reset.
@@ -693,7 +735,8 @@ struct Index {
     // Assign only real changes: @ObjectLink cards are notified per assignment,
     // so a plain 2 s registry tick must not dirty every card.
     const endpoint = this.endpointOf(entry);
-    const protocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+    const protocol = entry.protocol === 'rdp' ? 'rdp' :
+      (entry.protocol === 'sunshine' ? 'sunshine' : 'vnc');
     const lastConnectedText = this.formatTime(entry.lastConnectedAt);
     const status = this.statusOf(entry);
     const hasSessions = sessionsForConnection(entry.id).length > 0;
@@ -801,6 +844,8 @@ struct Index {
     this.formProtocol = 'vnc';
     this.formUsername = '';
     this.formDomain = '';
+    this.formSunshineApp = '';
+    this.resetSunshineQuality(SUNSHINE_PRESET_BALANCED, SUNSHINE_CODEC_AUTO);
     this.formPort = DEFAULT_PORT;
     this.formGroup = this.selectedGroup === '__all__' || this.selectedGroup === UNGROUPED
       ? '' : this.selectedGroup;
@@ -814,9 +859,28 @@ struct Index {
     this.editingId = entry.id;
     this.formName = entry.name;
     this.formHost = entry.host;
-    this.formProtocol = entry.protocol === 'rdp' ? 'rdp' : 'vnc';
+    this.formProtocol = entry.protocol === 'rdp' ? 'rdp' :
+      (entry.protocol === 'sunshine' ? 'sunshine' : 'vnc');
     this.formUsername = entry.username;
     this.formDomain = entry.domain;
+    this.formSunshineApp = entry.sunshineApp;
+    // Quality: old records loaded by parseConnectionRecords already carry the
+    // resolved values (balanced tier when the field was absent); the helpers
+    // below only guard against a hand-written / partial record.
+    const preset = typeof entry.sunshinePreset === 'string' &&
+      isSunshinePreset(entry.sunshinePreset) ? entry.sunshinePreset : SUNSHINE_PRESET_BALANCED;
+    const tier = sunshinePresetFor(preset);
+    this.formSunshinePreset = preset;
+    this.formSunshineWidth = String(typeof entry.sunshineWidth === 'number'
+      ? entry.sunshineWidth : tier.width);
+    this.formSunshineHeight = String(typeof entry.sunshineHeight === 'number'
+      ? entry.sunshineHeight : tier.height);
+    this.formSunshineFps = String(typeof entry.sunshineFps === 'number'
+      ? entry.sunshineFps : tier.fps);
+    this.formSunshineBitrate = String(typeof entry.sunshineBitrate === 'number'
+      ? entry.sunshineBitrate : tier.bitrateMbps);
+    this.formSunshineCodec = typeof entry.sunshineCodec === 'string' &&
+      isSunshineCodec(entry.sunshineCodec) ? entry.sunshineCodec : SUNSHINE_CODEC_AUTO;
     this.formPort = entry.port;
     this.formGroup = entry.group;
     this.formSavePassword = entry.savePassword;
@@ -839,6 +903,39 @@ struct Index {
   }
 
   /**
+   * Puts the Sunshine quality fields back onto one tier (used for a new
+   * connection). The numbers always come from the shared SUNSHINE_PRESETS
+   * table, so the form can never drift from what connect() sends.
+   */
+  private resetSunshineQuality(preset: string, codec: string): void {
+    const tier = sunshinePresetFor(preset);
+    this.formSunshinePreset = preset;
+    this.formSunshineWidth = String(tier.width);
+    this.formSunshineHeight = String(tier.height);
+    this.formSunshineFps = String(tier.fps);
+    this.formSunshineBitrate = String(tier.bitrateMbps);
+    this.formSunshineCodec = codec;
+  }
+
+  /**
+   * Selects a Sunshine quality tier. A named tier overwrites the four numbers
+   * with the tier table; 自定义 keeps whatever is in the fields so the user can
+   * start editing from the previous tier.
+   */
+  private selectSunshinePreset(preset: string): void {
+    if (preset === SUNSHINE_PRESET_CUSTOM) {
+      this.formSunshinePreset = preset;
+      return;
+    }
+    const tier = sunshinePresetFor(preset);
+    this.formSunshinePreset = preset;
+    this.formSunshineWidth = String(tier.width);
+    this.formSunshineHeight = String(tier.height);
+    this.formSunshineFps = String(tier.fps);
+    this.formSunshineBitrate = String(tier.bitrateMbps);
+  }
+
+  /**
    * Switches the form protocol. The port follows the new default only while it
    * is empty or still the other protocol's default; a custom port the user
    * typed is never overwritten.
@@ -854,8 +951,14 @@ struct Index {
     }
     this.formProtocol = protocol;
     if (protocol !== 'vnc') {
-      // RDP has no "server needs no password" semantics.
+      // RDP and Sunshine have no "server needs no password" semantics.
       this.formNoPassword = false;
+    }
+    if (protocol === 'sunshine') {
+      // Sunshine never uses a password: a value typed under VNC/RDP must not
+      // survive into a Sunshine connection (the form hides these fields).
+      this.formPassword = '';
+      this.formSavePassword = false;
     }
   }
 
@@ -864,9 +967,12 @@ struct Index {
       this.showHint('请填写服务器地址', true);
       return undefined;
     }
-    const protocol = this.formProtocol === 'rdp' ? 'rdp' : 'vnc';
+    const protocol = this.formProtocol === 'rdp' ? 'rdp' :
+      (this.formProtocol === 'sunshine' ? 'sunshine' : 'vnc');
     const username = protocol === 'rdp' ? this.formUsername.trim() : '';
     const domain = protocol === 'rdp' ? this.formDomain.trim() : '';
+    // Sunshine launches an app by /applist title; '' means the native default.
+    const sunshineApp = protocol === 'sunshine' ? this.formSunshineApp.trim() : '';
     if (protocol === 'rdp' && username.length === 0) {
       this.showHint('请输入用户名', true);
       return undefined;
@@ -880,18 +986,69 @@ struct Index {
     // Editing keeps the original opaque id, so changing host/port updates that
     // record instead of leaving the old one behind and adding a second one.
     const previous = this.editingId.length > 0 ? findConnection(this.editingId) : undefined;
+    // Sunshine quality: a named tier always stores the tier table's numbers;
+    // 'custom' stores the four edited values after validating them against the
+    // native limits (an out-of-range value would make createSession fail with
+    // "invalid sunshine …"). Every other protocol stores the balanced defaults
+    // (the fields are simply ignored for it).
+    let sunshinePreset = SUNSHINE_PRESET_BALANCED;
+    let sunshineTier = sunshinePresetFor(SUNSHINE_PRESET_BALANCED);
+    let sunshineWidth = sunshineTier.width;
+    let sunshineHeight = sunshineTier.height;
+    let sunshineFps = sunshineTier.fps;
+    let sunshineBitrate = sunshineTier.bitrateMbps;
+    let sunshineCodec = SUNSHINE_CODEC_AUTO;
+    if (protocol === 'sunshine') {
+      sunshinePreset = isSunshinePreset(this.formSunshinePreset) ?
+        this.formSunshinePreset : SUNSHINE_PRESET_BALANCED;
+      sunshineTier = sunshinePresetFor(sunshinePreset);
+      sunshineWidth = sunshineTier.width;
+      sunshineHeight = sunshineTier.height;
+      sunshineFps = sunshineTier.fps;
+      sunshineBitrate = sunshineTier.bitrateMbps;
+      if (sunshinePreset === SUNSHINE_PRESET_CUSTOM) {
+        sunshineWidth = Number(this.formSunshineWidth.trim());
+        sunshineHeight = Number(this.formSunshineHeight.trim());
+        if (!isValidSunshineSize(sunshineWidth) || !isValidSunshineSize(sunshineHeight)) {
+          this.showHint('分辨率无效（1-4096）', true);
+          return undefined;
+        }
+        sunshineFps = Number(this.formSunshineFps.trim());
+        if (!isValidSunshineFps(sunshineFps)) {
+          this.showHint('帧率无效（1-480）', true);
+          return undefined;
+        }
+        sunshineBitrate = Number(this.formSunshineBitrate.trim());
+        if (!isValidSunshineBitrateMbps(sunshineBitrate)) {
+          this.showHint('码率无效（1-200 Mbps，整数）', true);
+          return undefined;
+        }
+      }
+      sunshineCodec = isSunshineCodec(this.formSunshineCodec) ?
+        this.formSunshineCodec : SUNSHINE_CODEC_AUTO;
+    }
+    // Sunshine has no password at all, so noPassword/savePassword are forced off
+    // and the password fields never reach the record.
+    const sunshine = protocol === 'sunshine';
     const entry: ConnectionEntry = {
       id: previous === undefined ? newConnectionId() : previous.id,
       name: this.formName.trim().length > 0 ? this.formName.trim() : this.formHost.trim(),
       host: this.formHost.trim(),
       port: port,
       group: this.formGroup.trim(),
-      savePassword: this.formNoPassword ? false : this.formSavePassword,
-      noPassword: this.formNoPassword,
+      savePassword: sunshine ? false : (this.formNoPassword ? false : this.formSavePassword),
+      noPassword: sunshine ? false : this.formNoPassword,
       lastConnectedAt: previous === undefined ? 0 : previous.lastConnectedAt,
       protocol: protocol,
       username: username,
-      domain: domain
+      domain: domain,
+      sunshineApp: sunshineApp,
+      sunshinePreset: sunshinePreset,
+      sunshineWidth: sunshineWidth,
+      sunshineHeight: sunshineHeight,
+      sunshineFps: sunshineFps,
+      sunshineBitrate: sunshineBitrate,
+      sunshineCodec: sunshineCodec
     };
     return entry;
   }
@@ -913,7 +1070,8 @@ struct Index {
       if (!entry.savePassword) {
         removePassword(stored);
       }
-      this.showHint(entry.noPassword ? '已保存连接（该服务器无需密码）' : '已保存连接（未保存密码）');
+      this.showHint(entry.protocol === 'sunshine' ? '已保存连接' :
+        (entry.noPassword ? '已保存连接（该服务器无需密码）' : '已保存连接（未保存密码）'));
     }
     this.formVisible = false;
     if (andConnect) {
@@ -934,7 +1092,14 @@ struct Index {
       lastConnectedAt: 0,
       protocol: entry.protocol,
       username: entry.username,
-      domain: entry.domain
+      domain: entry.domain,
+      sunshineApp: entry.sunshineApp,
+      sunshinePreset: entry.sunshinePreset,
+      sunshineWidth: entry.sunshineWidth,
+      sunshineHeight: entry.sunshineHeight,
+      sunshineFps: entry.sunshineFps,
+      sunshineBitrate: entry.sunshineBitrate,
+      sunshineCodec: entry.sunshineCodec
     };
     upsertConnection(copy);
     this.connections = savedConnections();
@@ -970,6 +1135,12 @@ struct Index {
    * only the surviving list decides.
    */
   private forgetTrustIfUnshared(entry: ConnectionEntry): void {
+    // Sunshine never has an entry in the ArkTS trust store (its server
+    // certificate is pinned by the native backend inside sunshineStateDir), so
+    // there is nothing to forget and the VNC/RDP store must not be touched.
+    if (entry.protocol === 'sunshine') {
+      return;
+    }
     const key = pinKeyFor(entry);
     const remaining = savedConnections();
     for (let i = 0; i < remaining.length; i++) {
@@ -988,6 +1159,11 @@ struct Index {
    * check above.
    */
   private forgetPasswordIfUnshared(entry: ConnectionEntry): void {
+    // Sunshine has no password: the form never saves one and deleting the
+    // record must not run an asset-store removal for it.
+    if (entry.protocol === 'sunshine') {
+      return;
+    }
     const alias = passwordAliasFor(entry);
     const remaining = savedConnections();
     for (let i = 0; i < remaining.length; i++) {
@@ -1241,6 +1417,39 @@ struct Index {
     }
   }
 
+  /**
+   * App-sandbox absolute path of the Sunshine client state directory
+   * (client certificate/private key, uniqueid and the pinned server
+   * certificate). The native backend requires the directory to exist; it is
+   * created here on first use. '' means the path could not be prepared and the
+   * connection must be refused instead of starting a session that would fail
+   * with "missing state directory".
+   */
+  private sunshineStateDir(): string {
+    const context = this.abilityContext();
+    if (context === undefined) {
+      return '';
+    }
+    const stateDir = context.filesDir + '/sunshine';
+    try {
+      if (!fs.accessSync(stateDir)) {
+        fs.mkdirSync(stateDir, true);
+      }
+    } catch (error) {
+      // A concurrent create can fail with "file exists" while the directory is
+      // already usable: only report the failure when the directory is missing.
+      hilog.warn(DOMAIN, TAG, '创建 Sunshine 状态目录失败：%{public}s', String(error));
+      try {
+        if (!fs.accessSync(stateDir)) {
+          return '';
+        }
+      } catch (inner) {
+        return '';
+      }
+    }
+    return stateDir;
+  }
+
   private activateSession(sessionId: string, displayName: string): void {
     // Opening is async; a double click used to start two opens, and multiton
     // does not deduplicate, so two instances (double polling, two input
@@ -1307,15 +1516,21 @@ struct Index {
       this.connectingRdpKeys.add(rdpKey);
     }
     try {
+      // Sunshine never asks for a password (the PIN pairing replaces it), so it
+      // skips the whole password gate — including the key-store read: it must
+      // never touch the VNC/RDP password store.
+      const sunshine = entry.protocol === 'sunshine';
       let password = explicitPassword;
-      if (password.length === 0 && entry.savePassword) {
-        password = await loadPassword(entry);
-      }
-      if (password.length === 0 && entry.noPassword !== true) {
-        // No password available: open the form focused on the password field.
-        this.openFormEdit(entry);
-        this.showHint('请输入密码后再连接', true);
-        return;
+      if (!sunshine) {
+        if (password.length === 0 && entry.savePassword) {
+          password = await loadPassword(entry);
+        }
+        if (password.length === 0 && entry.noPassword !== true) {
+          // No password available: open the form focused on the password field.
+          this.openFormEdit(entry);
+          this.showHint('请输入密码后再连接', true);
+          return;
+        }
       }
       const endpoint = this.endpointOf(entry);
       const options: SessionOptions = {
@@ -1325,10 +1540,46 @@ struct Index {
       };
       // password is optional in the contract: omit it entirely for servers that
       // need none instead of sending an empty credential.
-      if (password.length > 0) {
+      if (!sunshine && password.length > 0) {
         options.password = password;
       }
-      if (entry.protocol === 'rdp') {
+      if (sunshine) {
+        // Sunshine/Moonlight. The client state directory is mandatory: the
+        // native backend keeps the client identity and the pinned server
+        // certificate there. security / password / expectedFingerprint are
+        // deliberately NOT set — Sunshine has no RFB security types and pins
+        // its server certificate natively inside that directory, so it must
+        // never read the VNC/RDP trust store.
+        const stateDir = this.sunshineStateDir();
+        if (stateDir.length === 0) {
+          this.showHint('无法准备 Sunshine 状态目录，连接已取消', true);
+          return;
+        }
+        options.protocol = 'sunshine';
+        options.sunshineStateDir = stateDir;
+        if (entry.sunshineApp.length > 0) {
+          // '' keeps the native default ("Desktop").
+          options.sunshineApp = entry.sunshineApp;
+        }
+        // Quality: a named tier resolves through the single SUNSHINE_PRESETS
+        // table (so tuning a tier is one edit); 'custom' uses the stored
+        // numbers. sunshineBitrate is kbps natively but Mbps in the store/form.
+        const quality = normalizeSunshineQuality(entry.sunshinePreset,
+          entry.sunshineWidth, entry.sunshineHeight, entry.sunshineFps,
+          entry.sunshineBitrate, entry.sunshineCodec);
+        const tier = sunshinePresetFor(quality.preset);
+        const custom = quality.preset === SUNSHINE_PRESET_CUSTOM;
+        options.sunshineWidth = custom ? quality.width : tier.width;
+        options.sunshineHeight = custom ? quality.height : tier.height;
+        options.sunshineFps = custom ? quality.fps : tier.fps;
+        options.sunshineBitrate = (custom ? quality.bitrateMbps : tier.bitrateMbps) * 1000;
+        // auto: omit -> native picks by hardware decoder; h264 -> "h264";
+        // hevc -> "h264,hevc" (server prefers HEVC, falls back to H.264).
+        const formats = sunshineFormatsFor(quality.codec);
+        if (formats.length > 0) {
+          options.sunshineFormats = formats;
+        }
+      } else if (entry.protocol === 'rdp') {
         // RDP shares the session state machine; only the endpoint options
         // differ. security stays unset (RFB security types only), but
         // expectedFingerprint is the RDP server certificate pin: the pin is
@@ -1407,6 +1658,10 @@ struct Index {
         return '协议不匹配或服务器拒绝';
       case SESSION_ERROR_SESSION_TAKEN_OVER:
         return '该账号的会话已被别的连接接管。在远端注销被接管的会话，或直接点「重连」即可重新连接。';
+      case 'pair-failed':
+        // Sunshine only; normal retry happens inside the PIN panel without a
+        // reconnect, this text is the fallback when the session really failed.
+        return '配对失败：PIN 不正确或已过期，请重试';
       default:
         return '连接失败';
     }
@@ -1425,6 +1680,8 @@ struct Index {
         return '协议不匹配';
       case SESSION_ERROR_SESSION_TAKEN_OVER:
         return '会话被接管';
+      case 'pair-failed':
+        return '配对失败';
       default:
         return '';
     }
@@ -1660,6 +1917,16 @@ struct Index {
           .fontColor(this.formProtocol === 'rdp'
             ? Color.White : $r('app.color.text_primary'))
           .onClick(() => { this.selectProtocol('rdp'); })
+        Button('Sunshine')
+          .fontSize(14)
+          .height(40)
+          .layoutWeight(1)
+          .borderRadius(12)
+          .backgroundColor(this.formProtocol === 'sunshine'
+            ? $r('app.color.brand') : $r('app.color.chip_background'))
+          .fontColor(this.formProtocol === 'sunshine'
+            ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => { this.selectProtocol('sunshine'); })
       }.width('100%')
       Row({ space: 8 }) {
         TextInput({ text: this.formHost, placeholder: '服务器地址' })
@@ -1680,6 +1947,107 @@ struct Index {
           .height(40)
           .onChange((value: string) => { this.formDomain = value; })
       }
+      if (this.formProtocol === 'sunshine') {
+        // Sunshine launches an app by title from the host's /applist; empty
+        // keeps the native default ("Desktop").
+        TextInput({ text: this.formSunshineApp, placeholder: '应用名（留空为 Desktop）' })
+          .height(40)
+          .onChange((value: string) => { this.formSunshineApp = value; })
+        // ---- 画质: one tier + (for 自定义) the four numbers and the codec ----
+        Text('画质').fontSize(13).fontColor($r('app.color.text_secondary'))
+        Row({ space: 6 }) {
+          ForEach(SUNSHINE_PRESETS, (preset: SunshinePreset) => {
+            Button(preset.label)
+              .fontSize(12)
+              .height(36)
+              .layoutWeight(1)
+              .borderRadius(10)
+              .backgroundColor(this.formSunshinePreset === preset.id
+                ? $r('app.color.brand') : $r('app.color.chip_background'))
+              .fontColor(this.formSunshinePreset === preset.id
+                ? Color.White : $r('app.color.text_primary'))
+              .onClick(() => { this.selectSunshinePreset(preset.id); })
+          }, (preset: SunshinePreset) => preset.id)
+          Button('自定义')
+            .fontSize(12)
+            .height(36)
+            .layoutWeight(1)
+            .borderRadius(10)
+            .backgroundColor(this.formSunshinePreset === SUNSHINE_PRESET_CUSTOM
+              ? $r('app.color.brand') : $r('app.color.chip_background'))
+            .fontColor(this.formSunshinePreset === SUNSHINE_PRESET_CUSTOM
+              ? Color.White : $r('app.color.text_primary'))
+            .onClick(() => { this.selectSunshinePreset(SUNSHINE_PRESET_CUSTOM); })
+        }.width('100%')
+        if (this.formSunshinePreset === SUNSHINE_PRESET_CUSTOM) {
+          Row({ space: 8 }) {
+            TextInput({ text: this.formSunshineWidth, placeholder: '宽' })
+              .height(40)
+              .type(InputType.Number)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.formSunshineWidth = value; })
+            TextInput({ text: this.formSunshineHeight, placeholder: '高' })
+              .height(40)
+              .type(InputType.Number)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.formSunshineHeight = value; })
+          }.width('100%')
+          Row({ space: 8 }) {
+            TextInput({ text: this.formSunshineFps, placeholder: '帧率' })
+              .height(40)
+              .type(InputType.Number)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.formSunshineFps = value; })
+            TextInput({ text: this.formSunshineBitrate, placeholder: '码率（Mbps）' })
+              .height(40)
+              .type(InputType.Number)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.formSunshineBitrate = value; })
+          }.width('100%')
+          // 视频编码: auto leaves sunshineFormats unset; H.264 -> "h264";
+          // HEVC -> "h264,hevc" so a server without HEVC still connects.
+          Row({ space: 6 }) {
+            Button('自动')
+              .fontSize(13)
+              .height(36)
+              .layoutWeight(1)
+              .borderRadius(10)
+              .backgroundColor(this.formSunshineCodec === SUNSHINE_CODEC_AUTO
+                ? $r('app.color.brand') : $r('app.color.chip_background'))
+              .fontColor(this.formSunshineCodec === SUNSHINE_CODEC_AUTO
+                ? Color.White : $r('app.color.text_primary'))
+              .onClick(() => { this.formSunshineCodec = SUNSHINE_CODEC_AUTO; })
+            Button('H.264')
+              .fontSize(13)
+              .height(36)
+              .layoutWeight(1)
+              .borderRadius(10)
+              .backgroundColor(this.formSunshineCodec === SUNSHINE_CODEC_H264
+                ? $r('app.color.brand') : $r('app.color.chip_background'))
+              .fontColor(this.formSunshineCodec === SUNSHINE_CODEC_H264
+                ? Color.White : $r('app.color.text_primary'))
+              .onClick(() => { this.formSunshineCodec = SUNSHINE_CODEC_H264; })
+            Button('HEVC')
+              .fontSize(13)
+              .height(36)
+              .layoutWeight(1)
+              .borderRadius(10)
+              .backgroundColor(this.formSunshineCodec === SUNSHINE_CODEC_HEVC
+                ? $r('app.color.brand') : $r('app.color.chip_background'))
+              .fontColor(this.formSunshineCodec === SUNSHINE_CODEC_HEVC
+                ? Color.White : $r('app.color.text_primary'))
+              .onClick(() => { this.formSunshineCodec = SUNSHINE_CODEC_HEVC; })
+          }.width('100%')
+        }
+        Text('分辨率、帧率与码率在重新连接后生效')
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+        Text('码率低于 15 Mbps 时音频会降为普通音质')
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+      }
       TextInput({ text: this.formGroup, placeholder: '分组（可留空）' })
         .height(40)
         .onChange((value: string) => { this.formGroup = value; })
@@ -1697,22 +2065,26 @@ struct Index {
           Text('该服务器无需密码').fontSize(14)
         }
       }
-      TextInput({ text: this.formPassword, placeholder: '密码（不回显）' })
-        .height(40)
-        .type(InputType.Password)
-        .enabled(!this.formNoPassword)
-        .onChange((value: string) => {
-          this.formPassword = value;
-        })
-      Row({ space: 8 }) {
-        Checkbox()
-          .select(this.formSavePassword)
+      // Sunshine has no password at all: the whole password block is hidden
+      // (a stale value can never be saved for it, see selectProtocol/formEntry).
+      if (this.formProtocol !== 'sunshine') {
+        TextInput({ text: this.formPassword, placeholder: '密码（不回显）' })
+          .height(40)
+          .type(InputType.Password)
           .enabled(!this.formNoPassword)
-          .onChange((checked: boolean) => { this.formSavePassword = checked; })
-        Text('保存密码（系统密钥库）')
-          .fontSize(14)
-          .fontColor(this.formNoPassword
-            ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
+          .onChange((value: string) => {
+            this.formPassword = value;
+          })
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(this.formSavePassword)
+            .enabled(!this.formNoPassword)
+            .onChange((checked: boolean) => { this.formSavePassword = checked; })
+          Text('保存密码（系统密钥库）')
+            .fontSize(14)
+            .fontColor(this.formNoPassword
+              ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
+        }
       }
       Row({ space: 12 }) {
         Button('取消')
@@ -1741,7 +2113,9 @@ struct Index {
           .onClick(() => { this.saveForm(true); })
       }.width('100%')
     }
-    .width('86%')
+    // Width comes from the enclosing Scroll (86% of the window); the panel only
+    // adds its own background/padding so scrolling never cuts the card edges.
+    .width('100%')
     .padding(24)
     .borderRadius(16)
     .backgroundColor($r('app.color.card_background'))
@@ -2040,7 +2414,7 @@ struct Index {
             Text('版本 ' + (this.appVersion.length > 0 ? this.appVersion : '未知'))
               .fontSize(13)
               .fontColor($r('app.color.text_secondary'))
-            Text('HarmonyOS 远程桌面客户端（VNC / RDP）')
+            Text('HarmonyOS 远程桌面客户端（VNC / RDP / Sunshine）')
               .fontSize(13)
               .fontColor($r('app.color.text_secondary'))
           }
@@ -2388,7 +2762,14 @@ struct Index {
           .height('100%')
           .backgroundColor('rgba(0,0,0,0.45)')
           .onClick(() => { this.formVisible = false; })
-        this.formOverlay()
+        // The form grew with the Sunshine quality group: scroll it when it is
+        // taller than the window instead of letting the buttons fall off screen.
+        Scroll() {
+          this.formOverlay()
+        }
+        .width('86%')
+        .constraintSize({ maxHeight: '92%' })
+        .scrollBar(BarState.Auto)
       }
       if (this.moveTargetId.length > 0) {
         Column()

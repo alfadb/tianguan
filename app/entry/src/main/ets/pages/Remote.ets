@@ -58,7 +58,8 @@
  * Everything talks to the native layer through diag/SessionApi.ets with THIS
  * session's id; the status is parsed as JSON per docs/napi-contract.md (never
  * the legacy "key=value" text). The 250 ms poll (30 ms on the Canvas path)
- * drives the status text, the trust-required panel and the clipboard edge
+ * drives the status text, the trust-required panel, the Sunshine
+ * pairing-required (PIN) panel and the clipboard edge
  * (clipboard.version -> clipboard/TianguanClipboard); frames no longer depend
  * on it in the GL mode. The local cursor follows pointer events directly; the
  * poll only re-places it after a shape or size change. Two 2 s debug-level
@@ -78,11 +79,12 @@ import pointer from '@ohos.multimodalInput.pointer';
 import { display, window } from '@kit.ArkUI';
 import {
   copyCursor, forgetTrustedFingerprint, parseFrameMeta, reconnectSession, releaseSessionInput,
-  requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, takeFrameRaw,
+  requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, submitPin,
+  takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
   syncRemoteLockState,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
-  SESSION_ERROR_SESSION_TAKEN_OVER
+  SESSION_STATE_PAIRING_REQUIRED, SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_ERROR_PAIR_FAILED
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
 import {
@@ -618,6 +620,35 @@ struct Remote {
   @State private mismatchCurrent: string = '';
   @State private mismatchTrusted: string = '';
   @State private mismatchError: string = '';
+  /** True when the mismatch belongs to a Sunshine session: its server
+   * certificate is pinned natively in sunshineStateDir, so the VNC/RDP trust
+   * reset (forgetTrustedFingerprint) does not apply and must not be offered. */
+  @State private mismatchSunshine: boolean = false;
+  /** Native `error` of the mismatch status (Sunshine explains the re-pairing). */
+  @State private mismatchNative: string = '';
+  // Sunshine pairing (state=pairing-required): the session waits for the
+  // 4-digit PIN shown by the host's web page. The panel is interactive like the
+  // trust panel, but submitting does NOT reconnect: the same session continues
+  // to /applist -> /launch -> connected once the host confirms.
+  @State private needsPairing: boolean = false;
+  /** Title/description context: pairing.host from the status JSON ('' if none). */
+  @State private pairingHost: string = '';
+  @State private pairingAppVersion: string = '';
+  @State private pinValue: string = '';
+  /** True after submitPin() accepted the PIN: input and button are disabled
+   * until the state changes (connected / failed / pairing-required again). */
+  @State private pinSubmitted: boolean = false;
+  @State private pinError: string = '';
+  /**
+   * Set when submitPin() accepted a PIN. The native backend leaves
+   * pairing-required immediately (that is why the panel folds as soon as the
+   * button is pressed), but the stream is still waiting for the user to confirm
+   * the same PIN on the host's web page (up to 5 minutes). While this flag is
+   * set, the connecting state must say 「等待网页端确认 PIN…」 instead of
+   * 「等待首帧…」. Cleared on connected / failed / disconnected and when a new
+   * pairing-required round starts (pair-failed).
+   */
+  @State private pinAwaitingConfirm: boolean = false;
   // Terminal failure (state=failed, except fingerprint-mismatch which keeps its
   // own panel): a session that already has a picture keeps that last frame and
   // never reaches the "waiting for first frame" node again, so the reason and
@@ -3447,6 +3478,51 @@ struct Remote {
       this.placeCursor();
     }
     // State machine -> status text.
+    // Sunshine pairing: like trust-required it is an interactive "waiting for
+    // the user" state, not a failure. Unlike trust-required it needs no
+    // reconnect: once submitPin() accepts the PIN the same session continues to
+    // /applist -> /launch -> connected.
+    if (status.state === SESSION_STATE_PAIRING_REQUIRED) {
+      const entered = !this.needsPairing;
+      const pairing = status.pairing;
+      this.pairingHost = pairing !== undefined && typeof pairing.host === 'string' ?
+        pairing.host : '';
+      this.pairingAppVersion = pairing !== undefined &&
+        typeof pairing.appVersion === 'string' ? pairing.appVersion : '';
+      if (entered) {
+        // First poll in this state: start with an empty input and no pending
+        // PIN (a value typed for an earlier attempt must not be reused).
+        this.pinValue = '';
+        this.pinSubmitted = false;
+        this.pinError = '';
+      }
+      this.needsPairing = true;
+      this.needsTrust = false;
+      this.fingerprint = '';
+      this.failureVisible = false;
+      this.clearTrustMismatch();
+      // The "waiting for the web page" flag may only be cleared by a real new
+      // pairing round: a fresh prompt (entered) or a rejected PIN (pair-failed).
+      // A status poll that still reports the same pairing-required state one
+      // tick after a successful submit must NOT clear it, or the connecting
+      // state would fall back to a misleading 连接中….
+      if (entered || status.errorCode === SESSION_ERROR_PAIR_FAILED) {
+        this.pinAwaitingConfirm = false;
+      }
+      // pair-failed arrives in the SAME state (contract): re-enable the input
+      // and show the retry reason instead of waiting for a reconnect.
+      if (status.errorCode === SESSION_ERROR_PAIR_FAILED) {
+        this.pinSubmitted = false;
+        this.pinError = '配对失败：PIN 不正确或已过期，请重试';
+      }
+      this.statusText = '需要配对';
+      return;
+    }
+    // Any other state means the pairing wait is over (connected / failed /
+    // disconnected / reconnect): fold the panel away.
+    if (this.needsPairing) {
+      this.clearPairing();
+    }
     if (status.state === SESSION_STATE_TRUST_REQUIRED) {
       this.clearTrustMismatch();
       this.needsTrust = true;
@@ -3466,6 +3542,10 @@ struct Remote {
       if (!this.needsTrustReset) {
         this.mismatchTrusted = this.trustedFingerprintForSession();
         this.mismatchError = '';
+        // Sunshine pins its server certificate natively in sunshineStateDir;
+        // the ArkTS trust store (and its reset) does not apply to it.
+        this.mismatchSunshine = this.sessionProtocol() === 'sunshine';
+        this.mismatchNative = status.error.length > 0 ? status.error : '';
       }
       const seen = status.fingerprint === undefined ? '' : status.fingerprint;
       if (this.mismatchCurrent !== seen) {
@@ -3480,6 +3560,9 @@ struct Remote {
     this.failureVisible = false;
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
+        // The stream is up: a PIN submitted earlier is confirmed and the
+        // "waiting for the web page" phase is over.
+        this.pinAwaitingConfirm = false;
         this.statusText = '已连接（实时刷新）';
         if (!USE_GL_RENDER) {
           // GL mode: the native render thread consumes frames itself; the
@@ -3493,6 +3576,7 @@ struct Remote {
         return;
       }
       case 'failed': {
+        this.pinAwaitingConfirm = false;
         const detail = this.failureReason(status);
         this.statusText = '失败：' + detail;
         if (status.errorCode !== 'fingerprint-mismatch') {
@@ -3502,10 +3586,14 @@ struct Remote {
         return;
       }
       case 'disconnected':
+        this.pinAwaitingConfirm = false;
         this.statusText = '已断开';
         return;
       case 'connecting':
-        this.statusText = '连接中…';
+        // Sunshine leaves pairing-required as soon as submitPin() succeeds and
+        // connects as "connecting" while it waits for the host's web page to
+        // confirm the same PIN: report that instead of a generic 连接中…
+        this.statusText = this.pinAwaitingConfirm ? '等待网页端确认 PIN…' : '连接中…';
         return;
       default:
         this.statusText = status.state;
@@ -4966,11 +5054,66 @@ struct Remote {
     return session.endpoint.length > 0 ? readTrustedFingerprint(session.endpoint) : '';
   }
 
+  /**
+   * Protocol of the saved connection this session belongs to, or '' when it
+   * cannot be confirmed (orphan session / unknown connection).
+   */
+  private sessionProtocol(): string {
+    const session = findSession(this.sessionId);
+    if (session === undefined || session.connectionId.length === 0) {
+      return '';
+    }
+    const entry = findConnection(session.connectionId);
+    return entry === undefined ? '' : entry.protocol;
+  }
+
   private clearTrustMismatch(): void {
     this.needsTrustReset = false;
     this.mismatchCurrent = '';
     this.mismatchTrusted = '';
     this.mismatchError = '';
+    this.mismatchSunshine = false;
+    this.mismatchNative = '';
+  }
+
+  /** Folds the Sunshine PIN panel and forgets the typed PIN. */
+  private clearPairing(): void {
+    this.needsPairing = false;
+    this.pairingHost = '';
+    this.pairingAppVersion = '';
+    this.pinValue = '';
+    this.pinSubmitted = false;
+    this.pinError = '';
+  }
+
+  /**
+   * 提交 PIN: hands the 4-digit PIN to the native session slot. On success the
+   * input and button stay disabled until the state moves on (the host confirms
+   * on its web page); the status poll either hides the panel (connected/failed)
+   * or brings back pair-failed, which re-enables the input.
+   */
+  private submitPairingPin(): void {
+    if (this.pinSubmitted || this.sessionId.length === 0) {
+      return;
+    }
+    if (this.pinValue.length !== 4) {
+      this.pinError = '请输入 4 位 PIN';
+      return;
+    }
+    const accepted = submitPin(this.sessionId, this.pinValue);
+    if (!accepted) {
+      // Not waiting for a PIN any more (state changed between the last poll and
+      // the click) or the native call was rejected: keep the input usable.
+      this.pinError = 'PIN 提交失败，请确认会话仍在等待配对后重试';
+      return;
+    }
+    this.pinError = '';
+    this.pinSubmitted = true;
+    // The native side leaves pairing-required right after this call, so the
+    // panel folds and the page shows the connecting state; remember that it is
+    // actually waiting for the host's web page to confirm this PIN.
+    this.pinAwaitingConfirm = true;
+    this.statusText = '等待网页端确认…';
   }
 
   /**
@@ -5216,37 +5359,109 @@ struct Remote {
         .borderRadius(12)
         .backgroundColor($r('app.color.warning_surface'))
       }
+      // Sunshine pairing: the session is waiting for the 4-digit PIN shown by
+      // the host's web page. Submitting it does NOT reconnect; the native
+      // session continues and the panel disappears once the state moves on.
+      if (this.needsPairing) {
+        Column({ space: 8 }) {
+          Text(this.pairingHost.length > 0 ? '需要配对：' + this.pairingHost : '需要配对')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+          if (this.pairingAppVersion.length > 0) {
+            Text('Sunshine 服务端版本 ' + this.pairingAppVersion)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          Text('请输入一个 4 位 PIN，然后在主机的 Sunshine 网页端「PIN」页提交同一个 PIN')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          if (this.pinError.length > 0) {
+            Text(this.pinError).fontSize(12).fontColor($r('app.color.danger'))
+          }
+          Row({ space: 8 }) {
+            TextInput({ text: this.pinValue, placeholder: '4 位 PIN' })
+              .height(40)
+              .layoutWeight(1)
+              .type(InputType.Number)
+              .maxLength(4)
+              .enabled(!this.pinSubmitted)
+              .onChange((value: string) => {
+                // PINs are ASCII digits only; the native call also rejects
+                // anything else, but filtering here avoids a pointless submit.
+                let digits = '';
+                for (let i = 0; i < value.length; i++) {
+                  const ch = value.charAt(i);
+                  if (ch >= '0' && ch <= '9') {
+                    digits += ch;
+                  }
+                }
+                this.pinValue = digits;
+                if (this.pinError.length > 0) {
+                  this.pinError = '';
+                }
+              })
+            Button(this.pinSubmitted ? '等待网页端确认…' : '提交')
+              .fontSize(14)
+              .fontColor(Color.White)
+              .backgroundColor($r('app.color.brand'))
+              .height(40)
+              .borderRadius(12)
+              .enabled(!this.pinSubmitted)
+              .onClick(() => { this.submitPairingPin(); })
+          }.width('100%')
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .backgroundColor($r('app.color.warning_surface'))
+        .alignItems(HorizontalAlign.Start)
+      }
       // Fingerprint mismatch: a separate interactive panel (the plain failure
       // text is non-interactive). It offers a reset that only makes the server
       // present its fingerprint again; 确认并信任 stays a separate user action.
       if (this.needsTrustReset) {
         Column({ space: 8 }) {
-          Text('服务端指纹与已信任值不一致，已拒绝连接')
+          Text(this.mismatchSunshine
+            ? 'Sunshine 的配对证书与已配对记录不一致，已拒绝连接'
+            : '服务端指纹与已信任值不一致，已拒绝连接')
             .fontSize(14)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.danger'))
-          Text('已信任：' + (this.mismatchTrusted.length > 0
-            ? this.mismatchTrusted : '（未取到）'))
-            .fontSize(13)
-          Text('当前看到：' + (this.mismatchCurrent.length > 0
-            ? this.mismatchCurrent : '（未取到）'))
-            .fontSize(13)
-          Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
+          if (this.mismatchSunshine) {
+            // Sunshine pins its server certificate natively at pairing time; the
+            // ArkTS trust store and 重新确认指纹 (forgetTrustedFingerprint) do not
+            // apply to it, and this version has no NAPI to clear that pin, so the
+            // honest action is to leave and re-pair from the host side.
+            Text(this.mismatchNative.length > 0 ? this.mismatchNative
+              : 'Sunshine 会在配对时固定服务端证书，本机无法在应用内重置该记录。请在主机端删除本客户端的配对后重新连接，再按 PIN 配对一次。')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          } else {
+            Text('已信任：' + (this.mismatchTrusted.length > 0
+              ? this.mismatchTrusted : '（未取到）'))
+              .fontSize(13)
+            Text('当前看到：' + (this.mismatchCurrent.length > 0
+              ? this.mismatchCurrent : '（未取到）'))
+              .fontSize(13)
+            Text('指纹变化通常是因为服务器重装或更新了证书，也可能是连接被冒充。请先与服务端核对指纹。')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
           if (this.mismatchError.length > 0) {
             Text('重新确认指纹失败：' + this.mismatchError)
               .fontSize(12)
               .fontColor($r('app.color.danger'))
           }
           Row({ space: 8 }) {
-            Button('重新确认指纹')
-              .fontSize(14)
-              .fontColor(Color.White)
-              .backgroundColor($r('app.color.brand'))
-              .height(40)
-              .borderRadius(12)
-              .onClick(() => { this.resetTrustedFingerprint(); })
+            if (!this.mismatchSunshine) {
+              Button('重新确认指纹')
+                .fontSize(14)
+                .fontColor(Color.White)
+                .backgroundColor($r('app.color.brand'))
+                .height(40)
+                .borderRadius(12)
+                .onClick(() => { this.resetTrustedFingerprint(); })
+            }
             Button('返回连接列表')
               .fontSize(14)
               .height(40)
@@ -5647,7 +5862,12 @@ struct Remote {
           if (!this.canvasShown && !this.failureVisible) {
             Column({ space: 12 }) {
               LoadingProgress().width(36).height(36)
-              Text(this.needsTrust ? '等待身份确认' : '等待首帧…').fontSize(16)
+              // After a PIN was submitted the native side is "connecting" but the
+              // stream is really waiting for the host's web page to confirm it
+              // (up to 5 minutes): say so instead of a misleading 等待首帧….
+              Text(this.pinAwaitingConfirm ? '等待网页端确认 PIN…'
+                : (this.needsPairing ? '等待配对'
+                  : (this.needsTrust ? '等待身份确认' : '等待首帧…'))).fontSize(16)
             }
             .width('100%')
             .height('100%')
