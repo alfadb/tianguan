@@ -383,6 +383,56 @@ GL 模式下远程画面支持双指手势：两指捏合缩放、两指拖动�
 - **已知限制**（首版验收范围定为「画面 + 键鼠」）：剪贴板仅支持 CF_UNICODETEXT 文本，两个方向都已可用（本机 → 远端需首次打开会话时授权 `READ_PASTEBOARD`，见上一条）；GFX 已启用（`rdpgfx` 动态通道，`CHANNEL_RDPGFX=ON` 客户端侧；服务端选 ClearCodec/Progressive/RemoteFX 时由 FreeRDP GDI surface 管线解码并复用现有帧镜像；H.264/AVC 已启用：依赖以 FFmpeg 7.1.5 静态解码（H.264/AAC/ADPCM + swscale/swresample），客户端声明 AVC420/AVC444/AVC444v2 能力，服务端按内容在 ClearCodec 与 AVC420 之间切换，真机全屏视频时实测到 `last codec=11`）；RDP GFX 协议只定义 AVC（AVC420/AVC444 系），没有 H.265/HEVC，因此 H.265 不支持也不可协商；`CHANNEL_VIDEO` 仍为 OFF（GFX 的 AVC 解码由 `WITH_VIDEO_FFMPEG` 提供，不需要 VIDEO 动态通道）；`app/native/rdp_backend.cxx` 里的 `kEnableGfx` 常量可回退到改动前的 GDI-only 行为；音频已实现（`rdpsnd`，客户端侧，见下一条）：PCM 与可解码的压缩格式（AAC 等，取决于 FFmpeg 解码器与 FreeRDP dsp 支持）都可接受；实测 Windows 在有 PCM 可选时仍偏好 PCM，AAC/ADPCM 未被协商到（属服务端偏好）；中文输入由远端 Windows 输入法完成（客户端在输入法之前拦截并按物理按键逐个转发，映射覆盖主键区/功能键/小键盘/浏览器与应用启动键，候选窗与上屏在远程画面里；本机输入法不再截获物理键盘）；不在客户端做 IME 转发，也不支持映射表之外的 Unicode 直接输入（映射不到的键保持本机行为并记日志）；证书固定已实现 TOFU（见上一条），但仍不校验证书链与主机名；证书变化后需先在会话窗口或连接卡片点「重新确认指纹」，核对服务端给出的新指纹后再点「确认并信任」，不存在自动重新信任；驱动/打印机/智能卡/摄像头/多显示器等重定向通道均未启用。
 - **验证状态（2026-10-24）**：已在真机（MateBook Fold SLM-W32，调试签名、`install -r` 覆盖安装）连接 192.168.50.12 与 192.168.50.18。两台均完成 TCP/TLS/NLA 登录、首帧真实桌面、鼠标点击（远端弹出 Windows 开始菜单、通知中心/日历面板）与键盘（Esc 关闭菜单）。设备侧 /proc/<pid>/net/tcp 可见到两台的 3389 连接为 ESTABLISHED。证据在 .work/device-runs/rdp-btnfix-20261024/（12）与 .work/device-runs/rdp18-final-20261024/（18）。延迟实测（2026-10-25）：稳态下「点击 → 画面出现」为亚秒级（.12 0.6–0.9 s，.18 0.9–1.6 s，两台均 < 2 s），此前「.18 持续滞后十几到几十秒」未复现；新连接会先显示 Windows 锁屏：实测首帧即锁屏，约 3 s 后自动解锁，桌面在 +5.2~6.2 s 就绪；桌面就绪后的首次远端点按约 3.5 s 才出通知中心（客户端 0.6 s 内已执行并画出光标，多出的时间在 Windows 侧），随后恢复到 0.11~0.97 s。此前一次 > 7.9 s 的慢首击未能复现。测量方法与逐帧数据见 .work/device-runs/rdp-latency-20261025/ 与 .work/device-runs/rdp-firstinput-20261025/。剪贴板「远端 → 本机」已由用户实测通过；「本机 → 远端」已在 PC 上端到端实测通过（PC 打开 RDP 12 会话、首次弹授权框并允许，在 PC 上复制文本后到远端 Windows 里 Ctrl+V，内容到达）。手机端也已验证：手机没有物理键盘、无法在远端按 Ctrl+V，改由长按画面弹出的远端右键菜单点「粘贴」完成，内容到达远端。中文输入已由用户实测：在 RDP 会话中使用远端 Windows 输入法可正常上屏。GFX 图形管线已启用并在 .12 上实测接管（bitmap/surfbits 计数为 0）。音频已由用户在真机上听验通过（PCM 44.1kHz 立体声，日志速率与 PCM 参数一致）。H.264/AVC 已由用户真机验证：远端 Edge 全屏播放视频后 hilog 出现 `last codec=11`（AVC420），`endframes`/`commits` 持续增长而 `bitmap`/`surfbits` 为 0（播放前为 codec=8 ClearCodec）。压缩音频的解码路径已就绪（去掉 `format:1`、`freerdp_dsp_decode` 解成 PCM），但实测 Windows 在有 PCM 可选时仍选 PCM，AAC/ADPCM 未被协商到。
 
+## Sunshine 接入（2026-11-27）
+
+第三种协议：连接可以保存为 `Sunshine`（`protocol: "sunshine"`），用 Moonlight 协议连 Sunshine 主机；默认端口 `47989`（Sunshine 的明文 HTTP / nvhttp 端口，HTTPS 取 `47984` = 端口 − 5）。远程窗口、帧镜像、EGL 渲染、状态轮询与输入链路都复用 VNC / RDP 那一套，界面不为 Sunshine 另起一套远程页。
+
+### 定位与用户流程
+
+- **卡片与端口**：卡片协议标签为 `Sunshine`，显示 `Sunshine  host:port`；表单协议选「Sunshine」时端口默认 `47989`，切换协议时端口只在为空或仍是另一协议默认值时才跟随切换，手填端口不被覆盖。Sunshine 不用密码：切到该协议会清掉已填密码与「保存密码」勾选，表单隐藏这些字段。
+- **首次连接配对**：会话先进入 `state=pairing-required`（等用户动作，不是失败）。远程窗口显示「需要配对」面板：用户在应用内输入 4 位 PIN，同时在主机的 Sunshine 网页管理页「PIN」页提交**同一个** PIN；配对请求最多等 5 分钟（网页端未在 300 秒内提交即超时）。配对走 `/pair` 五阶段（前四阶段明文 HTTP，`pairchallenge` 走 HTTPS 并带客户端证书），成功后把服务端证书与 SHA-256 指纹固定到 `sunshineStateDir`（默认 `filesDir/sunshine`，文件 `server-<host>-<httpsPort>.pem` / `.sha256`），随后自动继续 `/applist` → `/launch` → `connected`，**不需要重连**。
+- **PIN 失败**：PIN 错误或网页端 5 分钟没提交，会话回到 `pairing-required` 并带 `errorCode=pair-failed`，面板重新可输入（「配对失败：PIN 不正确或已过期，请重试」）；连续两次传输层失败才转成 `state=failed` + `errorCode=network`。
+- **应用名**：表单「应用名（留空为 Desktop）」。原生按 `/applist` 标题做不区分大小写的包含匹配，找不到就用第一个应用；实际启动的标题经状态 JSON 的 `app` 字段回传（可能与填写值不同）。
+- **画质档位**：`SUNSHINE_PRESETS` 是唯一数字来源——流畅 1280×720@60 / 15 Mbps、均衡 1920×1080@60 / 20 Mbps（默认）、高清 2560×1440@60 / 40 Mbps、超清 3840×2160@60 / 80 Mbps；「自定义」可填宽高（1–4096）、帧率（1–480）、码率（1–200 Mbps）与编码（自动 / H.264 / HEVC）。分辨率、帧率、码率、编码都在**重新连接后**生效；码率低于 15 Mbps 时服务端降为普通音质（每声道 96 kbps；高音质为 256 kbps）。
+- **断线与重连**：连接建立后断线进入 `state=reconnecting`（`errorCode=network`），按 1 s / 2 s / 4 s 退避重连，每次重连重新走 `/serverinfo` → `/launch`；手动「重连」换代也会立即拆流重连。
+
+### 原生结构
+
+- **`app/native/sunshine/`**：控制面公共层，`identity`（客户端自签证书、私钥、uniqueid 的生成与落盘）、`xml_util`（够用的极简 XML）、`nv_http`（六个 nvhttp 端点）、`pairing`（`/pair` 五阶段与 TOFU 指纹固定），命名空间 `tg::sunshine`。由 `experiments/sunshine-core/src/common` 迁入，为 API 26 的 C++11 目标做了少量适配（去掉 `<filesystem>` / `std::make_unique`，状态目录改为必填）。
+- **`app/native/sunshine_backend.cxx`**：一次连接尝试的主流程（identity → `/serverinfo` → 配对 → `/applist` → `/launch` → `LiStartConnection` → 等待终止/停止/换代 → `/cancel` → 退避），以及输入翻译（会话的 keysym / 指针队列 → Win32 VK、绝对坐标、按键与滚轮，10 ms 节拍）和启动阶段的看门狗（`stop` 时只调 `LiInterruptConnection()` 打断阻塞握手，`LiStopConnection()` 始终由持流线程调用）。
+- **`app/native/sunshine_video.cxx`**：OHOS AVCodec 硬解（`OH_VideoDecoder` Buffer 模式，`video/avc` / `video/hevc`），输出 NV12/NV21 经 libswscale 转 BGRA，再走与 RDP 相同的 `resizeFrame` / `commitFrame`，复用既有帧镜像、EGL 渲染、缩放与坐标换算。
+- **`app/native/sunshine_audio.cxx`**：libopus 多流解码 → 交织 S16 PCM → 环形缓冲（约 0.5 秒，满时丢最旧）→ `OH_AudioRenderer` 拉模式写回调；约 80 ms 预缓冲，欠载后退回预缓冲，解码失败只计数限频记日志。
+- **依赖与脚本**：`scripts/fetch-moonlight.sh` 按固定提交拉 moonlight-common-c 并校验 enet / nanors 子模块；`scripts/build-sunshine-deps.sh ohos` 用固定 OHOS SDK 交叉编译成 AArch64 静态 PIC 归档，装到 `.work/sunshine-deps/ohos/prefix`。`app/native/CMakeLists.txt` 的 OHOS 目标定义 `TIANGUAN_WITH_SUNSHINE=1` 并静态链接 `libmoonlight-common-c.a` / `libenet.a` / `libopus.a` 与 AVCodec 系统库（`native_media_vdec` / `native_media_core` / `native_media_codecbase` / `native_buffer`）；前缀缺失时编译或链接直接失败，不会静默回退到 VNC 循环。host 目标不编译 Sunshine，`protocol=sunshine` 在 host 上明确失败。
+
+### 协议与会话
+
+- **自写控制面**：六个 nvhttp 端点（`/serverinfo`、`/applist`、`/launch`、`/resume`、`/cancel`、`/unpair`）与 `/pair` 五阶段、证书与指纹固定全部自己实现，moonlight-common-c 不发任何 HTTP。common-c 负责 RTSP 握手、RTP 收流与音视频解包、FEC / 纠错重组（nanors）、控制通道与输入通道；`/launch` 给出的 `sessionUrl0`、`rikey`、`rikeyid` 原样交给它还流。
+- **残留会话接管**：服务端上一条会话没被取消时，`/launch` 会返回 400 `An app is already running on this host`。连接时先看 `/serverinfo`：`state=SUNSHINE_SERVER_BUSY` 且 `currentgame` 等于目标应用 → `/resume` 接管续播；BUSY 但在跑别的应用 → 先 `/cancel`，每 500 ms 轮询 `/serverinfo`、最多等 10 秒，再按服务端当时的状态用 `/resume` 或 `/launch`。`/launch` 仍报 `already running` 时只重试一次同样的「cancel → 等空闲 → 启动」；`/cancel` 自身失败只记日志，不让会话失败。
+- **退出时尽力 cancel**：停止、关窗（含 `closeSession` 打断会话线程）、`reconnectSession` 换代、对端结束或网络断开，只要本次尝试走到过 `/launch`，都会尽力向服务端发 `/cancel`；进程被杀来不及发的情况由下次连接时的残留会话处理兜底。
+- **进程级单例**：moonlight-common-c 的回调没有 context 指针、整库是进程级状态，因此内核同一时刻只允许一路 Sunshine 串流（进程内互斥槽）。第二条 Sunshine 会话最多等 10 秒串流槽，拿不到会报「已有另一个 Sunshine 串流在运行（moonlight-common-c 是进程级单例）」并按网络类错误退避重试。
+- **加密与音频能力位**：默认声明 `ENCFLG_ALL`（音视频都加密），`sunshineEncryption="none"` 关成 `ENCFLG_NONE`；控制/输入通道由 common-c 自行加密（仅在服务端 appversion ≥ 7.1.431 时启用，当前 Sunshine 即满足），不受该开关影响。音频能力位声明 `CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION`，不声明 `CAPABILITY_SLOW_OPUS_DECODER`（避免服务端按「解码器很慢」降级音质）。
+
+### ArkTS 侧
+
+- **协议类型与默认端口**：`ConnectionCodec.ets` 的协议类型加 `'sunshine'`，`DEFAULT_SUNSHINE_PORT = '47989'`，`defaultPortFor('sunshine')` 返回它；连接记录新增 `sunshineApp`、`sunshinePreset`、`sunshineWidth/Height/Fps/Bitrate`（Mbps，连接前 ×1000 转原生 kbps）与 `sunshineCodec`，旧记录加载后归一为均衡档。
+- **表单**：应用名输入框、「画质」档位按钮（来自 `SUNSHINE_PRESETS`）、自定义宽高/帧率/码率、编码按钮（自动 / H.264 / HEVC），以及「分辨率、帧率与码率在重新连接后生效」「码率低于 15 Mbps 时音频会降为普通音质」两条提示。`connect()` 只在非空时传 `sunshineApp`；编码「自动」不传 `sunshineFormats`，H.264 传 `"h264"`，HEVC 传 `"h264,hevc"`（服务端优先 HEVC，不可用时回落 H.264）。
+- **状态目录与信任**：`sunshineStateDir()` = `context.filesDir + '/sunshine'`；Sunshine 不读写 `vnc-pins.json`，也不传 `expectedFingerprint` / `security`，证书由原生在配对时固定。
+- **PIN 面板**：`state=pairing-required` 时窗口显示「需要配对：<host>」、服务端版本、说明文案与 4 位数字输入框；点「提交」调用 `submitPin`，成功后输入与按钮禁用、按钮文案变「等待网页端确认…」，离开该状态后面板自动收起；提交后若仍停在连接中，提示文案为「等待网页端确认 PIN…」而不是「等待首帧…」。`pair-failed` 时重新启用输入并显示重试原因。
+- **卡片与失败原因**：卡片协议标签 `Sunshine`；`pairing-required` 显示「需要配对」（warning 色，不算失败）；`pair-failed` 的短原因「配对失败」、长原因「配对失败：PIN 不正确或已过期，请重试」。
+- **单测覆盖点**（`app/tests/arkts/connection_codec.test.mjs`）：只有精确的 `'sunshine'` 才归一为该协议（大小写变体仍为 VNC）、`sunshineApp` 只对 Sunshine 生效、Sunshine 记录序列化往返、四档数字与缺省档位回退、`sunshineFormatsFor` 映射、`defaultPortFor`（RDP 3389 / Sunshine 47989 / VNC 5901），以及 Sunshine 与 VNC/RDP 在同一 `host:port` 上不共用 pin / 密码别名。
+
+### 验证边界（2026-11-27，鸿蒙 PC SLM-W32 + Windows 主机 Sunshine）
+
+- **已验证**：配对一次成功；默认均衡档协商到 HEVC 1920×1080@60，首帧约 2 秒；H.264 与 HEVC 均出画；键盘可解锁 Windows 锁屏、鼠标可用（用户实测）；音频可听，20 Mbps 时为高音质档（约 200 包/秒、每声道 256 kbps）；强杀应用后重连自动接管残留会话（约 4 秒出画）；档位切换生效；VNC 卡片回归正常。
+- **未实现**：剪贴板（Moonlight 协议没有剪贴板通道，common-c 也没有对应收发接口）、手柄、相对鼠标、UTF-8 文本直接输入（common-c 有 `LiSendUtf8TextEvent`，未接）、AV1、HDR / 10-bit（P010 被显式跳过）、应用列表选择（只能按标题匹配，表单不列出 `/applist`）。
+- **未验证**：手机 / 平板、长稳、多会话（进程级单例本身限制同时只有一路）、断线重连、5.1 / 7.1 声道。
+
+### 已知限制与排查提示
+
+- **主机重装后配对失效**：服务端证书变了会让会话停在 `state=failed` + `errorCode=fingerprint-mismatch`，界面没有应用内重置入口。处理办法是删除应用沙箱 `files/sunshine/` 下该主机的 `server-<host>-<httpsPort>.pem` 与 `.sha256`（`httpsPort` 通常是 47984），再重新走一次配对；`identity.crt` / `identity.key` / `uniqueid` 是客户端身份，不要删。
+- **「控制通道通、视频/音频不通」**：先看服务端日志与端口占用。若主机是 Windows 虚拟机，先排除 VirtIO 网卡与 USO 的老问题（批量 UDP 被合并成 0 长度头的大帧后丢弃，控制通道的小包不受影响），详见 [`experiments/sunshine-core/README.md`](../experiments/sunshine-core/README.md) 的「已知环境陷阱」。
+- **其他**：只有一路 Sunshine 串流；PIN 只进内存、不进日志与状态 JSON；`forgetTrustedFingerprint` 只作用于 VNC/RDP，对 Sunshine 无效；`/pair` 只支持 Gen 7+ 的 SHA-256 流程。
+
 ## 系统托盘（2026-10-21）
 
 - 仅 `2in1`（PC）启用：先按 `deviceInfo.deviceType === '2in1'`、`canIUse('SystemCapability.PCService.StatusBarManager')` 和平台 capability 探测三重判断，再动态加载 `@kit.DeskTopExtensionKit` 的 `statusBarManager`（`@hms.pcService.statusBarManager`，无权限要求）。手机/平板或缺少该能力的系统静默降级，只记一条日志，不加载该 kit。

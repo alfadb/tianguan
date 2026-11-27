@@ -46,6 +46,10 @@
 | OpenSSL | 3.5.9 | Apache-2.0 | FreeRDP 使用的 TLS 与加密实现；静态链接进 `libtianguan_diag.so` |
 | FFmpeg | 7.1.5 | LGPL-2.1-or-later | H.264 / AAC / ADPCM 解码与缩放、重采样；以静态链接方式编译进 `libtianguan_diag.so` |
 | zlib | 1.3.2 | Zlib | 压缩实现，供 FreeRDP 与 OpenSSL 使用；静态链接进 `libtianguan_diag.so` |
+| moonlight-common-c | 固定提交 `b4ee1cea` | GPL-3.0 | Moonlight / Sunshine 串流实现（RTSP、RTP 收流与音视频解包、FEC 纠错、控制与输入通道）；以静态链接方式编译进 `libtianguan_diag.so` |
+| enet | 固定提交 `98dbb897`（cgutman/enet fork） | MIT | moonlight-common-c 使用的可靠 UDP 传输；以静态链接方式编译进 `libtianguan_diag.so` |
+| nanors | 固定提交 `a9b1636f` | MIT | moonlight-common-c 使用的 Reed-Solomon FEC 纠错；编译进 moonlight-common-c 静态库后一并链入 `libtianguan_diag.so` |
+| libopus | 1.6.1 | BSD-3-Clause | Sunshine / Moonlight 的 Opus 多流音频解码；以静态链接方式编译进 `libtianguan_diag.so` |
 
 TigerVNC 中少量第三方条款文件的核对情况，以及其他组件的许可边界，见仓库 `docs/licensing.md`。
 

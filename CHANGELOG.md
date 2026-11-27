@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的风格，版本号采用[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 未发布
+
+新增第三种协议 Sunshine（Moonlight 客户端，服务端为 Sunshine），并补上获取上游的脚本与 host 侧实验目录。
+
+### 新增
+
+- Sunshine/Moonlight 协议：首次连接用 4 位 PIN 配对，配对后固定服务端证书指纹，变化即拒绝；连接表单提供流畅 / 均衡 / 高清 / 超清四档画质与自定义（宽、高、帧率、码率、H.264/HEVC）；视频经系统 AVCodec 硬解 H.264/HEVC（8-bit）后与 VNC/RDP 共用 EGL/GLES 渲染路径；音频为 Opus（libopus → OH_AudioRenderer）；键鼠按绝对鼠标与物理按键转发；强杀应用后重连可自动接管服务端残留会话。
+- 新增 `experiments/sunshine-core/`：host 侧配对、取会话参数与拉流的复现实验。
+
+### 构建
+
+- 新增 `scripts/fetch-moonlight.sh` 与 `scripts/build-sunshine-deps.sh ohos`：按固定提交获取 moonlight-common-c（含 enet、nanors 子模块）与 libopus v1.6.1，交叉编译到 `.work/sunshine-deps/ohos/prefix`。
+
+### 文档
+
+- README 增补 Sunshine 的功能、设计取舍、已验证 / 未实现 / 未验证、边界与许可说明；`docs/napi-contract.md` 增加 Sunshine 会话参数、配对与状态字段。
+- README 的许可章节补充 moonlight-common-c（GPL-3.0，含 MIT 的 enet、nanors）与 libopus（BSD-3）。已验证范围见 README。
+
 ## [1.1.0] - 2026-11-27
 
 会话窗口支持全屏与悬浮操作栏，分辨率可跟随窗口、也可由客户端请求远端调整；补齐键盘映射与指纹校验、连接信任方面的若干修复。
