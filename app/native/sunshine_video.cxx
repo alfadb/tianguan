@@ -702,6 +702,11 @@ class AvCodecVideoSink : public SunshineVideoSink {
     // commit 前强制 alpha 的做法一致，不依赖 sws 的行为）。
     for (size_t i = 3; i < bgra_.size(); i += 4) bgra_[i] = 255;
 
+    // 画面全黑检测：稀疏采样这一帧，把「黑 / 非黑」连同帧时刻交给后端；连续
+    // 全黑时长和 3 秒阈值由状态读取方换算（见 sunshine_backend.h）。采样只做
+    // 整数加法、不逐像素遍历：1080p 每帧约 68*120 = 8160 个点。
+    sunshineNoteVideoLuma(monotonicMillis(), frameIsBlack());
+
     // 帧提交：只有本回调线程会走到这里，所以同一时刻只有一个提交者。sink 与
     // generation 在锁内取快照，宿主自己还会核对 generation。
     SunshineFrameSink sink;
@@ -757,6 +762,27 @@ class AvCodecVideoSink : public SunshineVideoSink {
           "sunshine video: frames=%llu (idr %llu), %dx%d, errors=%llu, dropped=%llu",
           frames, idrFrames, frameWidth_, frameHeight_, decodeErrors, dropped));
     }
+  }
+
+  // 稀疏亮度采样（只读 bgra_，只在输出回调线程里调用）：每 16 行取一行、每
+  // 16 像素取一个点，取 R/G/B 平均并忽略 alpha。平均亮度 < 4 判为黑帧；整数
+  // 比较 sum < 4*3*count 等价且免去除法。4K 每帧也只有约 2.7 万个采样点。
+  bool frameIsBlack() const {
+    const int width = frameWidth_;
+    const int height = frameHeight_;
+    if (width <= 0 || height <= 0) return true;
+    const size_t stride = static_cast<size_t>(width) * 4;
+    unsigned long long sum = 0;
+    size_t count = 0;
+    for (int y = 0; y < height; y += 16) {
+      const uint8_t* row = bgra_.data() + static_cast<size_t>(y) * stride;
+      for (int x = 0; x < width; x += 16) {
+        const uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+        sum += static_cast<unsigned long long>(pixel[0]) + pixel[1] + pixel[2];
+        ++count;
+      }
+    }
+    return count == 0 || sum < 12ULL * count;
   }
 
   // 建/复用 sws 上下文与 BGRA 输出缓冲（只在输出回调线程里调用）。

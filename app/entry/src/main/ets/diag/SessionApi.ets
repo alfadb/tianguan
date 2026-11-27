@@ -106,6 +106,15 @@ export interface SessionStatus {
    * the server's web page (state="pairing-required").
    */
   pairing?: PairingInfo;
+  /**
+   * Sunshine only: present only while state="connected". True when the decoded
+   * picture has been continuously black (or no frame arrived yet) for at least
+   * 3 s; it drops back to false as soon as a non-black frame is decoded. The
+   * usual cause is that the Windows host has no active console session (an RDP
+   * session moved it to a disconnected virtual desktop), so the remote desktop
+   * renders black. VNC/RDP never set it.
+   */
+  pictureBlack?: boolean;
   /** Sunshine only: the /applist title that was actually launched. */
   app?: string;
 }

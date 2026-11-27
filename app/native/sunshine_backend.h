@@ -8,6 +8,14 @@
 // 帧提交和输入出队都通过下面的 SunshineHost 回调完成。宿主的适配层负责和 VNC/RDP
 // 完全相同的 stop / generation 语义、phase / errorCode 体系和 BGRA 帧镜像。
 //
+// 「主机结束串流」类的终止错误码是 0（ML_ERROR_GRACEFUL_TERMINATION，
+// Limelight.h:421）与 -1（控制流被对端断开且没有 termination 消息，
+// ControlStream.c:1600 / 1369；Sunshine 的 /cancel 与主机端应用退出都走这条）。
+// 判定按「终止前正常画面的持续时长」= 最近非黑帧 - 首个非黑帧：< 3000 ms（含
+// 从未有画面）视为主机显示会话状态变化（控制台会话被接回、被远程桌面占用等）
+// 造成的瞬时黑屏，自动重连最多 3 次（2/4/8s 退避）；>= 3000 ms 说明用户已正常
+// 观看，按主机主动结束处理，不自动重连。
+//
 // 线程模型（详见 sunshine_backend.cxx 顶部注释）：
 //   * 会话线程：本文件 runSunshineSession()，负责 HTTP 控制面、common-c 的
 //     启动/停止，以及连接建立后的等待循环；
@@ -49,6 +57,28 @@ struct SunshineOptions {
   std::string formats;       // "h264,hevc"；空 = 按设备硬解能力自动
   bool encryption = true;    // false -> ENCFLG_NONE（sunshineEncryption=none）
 };
+
+// 画面全黑检测（Sunshine 专用，进程级单例，与 common-c 的回调状态同一生命周期）。
+//
+// 视频 sink 在 AVCodec 输出回调线程里对每一帧做稀疏亮度采样（每 16 行取一行、
+// 每 16 像素取一个点，取 R/G/B 平均并忽略 alpha；平均亮度 < 4 判为黑帧），然后
+// 只调用 sunshineNoteVideoLuma() 上报该帧的单调时钟毫秒时刻与黑/非黑判定；连续
+// 全黑时长由状态读取方在读取时换算，解码线程上不做时间差、不加锁。
+//   blackMs        当前连续全黑（或本次尝试迟迟没有帧）的毫秒数，出现非黑帧即清零；
+//   lastFrameAgeMs 距最近一帧解码完成的毫秒数；本次尝试还没有帧时等于自视频
+//                  setup 以来的毫秒数。
+// 这些量只用于诊断/界面提示，不改变视频路径本身。
+struct SunshinePictureStatus {
+  SunshinePictureStatus() : blackMs(0), lastFrameAgeMs(0) {}
+  unsigned long long blackMs;
+  unsigned long long lastFrameAgeMs;
+};
+
+// 视频解码回调线程每解码出一帧调用一次。frameTimeMs 是单调时钟毫秒，black 是
+// 该帧的亮度判定（见上）。只写两个原子时间戳，可在任意线程调用。
+void sunshineNoteVideoLuma(unsigned long long frameTimeMs, bool black);
+// 状态读取（任意线程）：返回当前尝试的画面状态；没有活动串流时两个量都是 0。
+SunshinePictureStatus sunshinePictureStatus();
 
 // 一帧解码结果的矩形（BGRA_8888，stride = w * 4）。和 RdpRect 同义，只是命名空间
 // 上属于 Sunshine；视频解码实现通过 SunshineFrameSink 交给宿主。

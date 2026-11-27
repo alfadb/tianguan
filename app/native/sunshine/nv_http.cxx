@@ -881,6 +881,21 @@ ServerInfoProbe NvHttpClient::get_server_info() {
     return probe;
 }
 
+ServerInfo NvHttpClient::get_server_info_https() {
+    // 重连只做一次 HTTPS 请求：客户端证书与端口在首次连接时已经确定，再走一遍
+    // 明文探测只会多一次 TCP 往返（真机上重连时这一段耗时 10 s 以上）。
+    if (impl_->options.https_port == 0) {
+        throw NvError("HTTPS 端口未知（需要先做一次完整 /serverinfo 探测）", 0, -1, "", "");
+    }
+    RawResponse response =
+        impl_->request("GET", true, impl_->options.https_port, "/serverinfo",
+                       impl_->common_query(), "", "");
+    check_nv_status(response);
+    ServerInfo info = parse_server_info(response.body);
+    impl_->discovered_https_port = impl_->options.https_port;
+    return info;
+}
+
 std::vector<AppInfo> NvHttpClient::get_app_list() {
     ensure_https_port();
     RawResponse response =

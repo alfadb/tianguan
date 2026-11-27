@@ -3729,6 +3729,17 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   // Additive, Sunshine only: the /applist title that was actually launched
   // (the requested title may match a different app, or none at all).
   if (!appTitle.empty()) out += ",\"app\":\"" + jsonEscape(appTitle) + "\"";
+  // Additive, Sunshine only and only while connected: the picture has been
+  // continuously black (or no frame arrived yet) for at least 3 s. Both numbers
+  // come from the video decode callback thread as two atomic timestamps, so this
+  // read neither locks nor waits. VNC/RDP never emit the field.
+#if defined(TIANGUAN_WITH_SUNSHINE)
+  if (state->protocol == "sunshine" && phase == PhaseConnected) {
+    const tianguan::SunshinePictureStatus picture = tianguan::sunshinePictureStatus();
+    out += (picture.blackMs >= 3000 ? ",\"pictureBlack\":true"
+                                   : ",\"pictureBlack\":false");
+  }
+#endif
   out += "}";
   return out;
 }

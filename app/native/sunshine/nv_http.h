@@ -167,6 +167,12 @@ public:
     // 明文 HTTP /serverinfo 取 HttpsPort，再用 TLS + 客户端证书取一次。
     ServerInfoProbe get_server_info();
 
+    // 重连快路径：跳过明文探测，直接用已知的 HTTPS 端口发一次 /serverinfo
+    // （TLS + 客户端证书，走同一套证书指纹校验）。端口未知或请求失败时抛
+    // NvError，调用方退回 get_server_info() 的完整探测。成功时把端口记进
+    // discovered_https_port，供后续 /applist、/launch、/cancel 复用。
+    ServerInfo get_server_info_https();
+
     std::vector<AppInfo> get_app_list();
 
     SessionLaunch launch(const LaunchOptions& options);

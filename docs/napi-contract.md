@@ -54,6 +54,9 @@
 - `sunshineEncryption` 缺省为 `ENCFLG_ALL`（音视频都加密）；传 `"none"` 时关成 `ENCFLG_NONE`（远端输入加密始终开启，无法关闭）。
 - **残留会话**：服务端上一条会话没被取消时，`/launch` 会返回 `status_code=400: An app is already running on this host`（旧版本直接把这条当成「连接已断开」）。现在按 Moonlight 客户端的通行做法处理：`/serverinfo` 的 `state=SUNSHINE_SERVER_BUSY` 且 `currentgame` 等于要启动的应用 ID → 用 `/resume` 接管续播（参数与 `/launch` 相同，服务端上的应用继续跑）；BUSY 但是别的应用 → 先 `/cancel`，每 500ms 轮询 `/serverinfo`、最多 10 秒等服务端回到空闲，再按服务端当时的状态用 `/resume`（仍指向同一应用）或 `/launch`。`/launch` 仍返回 400 且消息含 `already running` 时，再执行一次同样的「cancel → 等空闲 → launch/resume」，只重试一次；`/cancel` 自身失败只记日志，不让会话失败。
 - 停止/关窗（含 `closeSession` 打断会话线程）、`reconnectSession` 换代、对端结束或网络断开，只要本次尝试走到过 `/launch`，都会尽力向服务端发 `/cancel`；进程被杀来不及发的情况由上面的连接时处理兜底。
+- **主机结束串流时的重连规则**：`connectionTerminated(0)` 是 `ML_ERROR_GRACEFUL_TERMINATION`（`Limelight.h:421`，主机主动结束）；`connectionTerminated(-1)` 是控制流被对端断开且没有 termination 消息（`ControlStream.c:1600` 的 `ENET_EVENT_TYPE_DISCONNECT`，另有 `ControlStream.c:1369` 的断开握手超时），Sunshine 的 `/cancel` 与主机端应用退出都走这条，协议层无法与真正的网络中断区分。两者都按「终止前正常画面的持续时长」（首个非黑帧到最近非黑帧的跨度）判定：**< 3000 ms（含从未有画面）** → 视为主机显示会话状态变化（控制台会话被接回、被远程桌面占用等）造成的瞬时黑屏，会话进入 `state=reconnecting`，按 2s/4s/8s 退避自动重连，每次重新走 `/serverinfo` →（必要时 `/resume`，或 `/cancel`→等空闲）→`/launch`；**最多自动重连 3 次**，仍失败则 `state=failed`、`errorCode="network"`，`error` 固定为「主机多次结束串流且始终无画面：请确认主机控制台已登录（未被远程桌面占用）后重试」，由用户手动重连。**≥ 3000 ms** → 用户已正常观看，按主机主动结束处理：不自动重连，停在 `state=disconnected`（`error`「主机结束了串流」），保留会话供用户手动重连。其它错误码（网络中断、无视频流量等）的重连策略不变（`reconnecting` + 1s/2s/4s 退避）。代价：若纯网络中断先以 -1 到达、且此前已正常观看 ≥3 秒，会停在下线状态而不是自动重连，需用户手动重连。
+- **重连快路径**（减少「终止到首帧」的等待）：主机结束类终止（0/-1）**立即**进入 `state=reconnecting`（在任何 HTTP 之前，UI 1 秒内就能显示「正在重新连接…」），并且不再向服务端发 `/cancel`（真机上这里白等过一次 10.5 s 超时）。重连期间复用首次连接学到的 HTTPS 端口与已固定的证书，**只走 HTTPS `/serverinfo` 快路径**：单次 5 s 超时，失败 1 s 退避重试，最多持续 60 s；只有拿到确定答案（成功，或 401/403 证书不再被接受而转去配对，或用户停止）才离开，超时类失败**不退回**明文+HTTPS 的长探测（首次连接路径不变，仍 10 s）。本会话首次 `/applist` 匹配到的应用 ID 会被缓存，重连不再拉 `/applist`（仅当 `/launch` 用缓存 ID 报 404 时重拉一次并重试）。RTSP 握手阶段失败（主机尚未就绪）保持 1 s 退避重试，但计入上面 60 s 的总预算，W 级日志打印「主机尚未就绪，第 n 次重试」；预算耗尽则 `failed/network` + 原有提示。每次 phase 变化都会打一条带墙钟时间的 W 级日志；`/launch` 后 5 s 还没有首帧也会打一行 W 级日志说明当前阶段（RTSP/控制流/视频）。
+- Sunshine 的生命周期与重连日志（serverinfo、配对阶段、launch/resume/cancel、终止及错误码、自动重连 n/3、放弃原因）与每 5 秒一条的媒体统计都用 **W 级**输出（hilog 默认可见）；更细的诊断仍是 D 级。
 - 音频能力位声明 `CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION`：音频实现按 `samplesPerFrame` 解码、支持任意 Opus 帧长；刻意不声明 `CAPABILITY_SLOW_OPUS_DECODER`（服务端会按「解码器很慢」降级帧长/音质，本实现是实时解码，不需要降级）。
 
 
@@ -69,6 +72,7 @@
   "clipboard": { "version": 7 },
   "retryInMs": 4000, "fingerprint": "84-64-…", "pixelBytes": 9216000,
   "resizeSupport": "unknown",
+  "pictureBlack": false,
   "pairing": { "host": "192.168.50.62", "appVersion": "7.1.431.-1" },
   "app": "Desktop" }
 ```
@@ -81,6 +85,7 @@
 - `errorCode` 是枚举；`error` 只用于辅助显示。指纹不一致时 `error` 统一为「服务端指纹与已信任值不一致，已拒绝连接」。
 - `errorCode=session-taken-over` 只出现在 RDP：同一 Windows 账号已有另一个远程会话，服务端用 `ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION` 结束了本连接（连接阶段或已连接之后都可能发生）。会话为 `state=failed`，且原生后端**不会自动重连**——自动重连会反过来顶掉另一个窗口，形成两个会话互相接管、最终远端会话不可用的循环。`error` 固定为「该账号的远程会话已被其它连接接管：同一 Windows 账号只允许一个远程会话」，界面提示后由用户手动调用 `reconnectSession`。
 - `resizeSupport` 按会话独立维护，重连后复位为 `"unknown"`：`"ok"` 表示服务端已按客户端请求确认/应用过至少一次（VNC：收到 `reasonClient` 的成功答复；RDP：收到与在途请求对应的 `DesktopResize`）；`"rejected"` 只可能来自 VNC（服务端明确拒绝）。RDP 协议没有拒绝应答，请求被忽略时保持 `"unknown"`，界面必须自行超时并停用该会话的自动跟随。
+- `pictureBlack`（Sunshine 专用，仅 `state=connected` 时出现）：布尔。视频解码路径在解码回调线程里对每一帧做稀疏亮度采样（每 16 行取一行、每 16 像素取一个点，取 R/G/B 平均并忽略 alpha），平均亮度 < 4 视为黑帧；连续全黑或本次尝试迟迟没有帧达到 3000 ms 时为 `true`，出现任一非黑帧后立即变为 `false`。常见原因是主机控制台上没有可用的登录会话（例如正被另一个远程桌面会话占用，Windows 把控制台会话搬走），界面可据此提示用户去主机上断开远程桌面或重新登录控制台。VNC/RDP 不产生该字段；未连接时不出现（读取方应按 `false` 处理）。
 
 ### 重新确认服务端指纹
 

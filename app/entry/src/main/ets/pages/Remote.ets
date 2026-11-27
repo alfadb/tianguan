@@ -656,6 +656,25 @@ struct Remote {
   // canvasShown.
   @State private failureVisible: boolean = false;
   @State private failureDetail: string = '';
+  /**
+   * Sunshine only: the native backend reconnects by itself after a dropped
+   * stream (1s/2s/4s backoff), and the window keeps the last frame meanwhile.
+   * A small centred note explains the frozen picture. VNC/RDP keep their
+   * existing behaviour and never set this (they also never enter this state on
+   * their own except after an explicit reconnect).
+   */
+  @State private reconnectingHintVisible: boolean = false;
+  /**
+   * Sunshine only: native status.pictureBlack is true while the decoded picture
+   * has been continuously black (or no frame arrived) for >= 3 s, which usually
+   * means the Windows host has no logged-in console session (an RDP session
+   * moved it away). The bar is an overlay, so it never changes the picture
+   * layout and cannot trigger the remote resize follow. Dismissing it hides it
+   * for the rest of this session window ("知道了"); a later pictureBlack=false
+   * hides it automatically. VNC/RDP never set the field, so nothing shows.
+   */
+  @State private pictureBlackHintVisible: boolean = false;
+  private pictureBlackHintDismissed: boolean = false;
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private canvasReady: boolean = false;
@@ -3378,6 +3397,15 @@ struct Remote {
     }
   }
 
+  /** 「知道了」: hide the Sunshine black-picture bar for the rest of this
+   * session window (the same session never pops it again, even if the picture
+   * goes black again after a reconnect). The next poll keeps it hidden because
+   * applyStatus() checks pictureBlackHintDismissed. */
+  private dismissPictureBlackHint(): void {
+    this.pictureBlackHintDismissed = true;
+    this.pictureBlackHintVisible = false;
+  }
+
   private applyStatus(status: SessionStatus): void {
     const width = status.width === undefined ? 0 : status.width;
     const height = status.height === undefined ? 0 : status.height;
@@ -3431,6 +3459,9 @@ struct Remote {
     // the server side may never have seen the key/button releases.
     if (this.lastState === SESSION_STATE_CONNECTED && status.state !== SESSION_STATE_CONNECTED) {
       this.releaseAllInputs('state-left-connected');
+      // The black-picture hint belongs to a connected picture; leaving the
+      // state (reconnect / failure / disconnect) hides it immediately.
+      this.pictureBlackHintVisible = false;
     }
     this.lastState = status.state;
     // Clipboard edge: one take per version bump.
@@ -3558,11 +3589,19 @@ struct Remote {
     // Every state except a terminal failure leaves the overlay hidden; the
     // failed branch below re-opens it (fingerprint-mismatch keeps its own panel).
     this.failureVisible = false;
+    // The reconnect note only lives while the state is reconnecting; the
+    // reconnecting case below re-enables it for Sunshine.
+    this.reconnectingHintVisible = false;
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
         // The stream is up: a PIN submitted earlier is confirmed and the
         // "waiting for the web page" phase is over.
         this.pinAwaitingConfirm = false;
+        // Native only emits pictureBlack for protocol=sunshine (and only while
+        // connected), so `=== true` keeps VNC/RDP and older native libraries at
+        // "hidden". A dismissal wins over a later true; a false value hides it.
+        this.pictureBlackHintVisible =
+          !this.pictureBlackHintDismissed && status.pictureBlack === true;
         this.statusText = '已连接（实时刷新）';
         if (!USE_GL_RENDER) {
           // GL mode: the native render thread consumes frames itself; the
@@ -3572,6 +3611,10 @@ struct Remote {
         return;
       case 'reconnecting': {
         const retry = status.retryInMs === undefined ? 0 : status.retryInMs;
+        // Sunshine reconnects on its own and keeps the last frame on screen, so
+        // without a note the window looks frozen. VNC/RDP keep their existing
+        // behaviour (text in the status string only, nothing on the picture).
+        this.reconnectingHintVisible = this.sessionProtocol() === 'sunshine';
         this.statusText = '连接中断，正在重连（' + Math.max(1, Math.ceil(retry / 1000)) + 's）';
         return;
       }
@@ -3587,6 +3630,14 @@ struct Remote {
       }
       case 'disconnected':
         this.pinAwaitingConfirm = false;
+        // Sunshine can end the stream with a reason ("主机结束了串流") and then
+        // the window would keep the last frame silently. Reuse the failed
+        // panel (same 重新连接 / 返回连接列表 actions) when there is an error
+        // text; VNC/RDP keep their silent 已断开 behaviour.
+        if (this.sessionProtocol() === 'sunshine' && status.error.length > 0) {
+          this.failureDetail = status.error;
+          this.failureVisible = true;
+        }
         this.statusText = '已断开';
         return;
       case 'connecting':
@@ -5859,7 +5910,9 @@ struct Remote {
           // Secondary UI only: the Canvas stays mounted underneath while the
           // first frame is on its way. A failed session is not "waiting" any
           // more: the interactive failure overlay below replaces this hint.
-          if (!this.canvasShown && !this.failureVisible) {
+          // reconnectingHintVisible suppresses the generic hint for Sunshine
+          // (the centred reconnect note below says the same thing, once).
+          if (!this.canvasShown && !this.failureVisible && !this.reconnectingHintVisible) {
             Column({ space: 12 }) {
               LoadingProgress().width(36).height(36)
               // After a PIN was submitted the native side is "connecting" but the
@@ -5873,6 +5926,56 @@ struct Remote {
             .height('100%')
             .justifyContent(FlexAlign.Center)
             .hitTestBehavior(HitTestMode.None)
+          }
+          // Sunshine only: the picture has been continuously black for >= 3 s,
+          // usually because the host console has no logged-in session (an RDP
+          // session moved it away). A top overlay, so the picture layout (and
+          // therefore the remote resize follow) is untouched and the floating
+          // bubble / radial menu at the bottom-right stays clear. It swallows
+          // its own clicks so a tap cannot reach the remote picture; 知道了
+          // dismisses it for this session window and pictureBlack=false hides it.
+          if (this.pictureBlackHintVisible) {
+            Row({ space: 12 }) {
+              Text('画面持续全黑：主机的控制台上可能没有登录会话（例如正被远程桌面占用）。' +
+                '请在主机上断开远程桌面或重新登录到控制台后重试。')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .layoutWeight(1)
+              Button('知道了')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .backgroundColor('#33FFFFFF')
+                .height(32)
+                .borderRadius(8)
+                .focusable(false)
+                .onClick(() => { this.dismissPictureBlackHint(); })
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .backgroundColor('#E6202124')
+            .position({ x: 0, y: 0 })
+            .focusable(false)
+            .onClick(() => {})
+          }
+          // Sunshine only: a dropped stream is being re-established in the
+          // background while the last frame stays on screen. A centred, small,
+          // hit-test-transparent note (spinner + text) explains the frozen
+          // picture; applyStatus turns it off as soon as the state changes.
+          if (this.reconnectingHintVisible) {
+            Column() {
+              Row({ space: 8 }) {
+                LoadingProgress().width(22).height(22).color(Color.White)
+                Text('正在重新连接…').fontSize(14).fontColor(Color.White)
+              }
+              .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+              .backgroundColor('#B3202124')
+              .borderRadius(12)
+            }
+            .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+            .hitTestBehavior(HitTestMode.None)
+            .focusable(false)
           }
           // Terminal failure overlay: works both before the first frame and over
           // the last rendered frame (a taken-over session never gets a new

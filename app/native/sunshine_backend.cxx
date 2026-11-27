@@ -101,6 +101,62 @@ void wipeString(std::string& value) {
   value.clear();
 }
 
+// 单调时钟毫秒：只用于计算「多久没有非黑帧 / 多久没有帧」这类时长，不受系统
+// 时间调整影响。与 VNC/RDP 的时长统计同一口径。
+unsigned long long monotonicMillis() {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+// 墙钟时间（真机日志对照用）：HH:MM:SS.mmm。
+std::string wallClockText() {
+  struct timespec now;
+  ::clock_gettime(CLOCK_REALTIME, &now);
+  struct tm local;
+  ::localtime_r(&now.tv_sec, &local);
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d.%03d", local.tm_hour,
+                local.tm_min, local.tm_sec,
+                static_cast<int>(now.tv_nsec / 1000000));
+  return std::string(buffer);
+}
+
+const char* phaseLabel(int phase) {
+  switch (phase) {
+    case SunshinePhaseConnecting: return "connecting";
+    case SunshinePhaseConnected: return "connected";
+    case SunshinePhaseDisconnected: return "disconnected";
+    case SunshinePhaseFailed: return "failed";
+    case SunshinePhaseTrustRequired: return "trust-required";
+    case SunshinePhaseReconnecting: return "reconnecting";
+    case SunshinePhasePairingRequired: return "pairing-required";
+    default: return "(none)";
+  }
+}
+
+// 上一次上报的阶段，只用于「每次 phase 变化都打一条 W 级日志」。
+std::atomic<int> g_lastPhase(-1);
+
+void logPhaseTransition(int phase, const std::string& error, const char* errorCode,
+                        int retryInMs) {
+  const int previous = g_lastPhase.exchange(phase);
+  if (previous == phase) return;
+  logWarn(formatText("sunshine phase %s -> %s at %s (retryInMs=%d, errorCode=%s)%s%s",
+                     phaseLabel(previous), phaseLabel(phase),
+                     wallClockText().c_str(), retryInMs,
+                     errorCode != nullptr ? errorCode : "none",
+                     error.empty() ? "" : ", error: ", error.c_str()));
+}
+
+// 所有阶段上报都走这里：先 W 级记一条带时间的转换日志，再写宿主状态。
+// （真机上 D 级不可见，没有这条日志就无法把 UI 显示时间和终止/重连时刻对上。）
+void setHostPhase(const SunshineHost& host, int phase, const std::string& error,
+                  const char* errorCode, int retryInMs) {
+  logPhaseTransition(phase, error, errorCode, retryInMs);
+  host.setPhase(host.user, phase, error.c_str(), errorCode, retryInMs);
+}
+
 // 服务端消息可能带换行；状态 JSON 的 error 必须是单行（与 VNC/RDP 路径一致）。
 std::string sanitizeLine(const std::string& text) {
   std::string out;
@@ -421,7 +477,10 @@ struct MediaContext {
   MediaContext()
       : host(nullptr), generation(0), video(nullptr), audio(nullptr),
         active(false), started(false), terminated(false), terminationCode(0),
-        failedStage(0), failedStageError(0) {}
+        failedStage(0), failedStageError(0), pictureFrameMs(0),
+        pictureBlackStartMs(0), pictureFirstNonBlackMs(0),
+        pictureLastNonBlackMs(0), terminationPictureMs(0), currentStage(0),
+        firstFrameTimeoutLogged(false) {}
 
   const SunshineHost* host;
   int generation;
@@ -435,6 +494,25 @@ struct MediaContext {
   std::atomic<int> terminationCode;
   std::atomic<int> failedStage;
   std::atomic<int> failedStageError;
+  // 画面全黑检测（见 sunshine_backend.h）：视频解码回调线程只写这两个时间戳，
+  // 状态轮询线程读取后换算成 blackMs / lastFrameAgeMs，采样路径不加锁。
+  //   pictureFrameMs        最近一帧解码完成时刻（0 = 本次尝试还没有帧）；
+  //   pictureBlackStartMs   本次尝试 video setup 的时刻：从未出现非黑帧时
+  //                         「连续全黑/无帧」从这里起算；
+  //   pictureFirstNonBlackMs 本次尝试首个非黑帧的时刻（0 = 还没有非黑帧）；
+  //   pictureLastNonBlackMs  最近一次非黑帧的时刻（0 = 本次尝试还没有非黑帧）。
+  std::atomic<unsigned long long> pictureFrameMs;
+  std::atomic<unsigned long long> pictureBlackStartMs;
+  std::atomic<unsigned long long> pictureFirstNonBlackMs;
+  std::atomic<unsigned long long> pictureLastNonBlackMs;
+  // 终止那一刻的「本次会话正常画面持续时长」快照（最近非黑帧 - 首个非黑帧；
+  // 0 = 从未有画面）。connectionTerminated() 里写入，会话线程据此区分
+  // 「瞬时黑屏（主机显示会话变化）」和「用户已正常观看后的主机主动结束」。
+  std::atomic<unsigned long long> terminationPictureMs;
+  // 「launch 后 5 秒还没有首帧」的诊断：当前初始化阶段（stageStarting 更新）与
+  // 只打一次的标记，便于判断慢在 RTSP/控制流/视频哪一段。
+  std::atomic<int> currentStage;
+  std::atomic<bool> firstFrameTimeoutLogged;
 
   std::mutex textMutex;
   std::string terminationText;
@@ -443,6 +521,9 @@ struct MediaContext {
 // 同一时刻只允许一个串流：common-c 的全局状态（流对象、stage、回调）是单例。
 std::timed_mutex g_streamMutex;
 MediaContext g_media;
+// 本次会话线程已经执行的「主机结束串流且无画面」自动重连次数。会话线程写、
+// 输入线程的限频媒体统计读（所以用原子量）；0 表示当前没有在自动重连。
+std::atomic<int> g_autoReconnects(0);
 
 // ---------------------------------------------------------------------------
 // common-c 回调
@@ -453,6 +534,12 @@ int videoSetupCallback(int videoFormat, int width, int height, int redrawRate,
   (void)flags;
   MediaContext& media = g_media;
   if (!media.active.load() || media.video == nullptr) return -1;
+  // 黑屏计时从本次视频 setup 开始：首帧迟迟不来也要能被判成「没有画面」。
+  // 之后每帧由视频 sink 在解码回调线程里更新（见 sunshineNoteVideoLuma）。
+  media.pictureFrameMs.store(0);
+  media.pictureFirstNonBlackMs.store(0);
+  media.pictureLastNonBlackMs.store(0);
+  media.pictureBlackStartMs.store(monotonicMillis());
   const bool ok = media.video->setup(videoFormat, width, height, redrawRate);
   if (!ok) {
     logWarn(formatText("sunshine video setup failed: format=0x%X %dx%d@%d",
@@ -502,6 +589,7 @@ void audioStopCallback(void) {
 
 void stageStartingCallback(int stage) {
   if (!g_media.active.load()) return;
+  g_media.currentStage.store(stage);
   logDebug(formatText("sunshine stage starting: %s", LiGetStageName(stage)));
 }
 
@@ -529,7 +617,7 @@ void connectionStartedCallback(void) {
   if (!media.active.load() || media.host == nullptr) return;
   media.started.store(true);
   // 该回调在 LiStartConnection() 内部、会话线程上触发，所以直接写宿主状态是安全的。
-  media.host->setPhase(media.host->user, SunshinePhaseConnected, "", "none", 0);
+  setHostPhase(*media.host, SunshinePhaseConnected, "", "none", 0);
   logWarn("sunshine connection established");
 }
 
@@ -547,6 +635,15 @@ void connectionTerminatedCallback(int errorCode) {
     media.terminationText = text;
   }
   media.terminationCode.store(errorCode);
+  // 终止那一刻快照「本次会话正常画面持续了多久」= 最近非黑帧 - 首个非黑帧
+  // （0 = 本次会话从未出现非黑帧）。上层据此区分「用户已正常观看后的主机主动
+  // 结束」和「主机显示会话状态变化造成的瞬时黑屏（要自动重连）」。
+  const unsigned long long firstNonBlack = media.pictureFirstNonBlackMs.load();
+  const unsigned long long lastNonBlack = media.pictureLastNonBlackMs.load();
+  media.terminationPictureMs.store(
+      firstNonBlack != 0 && lastNonBlack >= firstNonBlack
+          ? lastNonBlack - firstNonBlack
+          : 0);
   media.terminated.store(true);
   logWarn("sunshine " + text);
 }
@@ -690,21 +787,26 @@ bool parseHexBytes(const std::string& text, uint8_t* output, size_t outputLength
 
 // 构造 NvHttpClient 的选项。https_port 为 0 时交给 /serverinfo 的 HttpsPort 发现。
 tg::sunshine::NvHttpClient::Options makeClientOptions(
-    const SunshineOptions& options, uint16_t httpsPort) {
+    const SunshineOptions& options, uint16_t httpsPort, int timeoutMs) {
   tg::sunshine::NvHttpClient::Options clientOptions;
   clientOptions.host = options.host;
   clientOptions.http_port = static_cast<uint16_t>(options.port);
   clientOptions.https_port = httpsPort;
   clientOptions.state_dir = options.stateDir;
-  // getservercert 阶段服务端会挂起到网页端提交 PIN，单独给 5 分钟。
+  // 首次连接给 10 s（局域网首次 TLS/RTSP 探测可能慢）；重连路径收到 5 s，
+  // 失败就重试而不是干等一次超时（真机上曾出现单次请求 10.5 s 的超时）。
+  clientOptions.connect_timeout_ms = timeoutMs;
+  clientOptions.io_timeout_ms = timeoutMs;
+  // getservercert 阶段服务端会挂起到网页端提交 PIN，单独给 5 分钟（不随重连缩短）。
   clientOptions.pin_wait_ms = 300000;
   return clientOptions;
 }
 
 void pairProgress(const tg::sunshine::PairStageRecord& stage) {
   if (stage.ok) {
-    logDebug(formatText("sunshine pair stage %s ok (%lld ms)", stage.name.c_str(),
-                        stage.elapsed_ms));
+    // 配对是一次性生命周期事件，用 W 级保证真机日志可见（D 级在手机上被过滤）。
+    logWarn(formatText("sunshine pair stage %s ok (%lld ms)", stage.name.c_str(),
+                       stage.elapsed_ms));
   } else {
     logWarn(formatText("sunshine pair stage %s failed (%lld ms): %s",
                        stage.name.c_str(), stage.elapsed_ms, stage.detail.c_str()));
@@ -738,7 +840,8 @@ void cancelServerSession(tg::sunshine::NvHttpClient& client) {
     client.cancel();
     logWarn("sunshine: host session cancelled");
   } catch (const std::exception& error) {
-    logDebug(std::string("sunshine cancel failed (ignored): ") + error.what());
+    // 取消失败不致命，但它是重连流程的一部分，真机上要能看到（W 级）。
+    logWarn(std::string("sunshine cancel failed (ignored): ") + error.what());
   }
 }
 
@@ -789,15 +892,107 @@ bool cancelAndStartApp(tg::sunshine::NvHttpClient& client, const SunshineHost& h
   return true;
 }
 
+enum PickLaunchOutcome {
+  PickLaunchStarted = 0,
+  PickLaunchAborted = 1,  // stop 或换代：调用方结束/重启本次尝试
+  PickLaunchNoApps = 2    // /applist 为空
+};
+
+// 选应用并通过 /launch（或 /resume）启动，处理两件事：
+//   * 应用 ID 缓存：本会话首次匹配到的应用缓存在 cachedAppId 里，重连不再拉
+//     /applist（实测一次 HTTPS 往返约 5 s）；只有 launch 用缓存 ID 报 404/400
+//     「应用不存在」时才重新拉一次 applist 并重试一次。
+//   * 主机残留会话：BUSY 且是目标应用 -> /resume；别的应用 -> cancel→等空闲→launch。
+// 返回 PickLaunchAborted 表示被 stop 或换代打断；异常原样抛出。
+PickLaunchOutcome pickAndLaunchApp(
+    const SunshineHost& host, int generation, tg::sunshine::NvHttpClient& client,
+    const SunshineOptions& options, tg::sunshine::ServerInfo* info,
+    int* cachedAppId, std::string* cachedTitle,
+    tg::sunshine::LaunchOptions* launchOptions, tg::sunshine::SessionLaunch* launch,
+    bool* resumed) {
+  if (*cachedAppId == 0) {
+    const std::vector<tg::sunshine::AppInfo> apps = client.get_app_list();
+    const tg::sunshine::AppInfo* app = pickApp(apps, options.app);
+    if (app == nullptr) return PickLaunchNoApps;
+    *cachedAppId = app->id;
+    *cachedTitle = app->title;
+  }
+  launchOptions->app_id = *cachedAppId;
+  if (host.setAppTitle != nullptr)
+    host.setAppTitle(host.user, generation, cachedTitle->c_str());
+
+  int busyRetry = 0;
+  int appRefresh = 0;
+  for (;;) {
+    // 配对前那次 /serverinfo 可能已过期：忙时重新读一次再决定 resume/cancel。
+    if (serverBusy(*info)) {
+      try {
+        *info = client.get_server_info().server;
+      } catch (const tg::sunshine::PinMismatchError&) {
+        throw;
+      } catch (const std::exception& error) {
+        logWarn(std::string("sunshine serverinfo refresh failed (ignored): ") +
+                error.what());
+      }
+    }
+    *resumed = serverBusy(*info) && info->current_game == *cachedAppId;
+    try {
+      if (*resumed) {
+        // 同一个应用还在跑：/resume 接管续播，参数与 /launch 相同。
+        *launch = client.resume(*launchOptions);
+      } else if (serverBusy(*info)) {
+        if (!cancelAndStartApp(client, host, generation, *launchOptions, *cachedAppId,
+                               *info, launch, resumed))
+          return PickLaunchAborted;
+      } else {
+        *launch = client.launch(*launchOptions);
+      }
+      return PickLaunchStarted;
+    } catch (const tg::sunshine::NvError& error) {
+      if (!*resumed && busyRetry == 0 && launchAlreadyRunning(error)) {
+        // state 标记与实际不一致：/launch 仍可能 400 "already running"。
+        // 只重试一次（cancel -> 等空闲 -> launch/resume）。
+        ++busyRetry;
+        logWarn("sunshine: launch reported an app already running; retrying once");
+        if (!cancelAndStartApp(client, host, generation, *launchOptions, *cachedAppId,
+                               *info, launch, resumed))
+          return PickLaunchAborted;
+        return PickLaunchStarted;
+      }
+      if (appRefresh == 0 && *cachedAppId != 0 &&
+          (error.nv_status_code() == 404 || error.http_status() == 404)) {
+        // 缓存的应用 ID 已被服务端拒绝（应用列表变了）：重新拉一次再试一次。
+        ++appRefresh;
+        logWarn("sunshine: cached app id rejected by launch; refreshing app list once");
+        const std::vector<tg::sunshine::AppInfo> apps = client.get_app_list();
+        const tg::sunshine::AppInfo* app = pickApp(apps, options.app);
+        if (app == nullptr) return PickLaunchNoApps;
+        *cachedAppId = app->id;
+        *cachedTitle = app->title;
+        launchOptions->app_id = *cachedAppId;
+        if (host.setAppTitle != nullptr)
+          host.setAppTitle(host.user, generation, cachedTitle->c_str());
+        continue;
+      }
+      throw;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 串流阶段（LiStartConnection 及其等待/停止）
 // ---------------------------------------------------------------------------
 struct MediaOutcome {
-  MediaOutcome() : stopped(false), connected(false), restart(false) {}
+  MediaOutcome()
+      : stopped(false), connected(false), restart(false), terminationCode(0),
+        pictureMs(0), failedStage(0) {}
   bool stopped;    // 宿主已要求停止
   bool connected;  // LiStartConnection 成功过
   bool restart;    // generation 变化（手动重连），应立即进入下一次尝试
   std::string text;  // 启动失败或终止原因
+  int terminationCode;        // common-c 终止错误码（0 / -1 = 主机结束类）
+  unsigned long long pictureMs;  // 本次会话正常画面持续时长（0 = 从未有画面）
+  int failedStage;            // LiStartConnection 失败的阶段（0 = 不是阶段失败）
 };
 
 // 在 stop 可打断的前提下最多等 timeoutMs 拿到进程级串流槽，避免两条 Sunshine
@@ -859,6 +1054,14 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   media.terminationCode.store(0);
   media.failedStage.store(0);
   media.failedStageError.store(0);
+  // 画面全黑检测也按尝试复位；真正的计时起点在 videoSetupCallback。
+  media.pictureFrameMs.store(0);
+  media.pictureFirstNonBlackMs.store(0);
+  media.pictureLastNonBlackMs.store(0);
+  media.pictureBlackStartMs.store(0);
+  media.terminationPictureMs.store(0);
+  media.currentStage.store(0);
+  media.firstFrameTimeoutLogged.store(false);
   media.input.reset();
   {
     std::lock_guard<std::mutex> lock(media.textMutex);
@@ -959,14 +1162,31 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   // 看门狗：LiStartConnection 内的握手可能阻塞数秒（RTSP/enet 重试）。common-c
   // 文档给的跨线程中止手段只有 LiInterruptConnection()；LiStopConnection() 由会话
   // 线程在启动返回后自己调用。
+  const std::chrono::steady_clock::time_point streamStart =
+      std::chrono::steady_clock::now();
   std::atomic<bool> startReturned(false);
   std::thread watchdog;
   try {
-    watchdog = std::thread([&host, &startReturned]() {
+    watchdog = std::thread([&host, &startReturned, &media, streamStart]() {
       while (!startReturned.load()) {
         if (host.stopRequested(host.user)) {
           LiInterruptConnection();
           return;
+        }
+        // launch 后 5 秒还没连上：打一行 W 级日志说明卡在哪个阶段（RTSP/控制流/
+        // 视频），否则真机上只能看到黑屏，不知道慢在哪。只打一次。
+        if (!media.started.load() && !media.firstFrameTimeoutLogged.load()) {
+          const long long elapsedMs = static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - streamStart).count());
+          if (elapsedMs >= 5000) {
+            media.firstFrameTimeoutLogged.store(true);
+            const int stage = media.currentStage.load();
+            logWarn(formatText(
+                "sunshine: no first frame %lld ms after launch; setup at stage %s "
+                "(stage %d), established=0",
+                elapsedMs, LiGetStageName(stage), stage));
+          }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
@@ -1037,26 +1257,48 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   std::atomic<bool> inputDone(false);
   std::thread inputThread;
   try {
-    inputThread = std::thread([&host, &media, &inputSink, &applied, &inputDone]() {
+    inputThread = std::thread(
+        [&host, &media, &inputSink, &applied, &inputDone, streamStart]() {
       int ticks = 0;
       while (!inputDone.load()) {
         if (host.stopRequested(host.user) || media.terminated.load()) break;
         if (host.drainInput != nullptr)
           host.drainInput(host.user, &inputSink, &applied);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // 连上了但 5 秒还没有任何解码帧：打一行 W 级日志（只打一次），说明卡在
+        // 视频阶段，而不是让用户对着黑屏猜。
+        if (!media.firstFrameTimeoutLogged.load() &&
+            media.pictureFrameMs.load() == 0) {
+          const long long elapsedMs = static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - streamStart).count());
+          if (media.started.load() && elapsedMs >= 5000) {
+            media.firstFrameTimeoutLogged.store(true);
+            const int stage = media.currentStage.load();
+            logWarn(formatText(
+                "sunshine: established but no decoded frame %lld ms after launch; "
+                "last stage %s (stage %d)",
+                elapsedMs, LiGetStageName(stage), stage));
+          }
+        }
         // 每 5 秒打一次媒体计数（只读计数，不含任何画面内容）。
         if (++ticks % 500 == 0 && media.video != nullptr) {
           const SunshineVideoStats videoStats = media.video->stats();
           const SunshineAudioStats audioStats =
               media.audio != nullptr ? media.audio->stats() : SunshineAudioStats();
-          logDebug(formatText(
+          const SunshinePictureStatus picture = sunshinePictureStatus();
+          // 媒体统计也走 W：手机上默认看不到 D 级，无法确认帧/音频/重连计数。
+          // 限频不变（每 500 个 10ms 节拍 = 5 秒一次）。
+          logWarn(formatText(
               "sunshine media: frames=%llu (idr %llu), video bytes=%llu, audio "
-              "packets=%llu, audio bytes=%llu",
+              "packets=%llu, audio bytes=%llu, black=%llums, last frame=%llums, "
+              "autoReconnects=%d",
               videoStats.frames, videoStats.idrFrames, videoStats.bytes,
-              audioStats.packets, audioStats.bytes));
+              audioStats.packets, audioStats.bytes, picture.blackMs,
+              picture.lastFrameAgeMs, g_autoReconnects.load()));
         }
       }
-    });
+        });
   } catch (...) {
     // Degraded but safe: keep the stream, drop the input for this attempt. The
     // stream slot and every sink stay owned by this thread, so nothing dangles.
@@ -1090,37 +1332,140 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   }
   if (outcome.text.empty())
     outcome.text = "串流已结束";
+  // 终止原因与「本次会话是否交付过画面」（connectionTerminated 时的快照）。
+  outcome.terminationCode = media.terminationCode.load();
+  outcome.pictureMs = media.terminationPictureMs.load();
+  outcome.failedStage = media.failedStage.load();
   return outcome;
 }
 
 }  // namespace
 
-// Small helper so the many phase transitions can pass std::string messages
-// without scattering .c_str() at every call site (RdpHost::setPhase takes a
-// const char* like the rest of the host contract).
-void setHostPhase(const SunshineHost& host, int phase, const std::string& error,
-                  const char* errorCode, int retryInMs) {
-  host.setPhase(host.user, phase, error.c_str(), errorCode, retryInMs);
+// 视频解码回调线程每帧上报一次（见 sunshine_backend.h）。这里只写原子时间戳：
+// 不读时钟、不加锁，所以对解码线程的开销是一次 store。
+void sunshineNoteVideoLuma(unsigned long long frameTimeMs, bool black) {
+  MediaContext& media = g_media;
+  if (!media.active.load()) return;
+  media.pictureFrameMs.store(frameTimeMs);
+  // 非黑帧把「连续全黑/无帧」的起点推进到这一刻；黑帧不动它，时长自然增长。
+  // 同时记下首个与最近一个非黑帧的时刻，终止时用两者的差衡量「正常画面持续了
+  // 多久」（只有视频输出回调线程会调这里，先读后写不需要 CAS）。
+  if (!black) {
+    if (media.pictureFirstNonBlackMs.load() == 0)
+      media.pictureFirstNonBlackMs.store(frameTimeMs);
+    media.pictureLastNonBlackMs.store(frameTimeMs);
+  }
+}
+
+// 状态读取方（statusJson 的 NAPI 线程）在读取时换算时长；时间戳都是进程级原子
+// 量，因此这里不需要任何锁，也不会和视频回调线程互相等待。
+SunshinePictureStatus sunshinePictureStatus() {
+  SunshinePictureStatus status;
+  if (!g_media.active.load()) return status;
+  const unsigned long long now = monotonicMillis();
+  const unsigned long long frameMs = g_media.pictureFrameMs.load();
+  const unsigned long long lastNonBlack = g_media.pictureLastNonBlackMs.load();
+  const unsigned long long blackStart = g_media.pictureBlackStartMs.load();
+  // blackMs 从最近一次非黑帧（本次尝试从未出现非黑帧时是 video setup）起算：
+  // 全黑帧持续到达、或者根本没有帧，它都会增长；任何非黑帧都把它清零。
+  const unsigned long long baseline = lastNonBlack != 0 ? lastNonBlack : blackStart;
+  if (baseline != 0) status.blackMs = now - baseline;
+  if (frameMs != 0) {
+    status.lastFrameAgeMs = now - frameMs;
+  } else if (baseline != 0) {
+    // 本次尝试还没有任何帧：从视频 setup 起算「没有画面」的时长。
+    status.lastFrameAgeMs = now - baseline;
+  }
+  return status;
+}
+
+enum ProbeOutcome {
+  ProbeOk = 0,
+  ProbeNeedPair = 1,  // HTTPS 返回 401/403：客户端证书不再被接受（确定性失败）
+  ProbeStopped = 2    // stop 或换代
+};
+
+// 重连专用 /serverinfo 探测：只用 HTTPS 快路径（单次 5 s 超时），失败退避 1 s
+// 重试、最多持续 60 s；只有拿到确定答案才离开：
+//   * 成功；* 401/403（证书不再被接受，交给配对流程）；* stop/换代。
+// 超时/网络类失败不再退回「明文 + HTTPS」的长探测——真机上正是那一步多花了 20 s。
+ProbeOutcome probeHttpsWithRetry(const SunshineHost& host, int generation,
+                                 tg::sunshine::NvHttpClient& client,
+                                 tg::sunshine::ServerInfo* info) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  int tries = 0;
+  for (;;) {
+    if (host.stopRequested(host.user)) return ProbeStopped;
+    if (host.generation != nullptr && host.generation(host.user) != generation)
+      return ProbeStopped;
+    std::string errorText;
+    try {
+      *info = client.get_server_info_https();
+      if (tries > 0)
+        logWarn(formatText("sunshine: HTTPS serverinfo succeeded after %d retries", tries));
+      return ProbeOk;
+    } catch (const tg::sunshine::PinMismatchError&) {
+      throw;  // 指纹不一致：确定性失败，外层按 failed/fingerprint-mismatch 处理
+    } catch (const tg::sunshine::NvError& error) {
+      if (error.http_status() == 401 || error.http_status() == 403)
+        return ProbeNeedPair;
+      errorText = error.what();
+    } catch (const std::exception& error) {
+      errorText = error.what();
+    }
+    ++tries;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      logWarn(formatText("sunshine: serverinfo still unreachable after 60 s (%s)",
+                         errorText.c_str()));
+      throw tg::sunshine::NvError(
+          "60 秒内无法连接 Sunshine 服务端（" + errorText + "）", 0, -1, "", "");
+    }
+    logWarn(formatText(
+        "sunshine: serverinfo probe failed (try %d): %s; retry in 1000 ms", tries,
+        errorText.c_str()));
+    if (!host.sleepUnlessStopped(host.user, 1000)) return ProbeStopped;
+  }
 }
 
 void runSunshineSession(const SunshineHost& host, const SunshineOptions& options) {
   // 缺少状态目录属于配置错误：会话进入 failed/protocol 并等用户重连，绝不落到 VNC
   // 循环上（端口和握手完全不同）。
   if (options.stateDir.empty()) {
-    host.setPhase(host.user, SunshinePhaseFailed,
-                  "缺少 Sunshine 状态目录（sunshineStateDir，须传应用沙箱绝对路径）",
-                  "protocol", 0);
+    setHostPhase(host, SunshinePhaseFailed,
+                 "缺少 Sunshine 状态目录（sunshineStateDir，须传应用沙箱绝对路径）",
+                 "protocol", 0);
     host.waitForReconnect(host.user);
     return;
   }
 
+  g_lastPhase.store(-1);
   int lastApplied = 0;
   int backoffMs = 1000;
   int transportPairFailures = 0;
+  // 「主机结束串流且本次会话从未有画面」的连续自动重连次数（最多 3 次）。
+  int autoReconnects = 0;
+  // 首次连接与重连分开对待：首次走完整 /serverinfo（明文探测 HttpsPort + HTTPS，
+  // 10 s 超时）；之后直接用学到/缓存的值走 HTTPS 快路径（4 s 超时）。
+  bool firstAttempt = true;
+  uint16_t savedHttpsPort = 0;
+  // 本会话缓存的目标应用（首次 /applist 匹配结果）。重连不再拉 /applist，
+  // 除非 /launch 用缓存 ID 报 404（应用列表变了）才重拉一次。
+  int cachedAppId = 0;
+  std::string cachedAppTitle;
+  // 自动重连窗口里的总预算（60 s）：serverinfo 探测与 RTSP 阶段重试共同消耗，
+  // 主机端在预算内恢复就能连上，超时才判定失败。hostNotReadyRetries 只用于
+  // W 级日志「主机尚未就绪，第 n 次重试」。
+  int hostNotReadyRetries = 0;
+  std::chrono::steady_clock::time_point reconnectDeadline =
+      std::chrono::steady_clock::now();
 
   while (!host.stopRequested(host.user)) {
     const int generation = host.beginAttempt(host.user, &lastApplied);
-    host.setPhase(host.user, SunshinePhaseConnecting, "", "none", 0);
+    // 自动重连窗口里不要先跳回 connecting：UI 的「正在重新连接…」只在
+    // reconnecting 状态显示，探测/重试期间保持该状态直到真正连上。
+    if (autoReconnects == 0)
+      setHostPhase(host, SunshinePhaseConnecting, "", "none", 0);
 
     try {
       // 1. 客户端身份（证书/私钥/uniqueid），缺失时生成并落盘。
@@ -1129,44 +1474,91 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
       logDebug(formatText("sunshine identity ready (created_now=%d)",
                           identity.created_now ? 1 : 0));
 
-      // 2. nvhttp 客户端：http_port = 会话端口；https_port 先按端口-5 猜，
-      //    /serverinfo 报的 HttpsPort 与之不同时以服务端为准重建一次。
-      uint16_t httpsPort =
-          options.port > 5 ? static_cast<uint16_t>(options.port - 5) : 0;
+      // 2. nvhttp 客户端：http_port = 会话端口；首次连接按「端口-5」猜 HTTPS 端口，
+      //    重连直接复用上次成功探测到的端口。
+      const int probeTimeoutMs = firstAttempt ? 10000 : 5000;
+      uint16_t httpsPort = savedHttpsPort != 0
+                               ? savedHttpsPort
+                               : (options.port > 5
+                                      ? static_cast<uint16_t>(options.port - 5)
+                                      : 0);
       std::unique_ptr<tg::sunshine::NvHttpClient> client(
-          new tg::sunshine::NvHttpClient(makeClientOptions(options, httpsPort)));
+          new tg::sunshine::NvHttpClient(
+              makeClientOptions(options, httpsPort, probeTimeoutMs)));
 
-      // 3. /serverinfo。PinMismatchError 直接抛给外层（failed/fingerprint-mismatch）。
-      tg::sunshine::ServerInfoProbe probe = client->get_server_info();
-      tg::sunshine::ServerInfo info = probe.server;
-      if (!probe.http_ok && !probe.https_ok) {
-        const std::string detail =
-            !probe.http_error.empty() ? probe.http_error : probe.https_error;
-        setHostPhase(host, SunshinePhaseReconnecting,
-                     "无法连接 Sunshine 服务端：" + detail, "network", backoffMs);
-        if (!host.sleepUnlessStopped(host.user, backoffMs)) {
-          if (host.stopRequested(host.user)) break;
+      // 3. /serverinfo。首次连接：完整探测（明文拿 HttpsPort + HTTPS），10 s 超时。
+      //    重连：只走 HTTPS 快路径 + 1 s 退避重试（见 probeHttpsWithRetry），超时
+      //    类失败不再退回明文长探测；只有 401/403（证书不再被接受）才补一次完整
+      //  探测去走配对流程。
+      tg::sunshine::ServerInfoProbe probe;
+      tg::sunshine::ServerInfo info;
+      bool needFullProbe = firstAttempt;
+      if (!firstAttempt) {
+        if (savedHttpsPort == 0) {
+          // 还没学到 HTTPS 端口（理论上不会发生）：做一次完整探测。
+          needFullProbe = true;
+        } else {
+          const ProbeOutcome probeOutcome =
+              probeHttpsWithRetry(host, generation, *client, &info);
+          if (probeOutcome == ProbeStopped) {
+            if (host.stopRequested(host.user)) break;
+            continue;  // 手动换代
+          }
+          if (probeOutcome == ProbeOk) {
+            probe.server = info;
+            probe.https_ok = true;
+            probe.https_port_used = savedHttpsPort;
+          } else {
+            // 401/403：服务端不再信任客户端证书。补一次完整探测拿 appversion 等，
+            // 再交给下面的配对流程（这是确定答案，不是超时兜底）。
+            logWarn("sunshine: server rejected the client certificate; full probe for pairing");
+            needFullProbe = true;
+          }
         }
-        backoffMs = std::min(backoffMs * 2, 4000);
-        continue;
       }
-      if (info.https_port != 0 &&
-          static_cast<uint16_t>(info.https_port) != httpsPort &&
-          !probe.https_ok) {
-        // 服务端在别的 HTTPS 端口上：按它公布的值重建客户端并重新探测。
-        httpsPort = static_cast<uint16_t>(info.https_port);
-        client.reset(
-            new tg::sunshine::NvHttpClient(makeClientOptions(options, httpsPort)));
+      if (needFullProbe) {
         probe = client->get_server_info();
         info = probe.server;
+        if (!probe.http_ok && !probe.https_ok) {
+          const std::string detail =
+              !probe.http_error.empty() ? probe.http_error : probe.https_error;
+          setHostPhase(host, SunshinePhaseReconnecting,
+                       "无法连接 Sunshine 服务端：" + detail, "network", backoffMs);
+          if (!host.sleepUnlessStopped(host.user, backoffMs)) {
+            if (host.stopRequested(host.user)) break;
+          }
+          backoffMs = std::min(backoffMs * 2, 4000);
+          continue;
+        }
+        if (firstAttempt && info.https_port != 0 &&
+            static_cast<uint16_t>(info.https_port) != httpsPort &&
+            !probe.https_ok) {
+          // 服务端在别的 HTTPS 端口上：按它公布的值重建客户端并重新探测。
+          httpsPort = static_cast<uint16_t>(info.https_port);
+          client.reset(new tg::sunshine::NvHttpClient(
+              makeClientOptions(options, httpsPort, probeTimeoutMs)));
+          probe = client->get_server_info();
+          info = probe.server;
+        }
       }
+      // 记住这次用到的 HTTPS 端口，后续重连走快路径；首次连接到此结束。
+      if (probe.https_ok && probe.https_port_used != 0)
+        savedHttpsPort = probe.https_port_used;
+      else if (info.https_port != 0)
+        savedHttpsPort = static_cast<uint16_t>(info.https_port);
+      firstAttempt = false;
       if (info.appversion.empty()) {
-        host.setPhase(host.user, SunshinePhaseFailed,
-                      "服务端 /serverinfo 缺少 appversion，无法建立 Moonlight 会话",
-                      "protocol", 0);
+        setHostPhase(host, SunshinePhaseFailed,
+                     "服务端 /serverinfo 缺少 appversion，无法建立 Moonlight 会话",
+                     "protocol", 0);
         host.waitForReconnect(host.user);
         continue;
       }
+      // 生命周期日志统一用 W 级：真机默认只显示 W 及以上，D 级的诊断在手机上
+      // 看不到。只打印状态/版本，不含 PIN、rikey、证书或剪贴板内容。
+      logWarn(formatText("sunshine serverinfo: state=%s, pairStatus=%d, appversion=%s",
+                         info.state.empty() ? "(unset)" : info.state.c_str(),
+                         info.pair_status, info.appversion.c_str()));
       if (host.setServerAppVersion != nullptr)
         host.setServerAppVersion(host.user, generation, info.appversion.c_str());
 
@@ -1177,7 +1569,7 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
         // Enter pairing-required once. A failed pair re-enters the wait with its
         // pair-failed error text set by the catch below; the top of the loop
         // must not overwrite that (otherwise the UI would never see it).
-        host.setPhase(host.user, SunshinePhasePairingRequired, "", "none", 0);
+        setHostPhase(host, SunshinePhasePairingRequired, "", "none", 0);
         while (!paired) {
           if (host.stopRequested(host.user)) break;
           std::string pin;
@@ -1186,7 +1578,7 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
             wipeString(pin);
             break;
           }
-          host.setPhase(host.user, SunshinePhaseConnecting, "正在配对", "none", 0);
+          setHostPhase(host, SunshinePhaseConnecting, "正在配对", "none", 0);
           try {
             client->pair(pin, "Tianguan", pairProgress);
             paired = true;
@@ -1224,76 +1616,41 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
       if (info.server_codec_mode_support == 0) {
         // 没有编解码能力位时 common-c 的 LiStartConnection 会直接失败；在
         // /launch 之前就报出来，避免无意义地启动服务端应用。
-        host.setPhase(host.user, SunshinePhaseFailed,
-                      "服务端 /serverinfo 未声明 ServerCodecModeSupport，无法协商视频格式",
-                      "protocol", 0);
+        setHostPhase(host, SunshinePhaseFailed,
+                     "服务端 /serverinfo 未声明 ServerCodecModeSupport，无法协商视频格式",
+                     "protocol", 0);
         host.waitForReconnect(host.user);
         continue;
       }
 
-      // 5. /applist：标题不区分大小写包含匹配，找不到用第一个。
-      const std::vector<tg::sunshine::AppInfo> apps = client->get_app_list();
-      const tg::sunshine::AppInfo* app = pickApp(apps, options.app);
-      if (app == nullptr) {
-        host.setPhase(host.user, SunshinePhaseFailed,
-                      "服务端应用列表为空，无法启动 Sunshine 应用", "protocol", 0);
-        host.waitForReconnect(host.user);
-        continue;
+      // 5/6. 应用与启动：首次拉 /applist 并缓存目标应用 ID，重连直接用缓存 ID；
+      //       /launch 处理主机残留会话（resume / cancel→等空闲），缓存 ID 失效
+      //       时重拉 applist 再试一次（见 pickAndLaunchApp）。
+      if (cachedAppId != 0) {
+        logWarn(formatText("sunshine: reusing cached app \"%s\" (#%d), skipping /applist",
+                           cachedAppTitle.c_str(), cachedAppId));
       }
-      if (host.setAppTitle != nullptr)
-        host.setAppTitle(host.user, generation, app->title.c_str());
-
-      // 6. /launch（mode=WxHxFPS，服务端生成 rikey/rikeyid 与 sessionUrl0）。
-      //    先处理服务端的残留会话：BUSY 且就是目标应用 -> /resume 接管续播；
-      //    BUSY 是别的应用 -> /cancel、等空闲（500ms/最多 10s）再 /launch。
       tg::sunshine::LaunchOptions launchOptions;
-      launchOptions.app_id = app->id;
       launchOptions.width = options.width;
       launchOptions.height = options.height;
       launchOptions.fps = options.fps;
-
-      // info 是配对前那次探测的快照，忙时重新读一次再决策，避免拿过期状态去
-      // /resume 一个其实已经结束的会话。
-      if (serverBusy(info)) {
-        try {
-          info = client->get_server_info().server;
-        } catch (const tg::sunshine::PinMismatchError&) {
-          throw;
-        } catch (const std::exception& error) {
-          logDebug(std::string("sunshine serverinfo refresh failed (ignored): ") +
-                   error.what());
-        }
-      }
-
-      bool resumed = serverBusy(info) && info.current_game == app->id;
       tg::sunshine::SessionLaunch launch;
-      try {
-        if (resumed) {
-          // 同一个应用还在跑：/resume 接管续播，参数与 /launch 相同。
-          launch = client->resume(launchOptions);
-        } else if (serverBusy(info)) {
-          if (!cancelAndStartApp(*client, host, generation, launchOptions, app->id,
-                                 info, &launch, &resumed)) {
-            if (host.stopRequested(host.user)) break;
-            continue;  // 手动换代
-          }
-        } else {
-          launch = client->launch(launchOptions);
-        }
-      } catch (const tg::sunshine::NvError& error) {
-        // 兜底：state 标记与实际不一致时 /launch 仍可能 400 "already running"。
-        // 只重试一次（cancel -> 等空闲 -> launch/resume）。
-        if (resumed || !launchAlreadyRunning(error)) throw;
-        logWarn("sunshine: launch reported an app already running; cancelling and "
-                "retrying once");
-        if (!cancelAndStartApp(*client, host, generation, launchOptions, app->id,
-                               info, &launch, &resumed)) {
-          if (host.stopRequested(host.user)) break;
-          continue;  // 手动换代
-        }
+      bool resumed = false;
+      const PickLaunchOutcome pickOutcome = pickAndLaunchApp(
+          host, generation, *client, options, &info, &cachedAppId, &cachedAppTitle,
+          &launchOptions, &launch, &resumed);
+      if (pickOutcome == PickLaunchAborted) {
+        if (host.stopRequested(host.user)) break;
+        continue;  // 手动换代
+      }
+      if (pickOutcome == PickLaunchNoApps) {
+        setHostPhase(host, SunshinePhaseFailed,
+                     "服务端应用列表为空，无法启动 Sunshine 应用", "protocol", 0);
+        host.waitForReconnect(host.user);
+        continue;
       }
       logWarn(formatText("sunshine launch: app=\"%s\" (id %d), resumed=%d, sessionUrl set=%d",
-                         app->title.c_str(), app->id, resumed ? 1 : 0,
+                         cachedAppTitle.c_str(), cachedAppId, resumed ? 1 : 0,
                          launch.session_url0.empty() ? 0 : 1));
 
       // 7. 串流（阻塞到终止 / 停止 / 换代）。
@@ -1303,15 +1660,50 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
                          launch.session_url0, launch.rikey, launch.rikeyid,
                          generation);
       backoffMs = 1000;
-      // 只要本次尝试走到过 /launch，停止、换代、对端终止、启动失败都尽力 /cancel：
-      // 服务端上残留的会话会让下一次 /launch 直接 400 "already running"。
-      // closeSession() 只置 stop 并唤醒本线程，cancel 仍由会话线程在这里发出；
-      // 进程被杀来不及发的情况由连接时的残留会话处理兜底（见 cancelAndStartApp）。
-      cancelServerSession(*client);
+      // 主机已经结束串流（0/-1）时它自己已经清理过会话，再 /cancel 只会白等一次
+      // 网络超时（真机实测 10.5 s）。只有客户端主动停止、或其它错误码（服务端上
+      // 可能还留着会话）才发 /cancel。closeSession() 只置 stop 并唤醒本线程，
+      // cancel 仍由会话线程在这里发出；进程被杀来不及发的情况由连接时的残留会话
+      // 处理兜底（见 cancelAndStartApp）。
+      const bool hostEndedStream =
+          outcome.connected &&
+          (outcome.terminationCode == 0 || outcome.terminationCode == -1);
+      if (outcome.stopped || !hostEndedStream) cancelServerSession(*client);
       if (outcome.stopped) break;
-      if (outcome.restart) continue;
+      if (outcome.restart) {
+        // 用户手动重连：重新给 3 次「无画面自动重连」机会。
+        autoReconnects = 0;
+        g_autoReconnects.store(0);
+        continue;
+      }
 
       if (!outcome.connected) {
+        // RTSP 握手失败通常意味着主机端还没从上一段会话里恢复。保持 1 s 退避
+        // 重试（backoffMs 每次尝试都会重置回 1000），但把它计入自动重连的总
+        // 预算（60 s），并用 W 级日志打出「主机尚未就绪，第 n 次重试」。
+        if (autoReconnects > 0 && outcome.failedStage == STAGE_RTSP_HANDSHAKE) {
+          const std::chrono::steady_clock::time_point now =
+              std::chrono::steady_clock::now();
+          if (now >= reconnectDeadline) {
+            autoReconnects = 0;
+            hostNotReadyRetries = 0;
+            g_autoReconnects.store(0);
+            logWarn("sunshine: reconnect budget exhausted; host still not ready");
+            setHostPhase(
+                host, SunshinePhaseFailed,
+                "主机多次结束串流且始终无画面：请确认主机控制台已登录（未被远程桌面占用）后重试",
+                "network", 0);
+            host.waitForReconnect(host.user);
+            continue;
+          }
+          ++hostNotReadyRetries;
+          const long long leftMs = static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  reconnectDeadline - now).count());
+          logWarn(formatText(
+              "sunshine: 主机尚未就绪，第 %d 次重试（剩余 %lld ms）",
+              hostNotReadyRetries, leftMs > 0 ? leftMs : 0));
+        }
         // 启动失败：网络类退避重试；stop 已在 outcome 里。
         setHostPhase(host, SunshinePhaseReconnecting,
                      outcome.text.empty() ? std::string("Sunshine 串流启动失败") : outcome.text,
@@ -1323,8 +1715,67 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
         continue;
       }
 
-      // 连接建立后被终止（对端结束/网络断开）：/cancel 已在上面发过，这里退避
-      // 重连（重连会重新走 /serverinfo -> /launch，必要时 /resume 续播）。
+      // 连接建立后被终止。先归类「主机结束串流」类的错误码：
+      //   * 0  = ML_ERROR_GRACEFUL_TERMINATION（Limelight.h:421）：主机主动结束；
+      //   * -1 = Limelight.h 里没有这个常量，它来自控制流：ControlStream.c:1600
+      //          （ENET_EVENT_TYPE_DISCONNECT，即对端断开且没有 termination 消息）
+      //          与 ControlStream.c:1369（断开握手超时）。Sunshine 的 /cancel、
+      //          主机端应用退出都走这条；它与「真正的网络中断」在协议层不可区分。
+      // 两者都按「终止前正常画面持续了多久」判定：
+      //   * < 3 秒（含从未有画面）：用户还没看到稳定画面，视为主机显示会话状态
+      //     变化（控制台会话被接回/远程桌面占用等）造成的瞬时黑屏 -> 自动重连；
+      //   * >= 3 秒：用户已经正常观看 -> 主机主动结束，不自动重连。
+      if (hostEndedStream && outcome.pictureMs >= 3000) {
+        // 用户已经看到 >=3 秒正常画面：主机主动结束（关游戏、/cancel 等）。
+        // 不自动重连，停在 disconnected，保留会话供手动重连。
+        autoReconnects = 0;
+        g_autoReconnects.store(0);
+        logWarn(formatText(
+            "sunshine: host ended the stream after %llu ms of picture; no auto "
+            "reconnect",
+            outcome.pictureMs));
+        setHostPhase(host, SunshinePhaseDisconnected, "主机结束了串流", "none", 0);
+        host.waitForReconnect(host.user);
+        continue;
+      }
+      if (hostEndedStream) {
+        // 主机结束串流、但正常画面不到 3 秒（或从未有画面）：典型场景是主机
+        // 显示会话被接回/远程桌面占用（tscon 等），串流被主机踢掉，客户端只会
+        // 看到黑屏。按「主机显示会话状态变化」处理：自动重连，最多 3 次
+        // （2/4/8s 退避），每次重新走 /serverinfo ->（resume/cancel）-> /launch。
+        if (autoReconnects >= 3) {
+          autoReconnects = 0;
+          g_autoReconnects.store(0);
+          logWarn("sunshine: giving up after 3 no-picture auto reconnects; "
+                  "host display session is probably unavailable");
+          setHostPhase(host, SunshinePhaseFailed,
+                       "主机多次结束串流且始终无画面：请确认主机控制台已登录（未被远程桌面占用）后重试",
+                       "network", 0);
+          host.waitForReconnect(host.user);
+          continue;
+        }
+        ++autoReconnects;
+        g_autoReconnects.store(autoReconnects);
+        hostNotReadyRetries = 0;
+        reconnectDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        const int delayMs = 2000 << (autoReconnects - 1);  // 2s / 4s / 8s
+        logWarn(formatText(
+            "sunshine: host ended the stream after %llu ms of picture (<3000 ms); "
+            "auto reconnect %d/3 in %d ms",
+            outcome.pictureMs, autoReconnects, delayMs));
+        setHostPhase(
+            host, SunshinePhaseReconnecting,
+            formatText("主机结束了串流且没有画面，%d 秒后自动重连（%d/3）",
+                       delayMs / 1000, autoReconnects),
+            "network", delayMs);
+        if (!host.sleepUnlessStopped(host.user, delayMs)) {
+          if (host.stopRequested(host.user)) break;
+        }
+        continue;
+      }
+
+      // 其它错误码（网络中断、无视频流量等）：保持既有的 reconnecting +
+      // 1s..4s 退避重连，/cancel 已在上面发过。
       setHostPhase(host, SunshinePhaseReconnecting, outcome.text, "network",
                    backoffMs);
       if (!host.sleepUnlessStopped(host.user, backoffMs)) {
