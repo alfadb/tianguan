@@ -505,8 +505,10 @@ let pendingDelivery: boolean = false;
 let baselinePending: boolean = true;
 let board: pasteboard.SystemPasteboard | undefined = undefined;
 let lastReadFailure: string = '';
-/** One-shot explanation for "the pasteboard read yields no plain text". */
-let nonTextReadLogged: boolean = false;
+/** Throttles "the pasteboard read yields no text" to a new record shape. */
+let lastUnusableReadSignature: string = '';
+/** Throttles the "text came from a non text/plain record" note by source. */
+let lastNonPlainSourceSignature: string = '';
 let truncationCount: number = 0;
 let lastTruncatedOriginalBytes: number = 0;
 let lastTruncatedSentBytes: number = 0;
@@ -1088,6 +1090,109 @@ function hasPendingClipboardWork(): boolean {
   return remoteApplier.pendingCount() > 0;
 }
 
+// @selfcheck-begin local-paste-pick
+/**
+ * Text found in one pasteboard read and the record it came from. An empty text
+ * means no record carried usable text; the caller then reports the record
+ * shapes instead of syncing anything.
+ */
+export interface PickedPasteText {
+  text: string;
+  /** MIME type of the record the text came from; '' when nothing was usable. */
+  mimeType: string;
+  /** 'plain' | 'plain-other-mime' | 'none' */
+  kind: string;
+}
+
+/** plainText is absent on some records; never read it directly. */
+export function recordText(value: string | undefined): string {
+  return value === undefined ? '' : value;
+}
+
+/**
+ * Picks the first usable text from the records of one pasteboard read. A read
+ * is not one text/plain record by definition: on 2026-11-27 a PC device copied
+ * web page text in Huawei Browser and the pasteboard held one
+ * mimeType=text/html record whose text was in its plainText field, so the old
+ * "exactly one text/plain record" read silently dropped it while pure text
+ * sources kept working.
+ * Order: (a) text/plain with plainText, (b) any other MIME type whose plainText
+ * is set, (c) an empty text/plain record (the pasteboard was cleared) is
+ * reported as kind 'plain' so the caller still resets the empty-text state;
+ * otherwise 'none'.
+ */
+export function pickLocalPasteText(data: pasteboard.PasteData): PickedPasteText {
+  const count = data.getRecordCount();
+  for (let i = 0; i < count; i++) {
+    const record = data.getRecordAt(i);
+    if (record.mimeType === pasteboard.MIMETYPE_TEXT_PLAIN &&
+      recordText(record.plainText).length > 0) {
+      const plain: PickedPasteText = {
+        text: recordText(record.plainText), mimeType: record.mimeType, kind: 'plain'
+      };
+      return plain;
+    }
+  }
+  for (let i = 0; i < count; i++) {
+    const record = data.getRecordAt(i);
+    const plain = recordText(record.plainText);
+    if (plain.length > 0) {
+      const other: PickedPasteText = {
+        text: plain, mimeType: record.mimeType, kind: 'plain-other-mime'
+      };
+      return other;
+    }
+  }
+  // An empty text/plain record (the pasteboard was cleared) is its own case:
+  // report it as such so the caller still resets the empty-text state.
+  for (let i = 0; i < count; i++) {
+    const record = data.getRecordAt(i);
+    if (record.mimeType === pasteboard.MIMETYPE_TEXT_PLAIN) {
+      const emptyPlain: PickedPasteText = { text: '', mimeType: record.mimeType, kind: 'plain' };
+      return emptyPlain;
+    }
+  }
+  const none: PickedPasteText = { text: '', mimeType: '', kind: 'none' };
+  return none;
+}
+// @selfcheck-end local-paste-pick
+
+/** Throttle signature for "no usable text": count plus every record's shape. */
+function unusablePasteSignature(data: pasteboard.PasteData): string {
+  const count = data.getRecordCount();
+  const parts: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const record = data.getRecordAt(i);
+    parts.push(record.mimeType + ' plain=' + recordText(record.plainText).length +
+      ' html=' + recordText(record.htmlText).length);
+  }
+  return count + '|' + parts.join(', ');
+}
+
+/** Explains a read that yielded no text, once per record-shape signature. */
+function logUnusablePasteData(data: pasteboard.PasteData): void {
+  const signature = unusablePasteSignature(data);
+  if (signature === lastUnusableReadSignature) {
+    return;
+  }
+  lastUnusableReadSignature = signature;
+  hilog.info(DOMAIN, TAG,
+    'clipboard 本机剪贴板无可同步的文字（记录数 %{public}d；无 READ_PASTEBOARD 时系统返回空数据）：' +
+    '%{public}s', data.getRecordCount(), signature);
+}
+
+/** Notes which non text/plain record the synced text came from, once per format. */
+function logNonPlainPasteSource(picked: PickedPasteText, bytes: number): void {
+  const signature = picked.kind + '|' + picked.mimeType;
+  if (signature === lastNonPlainSourceSignature) {
+    return;
+  }
+  lastNonPlainSourceSignature = signature;
+  hilog.info(DOMAIN, TAG,
+    'clipboard 本机剪贴板文字来自非 text/plain 记录：mime=%{public}s kind=%{public}s bytes=%{public}d',
+    picked.mimeType, picked.kind, bytes);
+}
+
 /** Local -> remote: async read of the system pasteboard, fan a new text out. */
 async function syncLocal(): Promise<void> {
   if (readPermissionState !== 'granted') {
@@ -1130,30 +1235,25 @@ async function syncLocal(): Promise<void> {
     noteClipRead(readUs, 0);
     return;
   }
-  if (data.getRecordCount() !== 1) {
-    // Not a single-record pasteboard: not plain text, or the read was refused.
-    // Without ohos.permission.READ_PASTEBOARD (system_basic on this profile) the
-    // pasteboard service returns an empty PasteData, so explain it once instead
-    // of silently doing nothing.
-    if (!nonTextReadLogged) {
-      nonTextReadLogged = true;
-      hilog.info(DOMAIN, TAG,
-        'clipboard 本机剪贴板无可同步的纯文本（记录数 %{public}d；无 READ_PASTEBOARD 时系统返回空数据）',
-        data.getRecordCount());
-    }
+  const picked = pickLocalPasteText(data);
+  text = normalizeClipboardText(picked.text);
+  if (picked.kind === 'none') {
+    // No record carried usable text (a browser copy is not guaranteed to be a
+    // text/plain record), or the read was refused: without
+    // ohos.permission.READ_PASTEBOARD (system_basic on this profile) the
+    // pasteboard service returns an empty PasteData. Report the record shapes
+    // once per shape instead of doing nothing silently.
+    logUnusablePasteData(data);
     noteClipRead(readUs, 0);
     return;
   }
-  const record = data.getRecordAt(0);
-  if (record.mimeType !== pasteboard.MIMETYPE_TEXT_PLAIN) {
-    noteClipRead(readUs, 0);
-    return;
-  }
-  text = normalizeClipboardText(record.plainText);
-  noteClipRead(readUs, utf8Length(text));
-  lastReadBytesDiag = utf8Length(text);
+  const bytes = utf8Length(text);
+  noteClipRead(readUs, bytes);
+  lastReadBytesDiag = bytes;
   lastReadFailure = '';
-  nonTextReadLogged = false;
+  if (picked.kind !== 'plain') {
+    logNonPlainPasteSource(picked, bytes);
+  }
   if (baselinePending) {
     // First read after the module starts: this is the clipboard as it already
     // was, not a user copy, so it must not be pushed to the sessions.
@@ -1318,5 +1418,6 @@ export function clipboardReset(): void {
   lastTruncatedOriginalBytes = 0;
   lastTruncatedSentBytes = 0;
   lastReadFailure = '';
-  nonTextReadLogged = false;
+  lastUnusableReadSignature = '';
+  lastNonPlainSourceSignature = '';
 }
