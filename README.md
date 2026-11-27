@@ -2,15 +2,15 @@
 
 **HarmonyOS 上的原生 VNC / RDP 远程桌面客户端。**
 
-GPL-3.0-or-later · 当前版本 1.0.0 · API 26+ · 包内支持手机 / 平板 / PC（2in1），首发上架仅 PC/2in1
+GPL-3.0-or-later · 当前版本 1.1.0 · API 26+ · 包内支持手机 / 平板 / PC（2in1）；1.0.0 上架只勾 PC/2in1，1.1.0 起纳入手机与平板
 
 ![天关的连接列表](docs/store/screenshots/pc-01-main.png)
 
 天关把每个远程会话做成一个独立窗口，从 Dock 或系统窗口选择器直接切换，主窗口只负责连接管理。它连接运行 VNC 或 RDP 服务的主机，包括 Windows、Linux 与树莓派。
 
-画面经原生 EGL/GLES 渲染，不经过 WebView。VNC 已在鸿蒙 PC 与手机验证，RDP 已在鸿蒙 PC 验证。1.0.0 已提交应用市场审核，尚未上架，也还没有预编译安装包。
+画面经原生 EGL/GLES 渲染，不经过 WebView。VNC 已在鸿蒙 PC 与手机验证，RDP 已在鸿蒙 PC 验证。1.0.0 已上架 AppGallery；仓库不提供预编译安装包。
 
-Tianguan (TG) is a native VNC and RDP client for HarmonyOS. Its name comes from a star gate in the *Jin Shu* (Book of Jin). The first release targets PC and 2-in-1 devices only; it is an independent community project, not affiliated with or endorsed by Huawei.
+Tianguan (TG) is a native VNC and RDP client for HarmonyOS. Its name comes from a star gate in the *Jin Shu* (Book of Jin). The 1.0.0 release targets PC and 2-in-1 devices only; 1.1.0 adds phone and tablet support. It is an independent community project, not affiliated with or endorsed by Huawei.
 
 ## 功能
 
@@ -50,7 +50,7 @@ RDP 经 rdpsnd 输出 PCM 音频，实测 44.1 kHz 立体声；VNC 协议不包�
 
 ## 当前状态
 
-1.0.0 已覆盖安装到 PC 与手机（`install -r`，连接与密钥库保留）；PC 上 VNC 与 RDP、手机上 VNC 各一条连接均已复测连通。已提交 AppGallery 审核，状态为审核中（2026-11-05）；发布证书与 Profile 已办，APP 备案尚未办理。首发仅 PC/2in1 时不申请软著，以后加入手机再办。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+1.0.0 已覆盖安装到 PC 与手机（`install -r`，连接与密钥库保留）；PC 上 VNC 与 RDP、手机上 VNC 各一条连接均已复测连通。1.0.0 已上架 AppGallery（2026-11-27 用户确认在架，记录日期 2026-11-05）。1.1.0（versionCode 110）的本地发版材料已备：版本号已写入 `app/AppScope/app.json5` 与 `app/build-profile.json5`（两处必须同改，product 覆盖 `app.json5`），CHANGELOG 已增补；发布证书与 Profile 已办，发布签名包 `.work/release/app-default-signed.app` 已产出并通过 `hap-sign-tool verify-app` 验签；尚未提审。本次计划把手机与平板纳入同一应用的「支持设备」：包内 `deviceTypes` 一直是 `phone/tablet/2in1`，纳入手机/平板不需要改包、不需要重建包配置，只需在 AGC 勾选。APP 备案办理中（2026-11-27 用户确认）。版权材料按 2026-11-27 核实的口径：AGC 勾「手机」后，版本信息里的「应用版权证书或代理证书」在发布范围含中国大陆时必选，该栏接受《免责函》《计算机软件著作权登记证书》《APP电子版权认证证书》《软件著作权认证证书》，须在提审前备妥其中一种；官方未给「可后补/承诺」通道，且该栏必选的说法与《应用资质审核要求》80301 把软著列为「非必选资质」存在冲突，建议提审前用 AGC 工单确认《免责函》/《APP电子版权认证证书》能否满足该栏。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 已验证：
 
@@ -75,7 +75,7 @@ RDP 经 rdpsnd 输出 PCM 音频，实测 44.1 kHz 立体声；VNC 协议不包�
 
 - 非华为官方项目，与华为没有隶属、背书或合作关系。
 - 不是远程桌面服务端：目标主机需自行运行 VNC 或 RDP 服务。
-- 包内只有手机、平板与 PC（2in1），不含智慧屏；首发上架仅 PC/2in1。
+- 包内只有手机、平板与 PC（2in1），不含智慧屏；1.0.0 上架只勾 PC/2in1，1.1.0 起按手机 + 平板 + PC/2in1 勾选。设备类型只能增不能减：应用一旦发布，升级只能增加设备类型，不能删除已选设备。
 - 不支持 H.265/HEVC：RDP 的 GFX 协议只定义 AVC，没有该编码。
 
 ## 构建
