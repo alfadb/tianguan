@@ -2,6 +2,20 @@ export const runDiagnostics: () => Promise<string>;
 export const runNetworkTest: (filesDir: string) => Promise<string>;
 
 // Multi-session API (docs/napi-contract.md).
+// createSession() accepts protocol="vnc" (default) | "rdp" | "sunshine".
+// Sunshine/Moonlight options (only honoured for protocol="sunshine"):
+//   sunshineStateDir  required app-sandbox absolute path (client identity and
+//                     the pinned server certificate live there); when missing
+//                     the session starts and fails with state=failed,
+//                     errorCode="protocol" and an error naming the directory.
+//   sunshineApp       /applist title to launch (case-insensitive substring
+//                     match; first app when nothing matches). Default "Desktop".
+//   sunshineWidth / sunshineHeight / sunshineFps / sunshineBitrate
+//                     Default 1280 / 720 / 60 / 5000 (kbps).
+//   sunshineFormats   optional "h264,hevc"; empty = H.264 plus HEVC when the
+//                     device has a hardware HEVC decoder.
+//   sunshineEncryption optional; "none" disables Moonlight stream encryption
+//                     (ENCFLG_NONE), anything else keeps ENCFLG_ALL.
 export const createSession: (optionsJson: string) => string;
 // closeSession() is non-blocking: it detaches the session and returns CLOSED
 // while a background reaper joins the thread. pendingCloses() reports how many
@@ -18,6 +32,14 @@ export const reconnectSession: (sessionId: string) => string;
 // presents now; the user must confirm again and the UI then saves it and calls
 // reconnectSession(). Returns "OK" or "INVALID_SESSION". Never trusts anything.
 export const forgetTrustedFingerprint: (sessionId: string) => string;
+// Sunshine/Moonlight only: hands the 4-digit PIN shown by the server's web page
+// to a session whose sessionStatus().state is "pairing-required". Synchronous
+// boolean: true when the PIN was accepted into that session's slot (the backend
+// takes it once and then clears it), false for an unknown / non-Sunshine
+// session, a session that is not waiting for a PIN, or a value that is not
+// exactly 4 ASCII digits. The PIN is never logged and never appears in the
+// status JSON.
+export const submitPin: (sessionId: string, pin: string) => boolean;
 // RDP only: set the remote CapsLock/NumLock toggle state to the given absolute
 // values through the Client Synchronize Event (Sync PDU). The key events
 // themselves are not forwarded on RDP. VNC is a no-op. Returns "OK" or

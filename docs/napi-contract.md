@@ -20,37 +20,63 @@
 | `sessionStatus(sessionId: string): string` | 返回该会话状态 JSON。 |
 | `reconnectSession(sessionId: string): string` | 立即重连，`generation` 递增。`state=trust-required` 调用时把已展示的 `fingerprint` 记为信任锚。 |
 | `forgetTrustedFingerprint(sessionId: string): string` | 清空该会话的 `expectedPin` 与 `fingerprint`，并按与 `reconnectSession` 相同的逻辑立即重连（`generation` 递增）。返回 `OK` / `INVALID_SESSION`。 |
+| `submitPin(sessionId: string, pin: string): boolean` | **Sunshine/Moonlight 专用**：把服务端网页上显示的 4 位 PIN 交给处于 `state=pairing-required` 的会话（只接受一次，后端取走即清）。`true` = 已放入该会话的 PIN 槽；`false` = 会话不存在 / 不是 Sunshine / 当前不在 `pairing-required` / 不是 4 位数字。PIN 不进日志、不进状态 JSON。 |
 
 `optionsJson` 字段：
 
 ```json
 { "host": "192.168.50.62", "port": 5901,
-  "protocol": "rdp",          // 可选，"vnc"（缺省）| "rdp"
+  "protocol": "rdp",          // 可选，"vnc"（缺省）| "rdp" | "sunshine"
   "username": "…",            // 可选，仅 RDP
   "domain": "…",              // 可选，仅 RDP，可空
   "password": "…",            // 可选，短生命周期，不落盘、不入日志
   "expectedFingerprint": "…", // 可选，来自信任库；VNC 与 RDP 都使用
   "security": "None",         // 可选，默认 "RA2_256,RA2"；仅 VNC
-  "name": "测试机" }
+  "name": "测试机",
+  // 以下仅在 protocol="sunshine" 时生效
+  "sunshineStateDir": "/data/storage/el2/base/files/sunshine",
+  "sunshineApp": "Desktop",   // 可选，默认 "Desktop"
+  "sunshineWidth": 1280, "sunshineHeight": 720, "sunshineFps": 60,
+  "sunshineBitrate": 20000,   // 可选，默认 1280/720/60/20000（bitrate 单位 kbps）
+  "sunshineFormats": "h264,hevc", // 可选，缺省按设备硬解能力自动
+  "sunshineEncryption": "none" }  // 可选，默认 ENCFLG_ALL；"none" 关闭
 ```
 
-`protocol` 选择原生后端：缺省或 `"vnc"` 走 RFB，`"rdp"` 走 FreeRDP。`username`/`domain` 只在 RDP 下有意义（`domain` 可空），用于 RDP 登录；VNC 忽略这两个字段。RDP **必须**带 `password`（没有「无需密码」语义）。`security`（RFB 安全类型）只用于 VNC。`expectedFingerprint` 两种协议都用于服务端证书指纹固定：VNC 是 RA2 指纹，RDP 是服务端 X.509 证书的 SHA-256 指纹（小写、字节间用 `-` 连接，如 `84-64-…`）；RDP 首次连接（该字段为空）会以 `state=trust-required` 结束本次尝试并带出 `fingerprint`，不自动重试，界面确认后由 `reconnectSession` 重连，后续连接必须带该 pin。RDP 与 VNC 复用同一套会话状态（`connecting`/`connected`/`failed`/`reconnecting` 等）与 `errorCode`（`auth-failed`/`fingerprint-mismatch`/`protocol`/`network`；RDP 另有 `session-taken-over`），因此界面的失败提示与密码重输流程对两种协议一致。
+`protocol` 选择原生后端：缺省或 `"vnc"` 走 RFB，`"rdp"` 走 FreeRDP，`"sunshine"` 走 Moonlight（Sunshine 服务端）。`username`/`domain` 只在 RDP 下有意义（`domain` 可空），用于 RDP 登录；VNC 与 Sunshine 忽略这两个字段。RDP **必须**带 `password`（没有「无需密码」语义）。`security`（RFB 安全类型）只用于 VNC。`expectedFingerprint` 两种协议都用于服务端证书指纹固定：VNC 是 RA2 指纹，RDP 是服务端 X.509 证书的 SHA-256 指纹（小写、字节间用 `-` 连接，如 `84-64-…`）；RDP 首次连接（该字段为空）会以 `state=trust-required` 结束本次尝试并带出 `fingerprint`，不自动重试，界面确认后由 `reconnectSession` 重连，后续连接必须带该 pin。RDP 与 VNC 复用同一套会话状态（`connecting`/`connected`/`failed`/`reconnecting` 等）与 `errorCode`（`auth-failed`/`fingerprint-mismatch`/`protocol`/`network`；RDP 另有 `session-taken-over`），因此界面的失败提示与密码重输流程对两种协议一致。
+
+### Sunshine/Moonlight
+
+- `sunshineStateDir` 是**必填**的客户端状态目录（应用沙箱绝对路径）：客户端证书/私钥、uniqueid、以及配对后固定的服务端证书与指纹都落在这里。**缺失时 `createSession` 仍然成功**，会话以 `state=failed`、`errorCode="protocol"` 出现，`error` 说明缺少状态目录（界面需要一个会话才能展示这条错误；`createSession` 直接返回 `ERROR:` 的路径无法显示在会话列表里）。
+- `port` 对 Sunshine 是**明文 HTTP（nvhttp）端口**（Sunshine 默认 47989）。HTTPS 端口默认取 `port - 5`（即 47984）；若按该端口探测 HTTPS 失败、且 `/serverinfo` 公布了不同的 `HttpsPort`，则改用服务端公布的值重建客户端再探；RTSP 端口由 `/launch` 的 `sessionUrl0` 决定。
+- `sunshineApp` 与 `/applist` 的标题做**不区分大小写的包含匹配**，找不到就用第一个应用；实际启动的标题通过状态 JSON 的可选字段 `app` 回传。
+- `sunshineWidth`/`sunshineHeight`/`sunshineFps`/`sunshineBitrate` 默认 1280/720/60/20000 kbps，即 `/launch` 的 `mode=WxHxFPS`。默认码率取 20000 是因为 Moonlight 只有在视频码率 ≥ 15000 kbps（common-c `Limelight-internal.h` 的 `HIGH_AUDIO_BITRATE_THRESHOLD`）时才请求高音质音频（每声道 256 kbps，否则 96 kbps）。
+- `sunshineFormats` 缺省时自动选择：H.264 恒有；HEVC 需要设备有 `video/hevc` 硬解**且**服务端 `/serverinfo` 声明支持（否则协商会失败）。显式给出时按给定值（`h264` / `hevc`，`h265` 为 `hevc` 的别名）。
+- `sunshineEncryption` 缺省为 `ENCFLG_ALL`（音视频都加密）；传 `"none"` 时关成 `ENCFLG_NONE`（远端输入加密始终开启，无法关闭）。
+- **残留会话**：服务端上一条会话没被取消时，`/launch` 会返回 `status_code=400: An app is already running on this host`（旧版本直接把这条当成「连接已断开」）。现在按 Moonlight 客户端的通行做法处理：`/serverinfo` 的 `state=SUNSHINE_SERVER_BUSY` 且 `currentgame` 等于要启动的应用 ID → 用 `/resume` 接管续播（参数与 `/launch` 相同，服务端上的应用继续跑）；BUSY 但是别的应用 → 先 `/cancel`，每 500ms 轮询 `/serverinfo`、最多 10 秒等服务端回到空闲，再按服务端当时的状态用 `/resume`（仍指向同一应用）或 `/launch`。`/launch` 仍返回 400 且消息含 `already running` 时，再执行一次同样的「cancel → 等空闲 → launch/resume」，只重试一次；`/cancel` 自身失败只记日志，不让会话失败。
+- 停止/关窗（含 `closeSession` 打断会话线程）、`reconnectSession` 换代、对端结束或网络断开，只要本次尝试走到过 `/launch`，都会尽力向服务端发 `/cancel`；进程被杀来不及发的情况由上面的连接时处理兜底。
+- 音频能力位声明 `CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION`：音频实现按 `samplesPerFrame` 解码、支持任意 Opus 帧长；刻意不声明 `CAPABILITY_SLOW_OPUS_DECODER`（服务端会按「解码器很慢」降级帧长/音质，本实现是实时解码，不需要降级）。
+
 
 `security` 是向服务端声明的 RFB 安全类型（逗号分隔）。默认只声明加密的 `RA2_256,RA2`；**服务器若只公布 `None`(1)**，必须显式传 `"None"`，否则握手会以 `No matching security types` 失败。界面在「该服务器无需密码」勾选时传 `None`。RDP 没有对应的「无需密码」选项，界面也不显示该勾选。
 
 ## 状态 JSON
 
 ```json
-{ "id": "s1", "state": "connecting|connected|disconnected|failed|trust-required|reconnecting",
-  "error": "", "errorCode": "none|auth-failed|fingerprint-mismatch|network|protocol|session-taken-over",
+{ "id": "s1", "state": "connecting|connected|disconnected|failed|trust-required|reconnecting|pairing-required",
+  "error": "", "errorCode": "none|auth-failed|fingerprint-mismatch|network|protocol|session-taken-over|pair-failed",
   "width": 1920, "height": 1200, "generation": 3,
   "version": 118, "cursor": {"w":16,"h":23,"hotX":2,"hotY":0,"blank":false,"version":4},
   "clipboard": { "version": 7 },
   "retryInMs": 4000, "fingerprint": "84-64-…", "pixelBytes": 9216000,
-  "resizeSupport": "unknown" }
+  "resizeSupport": "unknown",
+  "pairing": { "host": "192.168.50.62", "appVersion": "7.1.431.-1" },
+  "app": "Desktop" }
 ```
 
 - `state=trust-required` 时附带 `fingerprint`，界面据此展示确认；确认写入 ArkTS 侧信任库后由界面调用 `reconnectSession`。
+- `state=pairing-required`（Sunshine 专用）时附带 `pairing: {host, appVersion}`：会话正在等界面把服务端网页上显示的 4 位 PIN 用 `submitPin()` 提交上来。它是「等用户动作」的状态（与 `trust-required` 同级），不是失败；关窗/停止/`closeSession` 都能打断它。
+- `errorCode=pair-failed`（Sunshine 专用）表示上一次配对失败：正常重试路径（PIN 错误 / 网页端超时）下会话回到 `state=pairing-required`，`error` 带服务端消息，界面重新调用 `submitPin()` 即可再试；外层 `PairError` 兜底分支也可能以 `state=reconnecting` + `pair-failed` 出现，界面不应假定两者绑定。连续两次传输层失败会转为 `state=failed` + `errorCode="network"`。
+- `app`（Sunshine 专用，可选）是 `/applist` 实际匹配并启动的应用标题；没有匹配时会回退到第一个应用，与请求的 `sunshineApp` 可能不同。
 - `state=failed` 且 `errorCode=fingerprint-mismatch` 时也附带当前观测到的 `fingerprint`（VNC 与 RDP 一致）：它是本次连接中服务端实际出示的指纹，供界面与已信任值对比展示。
 - `errorCode` 是枚举；`error` 只用于辅助显示。指纹不一致时 `error` 统一为「服务端指纹与已信任值不一致，已拒绝连接」。
 - `errorCode=session-taken-over` 只出现在 RDP：同一 Windows 账号已有另一个远程会话，服务端用 `ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION` 结束了本连接（连接阶段或已连接之后都可能发生）。会话为 `state=failed`，且原生后端**不会自动重连**——自动重连会反过来顶掉另一个窗口，形成两个会话互相接管、最终远端会话不可用的循环。`error` 固定为「该账号的远程会话已被其它连接接管：同一 Windows 账号只允许一个远程会话」，界面提示后由用户手动调用 `reconnectSession`。
@@ -65,6 +91,21 @@ forgetTrustedFingerprint(sessionId: string): string
 - **同步**返回。会话存在时：清空该会话的期望指纹 `expectedPin` 与已观测指纹 `fingerprint`，然后触发一次与 `reconnectSession` 等价的重连（`generation` 递增，正在退避或等待确认的重连立即进行）。下一次连接因没有期望指纹而停在 `state=trust-required`，并带回当前观测到的服务端指纹，由用户再次确认。返回 `OK`；会话不存在返回 `INVALID_SESSION`。
 - 对处于 `failed` / `trust-required` / `connected` / `connecting` 等任何状态的会话都允许调用；清 pin 后一律按重连处理。
 - **安全含义**：它只让会话重新展示服务端当前出示的指纹，不自动信任任何指纹，也不读写 ArkTS 侧信任库文件。真正建立信任仍必须由用户在界面上确认、界面写入信任库，再由界面调用 `reconnectSession`（该调用在 `trust-required` 状态下才把当前 `fingerprint` 记为信任锚）。因此它不能把「指纹不一致」直接变成「已连接」。
+
+### Sunshine 配对（PIN）
+
+```
+submitPin(sessionId: string, pin: string): boolean
+```
+
+- **同步**返回。会话必须是 `protocol="sunshine"` 且当前 `state=pairing-required`；PIN 必须是 4 位 ASCII 数字。满足条件时把 PIN 放进该会话的 PIN 槽、唤醒等待中的会话线程并返回 `true`；否则静默返回 `false`（不抛错，不改变状态）。
+- PIN 只被后端取走**一次**，取走后立即清空；它不进日志、不进状态 JSON、不落盘。离开 `pairing-required`（配对成功、失败重试、停止、重连）都会丢弃槽里的 PIN。
+- 典型流程：`sessionStatus` 看到 `state=pairing-required` → 界面提示用户打开服务端网页（Sunshine 首页）读取 4 位 PIN → 用户输入 → `submitPin(sessionId, pin)`。PIN 正确后会话自动进入 `/applist` → `/launch` → `connected`，不需要 `reconnectSession`。
+- PIN 错误或网页端在 5 分钟内没提交：会话回到 `state=pairing-required`，带 `errorCode="pair-failed"` 与服务端消息（如「PIN 错误」/「网页端未在 300 秒内提交 PIN」），界面可以让用户重新输入，**不需要**重连。
+- 服务端证书与配对时固定的指纹不一致（`PinMismatchError`）：`state=failed` + `errorCode="fingerprint-mismatch"`，`error` 说明需要重新配对；会话不会自动重试，由用户处理（当前版本没有通过 NAPI 清除 Sunshine pin 文件的入口）。
+- 配对成功后服务端证书与指纹由 native 侧落盘在 `sunshineStateDir`，不经过 ArkTS 信任库；`expectedFingerprint`/`forgetTrustedFingerprint` 只作用于 VNC/RDP 的信任锚，对 Sunshine 无效。
+- 连接建立后断线：会话进入 `state=reconnecting` + `errorCode="network"` 并按 1s/2s/4s 退避自动重连（每次重连重新走 `/serverinfo` → `/launch`）；`connected` 期间收到 `generation` 变化（`reconnectSession`）会立即拆流重连。
+- 视频用 OHOS AVCodec 硬解（NV12→BGRA 后走与 RDP 相同的 `resizeFrame`/`commitFrame` 帧提交），音频用 libopus 多流解码 + `OH_AudioRenderer` 播放；`width`/`height` 按协商到的流分辨率出现在状态里，`takeFrame` 交付解码后的 BGRA 帧。
 
 ## 画面
 

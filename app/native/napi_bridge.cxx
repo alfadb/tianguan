@@ -284,6 +284,25 @@ napi_value ForgetTrustedFingerprint(napi_env env, napi_callback_info info) {
     return MakeString(env, "INVALID_SESSION");
   return MakeString(env, tianguan::forgetTrustedFingerprint(id));
 }
+// submitPin(sessionId, pin): Sunshine only. Hands the 4-digit PIN shown by the
+// server's web page to the session currently in state=pairing-required. True
+// when the PIN was accepted; false for an unknown / non-Sunshine session, one
+// that is not waiting for a PIN, or a value that is not exactly 4 digits. The
+// PIN is handed over once and is never logged or exposed in the status JSON.
+napi_value SubmitPin(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  std::string id;
+  std::string pin;
+  bool accepted = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok &&
+      argc >= 2 && GetStringArg(env, argv[0], 256, id) &&
+      GetStringArg(env, argv[1], 32, pin))
+    accepted = tianguan::submitPin(id, pin);
+  napi_value result = nullptr;
+  if (napi_get_boolean(env, accepted, &result) != napi_ok) return nullptr;
+  return result;
+}
 // syncRemoteLockState(sessionId, capsLock, numLock): absolute RDP lock-state
 // sync; VNC is a no-op. Returns "OK" or "INVALID_SESSION".
 napi_value SyncRemoteLockState(napi_env env, napi_callback_info info) {
@@ -475,6 +494,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"listSessions", nullptr, ListSessions, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"reconnectSession", nullptr, ReconnectSession, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"forgetTrustedFingerprint", nullptr, ForgetTrustedFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"submitPin", nullptr, SubmitPin, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"syncRemoteLockState", nullptr, SyncRemoteLockState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -486,7 +506,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 28, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 29, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

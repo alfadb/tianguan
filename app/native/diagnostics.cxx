@@ -9,6 +9,12 @@
 // defines nothing, so this include (and every RDP reference below) is absent.
 #include "rdp_backend.h"
 #endif
+#if defined(TIANGUAN_WITH_SUNSHINE)
+// Sunshine/Moonlight backend bridge. Like RDP it is OHOS-only (it links
+// moonlight-common-c and the static OpenSSL prefix); without the macro
+// sessionMain() reports the missing backend instead of running the VNC loop.
+#include "sunshine_backend.h"
+#endif
 #include <rfb/CConnection.h>
 #include <rfb/CMsgWriter.h>
 #include <rfb/CSecurityRSAAES.h>
@@ -24,6 +30,7 @@
 #include <os/Mutex.h>
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +51,7 @@
 #include <vector>
 #include <jpeglib.h>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -871,7 +879,11 @@ enum SessionPhase {
   PhaseDisconnected,
   PhaseFailed,
   PhaseTrustRequired,
-  PhaseReconnecting
+  PhaseReconnecting,
+  // Sunshine only: the session is waiting for the user to type the 4-digit PIN
+  // shown by the server's web page. It is a "waiting for the user" state like
+  // trust-required, not a failure; closing/stopping still tears it down.
+  PhasePairingRequired
 };
 
 const char* phaseName(int phase) {
@@ -882,6 +894,7 @@ const char* phaseName(int phase) {
     case PhaseFailed: return "failed";
     case PhaseTrustRequired: return "trust-required";
     case PhaseReconnecting: return "reconnecting";
+    case PhasePairingRequired: return "pairing-required";
   }
   return "failed";
 }
@@ -1179,11 +1192,33 @@ struct SessionState {
   // "no password" connection passes "None", which is the only way to talk to a
   // server that advertises nothing but None (type 1).
   std::string securityTypes = "RA2_256,RA2";
+  // Sunshine/Moonlight options. Set once by launchSession() before the session
+  // thread starts, so the session loop may read them without the meta lock.
+  // sunshineStateDir is the app-sandbox absolute path holding the client
+  // identity and the pinned server certificate; missing -> failed/protocol.
+  std::string sunshineStateDir;
+  std::string sunshineApp = "Desktop";
+  int sunshineWidth = 1280;
+  int sunshineHeight = 720;
+  int sunshineFps = 60;
+  // 20000 kbps：Moonlight 只在视频码率 >= common-c 的
+  // HIGH_AUDIO_BITRATE_THRESHOLD（15000 kbps）时才请求高音质音频
+  // （每声道 256 kbps，否则 96 kbps），5000 会让声音明显发闷。
+  int sunshineBitrate = 20000;
+  std::string sunshineFormats;     // "h264,hevc"; empty = auto by HW decoder
+  bool sunshineEncryption = true;  // false = ENCFLG_NONE
 
   std::mutex meta;   // phase/error/retry/generation decisions
   std::mutex input;  // queued input + release epoch + pending lock sync
   std::mutex pix;    // framebuffer mirror, region, cursor, versions
   std::mutex clip;   // clipboard text
+  // Sunshine PIN slot: submitPin() stores one 4-digit PIN here and wakes the
+  // backend thread blocked in waitForPin(); the backend takes it exactly once
+  // and wipes it. It is never logged and never part of the status JSON.
+  std::mutex pin;  // pendingPin + hasPendingPin
+  std::condition_variable pinCv;
+  std::string pendingPin;      // pin
+  bool hasPendingPin = false;  // pin
   // Client-initiated desktop resize. The NAPI thread only records the size; the
   // session thread is the only one that writes the request (VNC
   // CMsgWriter::writeSetDesktopSize / RDP SendMonitorLayout). At most one
@@ -1210,8 +1245,13 @@ struct SessionState {
   bool connected;           // meta
   std::string error;        // meta, always a single line
   std::string errorCode;    // meta: none|auth-failed|fingerprint-mismatch|network|
-                            //       protocol|session-taken-over (RDP only)
+                            //       protocol|session-taken-over (RDP only)|
+                            //       pair-failed (Sunshine only)
   std::string fingerprint;  // meta
+  // Sunshine: /serverinfo appversion reported with state=pairing-required, and
+  // the /applist title that was actually launched (additive status fields).
+  std::string pairingAppVersion;  // meta
+  std::string appTitle;           // meta
 
   std::deque<QueuedInput> inputs;  // input
   // syncRemoteLockState(): newest absolute CapsLock/NumLock state for RDP.
@@ -1359,6 +1399,14 @@ void setPhase(SessionState& state, int phase, const std::string& error,
   state.retryInMs = retryInMs;
   state.connected = (phase == PhaseConnected);
   state.running = (phase == PhaseConnected);
+  // A PIN only ever belongs to a pairing-required phase: leaving that phase
+  // drops the slot, so a late submitPin() can never be reused by a later
+  // attempt. Lock order is meta -> pin (waitForPin()/submitPin() take only pin).
+  if (phase != PhasePairingRequired) {
+    std::lock_guard<std::mutex> pinLock(state.pin);
+    wipeString(state.pendingPin);
+    state.hasPendingPin = false;
+  }
 }
 
 // TigerVNC keeps one CConnection per client. This subclass only owns the
@@ -2810,6 +2858,349 @@ void runRdpSession(const std::shared_ptr<SessionState>& state) {
 
 #endif  // TIANGUAN_WITH_RDP
 
+// ---------------------------------------------------------------------------
+// Sunshine bridge (only compiled into the OHOS target, TIANGUAN_WITH_SUNSHINE)
+//
+// sunshine_backend.cxx owns the whole attempt: identity, /serverinfo, /pair,
+// /applist, /launch and the common-c stream. These adapters translate its
+// callbacks into SessionState writes with exactly the invariants of the RDP
+// adapters above:
+//   * setPhase / beginAttempt / sleepUnlessStopped / waitForReconnect are the
+//     same helpers the RDP path uses;
+//   * resizeFrame / commitFrame mirror rdpResizeFrame / rdpCommitFrame (same
+//     BGRA mirror, same delivery union, same generation guard). They are
+//     duplicated rather than factored out so the RDP/VNC code stays untouched;
+//   * waitForPin is the only new interaction: it waits on the session's PIN
+//     slot until submitPin() fills it, the generation changes or stop is set.
+// Every one of these functions only takes one short-lived session lock, so they
+// are safe from the backend's own input thread and from common-c's callback
+// threads (the backend never calls them from a thread that holds another lock).
+// ---------------------------------------------------------------------------
+#if defined(TIANGUAN_WITH_SUNSHINE)
+
+// The adapter passes SunshinePhase values straight to setPhase(), so the two
+// enums must stay numerically identical (pairing-required is the new value).
+static_assert(static_cast<int>(PhaseConnecting) ==
+                  static_cast<int>(tianguan::SunshinePhaseConnecting),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhaseConnected) ==
+                  static_cast<int>(tianguan::SunshinePhaseConnected),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhaseDisconnected) ==
+                  static_cast<int>(tianguan::SunshinePhaseDisconnected),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhaseFailed) ==
+                  static_cast<int>(tianguan::SunshinePhaseFailed),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhaseTrustRequired) ==
+                  static_cast<int>(tianguan::SunshinePhaseTrustRequired),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhaseReconnecting) ==
+                  static_cast<int>(tianguan::SunshinePhaseReconnecting),
+              "Sunshine phase mapping changed");
+static_assert(static_cast<int>(PhasePairingRequired) ==
+                  static_cast<int>(tianguan::SunshinePhasePairingRequired),
+              "Sunshine phase mapping changed");
+
+bool sunshineHostStopRequested(void* user) {
+  return static_cast<SessionState*>(user)->stop.load();
+}
+
+int sunshineHostGeneration(void* user) {
+  return static_cast<SessionState*>(user)->generation.load();
+}
+
+// A manual reconnect must act exactly like it does on the RDP path: reconnect
+// now, and drop a PIN that belonged to the previous generation.
+int sunshineHostBeginAttempt(void* user, int* lastApplied) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  state.forceReconnect = false;
+  {
+    std::lock_guard<std::mutex> lock(state.pin);
+    wipeString(state.pendingPin);
+    state.hasPendingPin = false;
+  }
+  return beginAttempt(state, *lastApplied);
+}
+
+void sunshineHostSetPhase(void* user, int phase, const char* error,
+                          const char* errorCode, int retryInMs) {
+  setPhase(*static_cast<SessionState*>(user), phase,
+           error != nullptr ? error : "",
+           errorCode != nullptr ? errorCode : "none", retryInMs);
+}
+
+bool sunshineHostSleepUnlessStopped(void* user, int milliseconds) {
+  return sleepUnlessStopped(*static_cast<SessionState*>(user), milliseconds);
+}
+
+void sunshineHostWaitForReconnect(void* user) {
+  waitForReconnect(*static_cast<SessionState*>(user));
+}
+
+// pairing-required: block until submitPin() hands over a 4-digit PIN. The wait
+// is stop- and generation-aware (100 ms poll plus a condition-variable wake), so
+// closing the window or reconnecting never leaves this stuck.
+bool sunshineHostWaitForPin(void* user, int generation, std::string* pin) {
+  if (pin == nullptr) return false;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::unique_lock<std::mutex> lock(state.pin);
+  while (!state.stop.load() && state.generation.load() == generation) {
+    if (state.hasPendingPin) {
+      pin->swap(state.pendingPin);
+      state.hasPendingPin = false;
+      return true;
+    }
+    state.pinCv.wait_for(lock, std::chrono::milliseconds(100));
+  }
+  return false;
+}
+
+void sunshineHostSetAppVersion(void* user, int generation,
+                               const char* appVersion) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.meta);
+  if (state.stop || state.generation.load() != generation) return;
+  state.pairingAppVersion = appVersion != nullptr ? appVersion : "";
+}
+
+void sunshineHostSetAppTitle(void* user, int generation, const char* title) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.meta);
+  if (state.stop || state.generation.load() != generation) return;
+  state.appTitle = title != nullptr ? title : "";
+}
+
+// Same body as rdpResizeFrame(): rebuild the mirror and reset every dirty layer
+// and the consumer baseline so nothing from the old geometry survives.
+void sunshineResizeFrame(void* user, int generation, int width, int height) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return;
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  state.fbWidth = width;
+  state.fbHeight = height;
+  state.full.assign(static_cast<size_t>(width) * height * 4, 0);
+  for (size_t i = 3; i < state.full.size(); i += 4) state.full[i] = 255;
+  state.region.clear();
+  state.updAny = false;
+  state.pendAny = false;
+  state.rectX = 0;
+  state.rectY = 0;
+  state.rectW = 0;
+  state.rectH = 0;
+  state.regionFull = false;
+  state.mirrorComplete = false;
+  state.wantFull = true;
+  state.version++;
+  state.frameGeneration = generation;
+  state.pixEpoch++;
+  state.takenVersion = state.version;
+  state.takenEpoch = state.pixEpoch;
+  // Same contract as RDP: the decoded surface is BGRA_8888 little-endian.
+  state.pfBpp = 32;
+  state.pfDepth = 24;
+  state.pfRedMax = 255;
+  state.pfGreenMax = 255;
+  state.pfBlueMax = 255;
+  state.pfRedShift = 16;
+  state.pfGreenShift = 8;
+  state.pfBlueShift = 0;
+  state.pfBigEndian = false;
+}
+
+// Same body as rdpCommitFrame(): copy every rectangle into the BGRA mirror,
+// then one version bump, pending union and the region copy. Sunshine decodes on
+// its own video thread, but the sink serializes submissions and the pix lock
+// makes one writer at a time impossible to violate. A generation mismatch (the
+// stream was torn down between decode and commit) drops the frame.
+void sunshineCommitFrame(void* user, int generation,
+                         const tianguan::SunshineRect* rects, size_t count,
+                         int width, int height) {
+  if (rects == nullptr || count == 0) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.pix);
+  if (state.stop || state.generation.load() != generation) return;
+  if (state.fbWidth != width || state.fbHeight != height) return;
+  const size_t mirrorBytes = static_cast<size_t>(width) * height * 4;
+  if (state.full.size() < mirrorBytes) return;
+  const bool full = state.wantFull;
+  bool any = false;
+  int ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const tianguan::SunshineRect& rect = rects[i];
+    if (rect.pixels == nullptr || rect.w <= 0 || rect.h <= 0 ||
+        rect.stride < rect.w * 4)
+      continue;
+    const int x = std::max(0, rect.x);
+    const int y = std::max(0, rect.y);
+    const int x1 = std::min(width, rect.x + rect.w);
+    const int y1 = std::min(height, rect.y + rect.h);
+    if (x1 <= x || y1 <= y) continue;
+    const int copyW = x1 - x;
+    const int copyH = y1 - y;
+    const uint8_t* src = rect.pixels +
+                         static_cast<size_t>(y - rect.y) * rect.stride +
+                         static_cast<size_t>(x - rect.x) * 4;
+    for (int row = 0; row < copyH; ++row) {
+      uint8_t* dstRow = &state.full[(static_cast<size_t>(y + row) * width + x) * 4];
+      const uint8_t* srcRow = src + static_cast<size_t>(row) * rect.stride;
+      for (int col = 0; col < copyW; ++col) {
+        uint32_t pixel;
+        std::memcpy(&pixel, srcRow + static_cast<size_t>(col) * 4, 4);
+        pixel |= 0xff000000u;
+        std::memcpy(dstRow + static_cast<size_t>(col) * 4, &pixel, 4);
+      }
+    }
+    if (!any) {
+      ux0 = x;
+      uy0 = y;
+      ux1 = x1;
+      uy1 = y1;
+      any = true;
+    } else {
+      ux0 = std::min(ux0, x);
+      uy0 = std::min(uy0, y);
+      ux1 = std::max(ux1, x1);
+      uy1 = std::max(uy1, y1);
+    }
+  }
+  if (!any) return;
+  if (full) {
+    state.region = state.full;
+    state.rectX = 0;
+    state.rectY = 0;
+    state.rectW = width;
+    state.rectH = height;
+    state.regionFull = true;
+    state.mirrorComplete = true;
+    state.pendAny = true;
+    state.pendX0 = 0;
+    state.pendY0 = 0;
+    state.pendX1 = width;
+    state.pendY1 = height;
+    state.wantFull = false;
+  } else {
+    const int rw = ux1 - ux0;
+    const int rh = uy1 - uy0;
+    state.region.resize(static_cast<size_t>(rw) * rh * 4);
+    for (int row = 0; row < rh; ++row) {
+      std::memcpy(&state.region[static_cast<size_t>(row) * rw * 4],
+                  &state.full[(static_cast<size_t>(uy0 + row) * width + ux0) * 4],
+                  static_cast<size_t>(rw) * 4);
+    }
+    state.rectX = ux0;
+    state.rectY = uy0;
+    state.rectW = rw;
+    state.rectH = rh;
+    state.regionFull = false;
+    if (!state.pendAny) {
+      state.pendX0 = ux0;
+      state.pendY0 = uy0;
+      state.pendX1 = ux1;
+      state.pendY1 = uy1;
+      state.pendAny = true;
+    } else {
+      state.pendX0 = std::min(state.pendX0, ux0);
+      state.pendY0 = std::min(state.pendY0, uy0);
+      state.pendX1 = std::max(state.pendX1, ux1);
+      state.pendY1 = std::max(state.pendY1, uy1);
+    }
+  }
+  state.version++;
+  state.frameGeneration = generation;
+}
+
+unsigned sunshinePrepareInput(void* user) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  clearQueuedInputForReconnect(state);
+  return state.releaseEpoch.load();
+}
+
+// Same body as rdpDrainInput(): swap the queue out under the input lock and feed
+// the backend's sink. Clipboard text is dequeued and dropped by the backend
+// (Moonlight has no clipboard channel); the protocol comment lives there.
+void sunshineDrainInput(void* user, const tianguan::SunshineInputSink* sink,
+                        unsigned* appliedRelease) {
+  if (sink == nullptr || appliedRelease == nullptr) return;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::deque<QueuedInput> pending;
+  const unsigned targetRelease = state.releaseEpoch.load();
+  {
+    std::lock_guard<std::mutex> lock(state.input);
+    if (state.inputs.empty() && targetRelease == *appliedRelease) return;
+    pending.swap(state.inputs);
+  }
+  for (std::deque<QueuedInput>::const_iterator it = pending.begin();
+       it != pending.end(); ++it) {
+    if (it->kind == QueuedInput::PointerKind) {
+      if (sink->pointer != nullptr) sink->pointer(sink->ctx, it->a, it->b, it->c);
+    } else if (it->kind == QueuedInput::KeyKind) {
+      if (sink->key != nullptr) sink->key(sink->ctx, it->a, it->b);
+    } else {
+      if (sink->clipboard != nullptr) sink->clipboard(sink->ctx, it->text.c_str());
+    }
+  }
+  if (targetRelease != *appliedRelease) {
+    if (sink->release != nullptr) sink->release(sink->ctx);
+    *appliedRelease = targetRelease;
+  }
+}
+
+// Sunshine equivalent of runRdpSession(): copy the options once, build the
+// bridge, run, then write the same terminal state the VNC/RDP loops write.
+void runSunshineSession(const std::shared_ptr<SessionState>& state) {
+  tianguan::SunshineOptions options;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    options.host = state->host;
+    options.port = state->port;
+    options.stateDir = state->sunshineStateDir;
+    options.app = state->sunshineApp;
+    options.width = state->sunshineWidth;
+    options.height = state->sunshineHeight;
+    options.fps = state->sunshineFps;
+    options.bitrate = state->sunshineBitrate;
+    options.formats = state->sunshineFormats;
+    options.encryption = state->sunshineEncryption;
+  }
+
+  tianguan::SunshineHost bridge;
+  bridge.user = state.get();
+  bridge.stopRequested = sunshineHostStopRequested;
+  bridge.generation = sunshineHostGeneration;
+  bridge.beginAttempt = sunshineHostBeginAttempt;
+  bridge.setPhase = sunshineHostSetPhase;
+  bridge.sleepUnlessStopped = sunshineHostSleepUnlessStopped;
+  bridge.waitForReconnect = sunshineHostWaitForReconnect;
+  bridge.waitForPin = sunshineHostWaitForPin;
+  bridge.setServerAppVersion = sunshineHostSetAppVersion;
+  bridge.setAppTitle = sunshineHostSetAppTitle;
+  bridge.resizeFrame = sunshineResizeFrame;
+  bridge.commitFrame = sunshineCommitFrame;
+  bridge.prepareInput = sunshinePrepareInput;
+  bridge.drainInput = sunshineDrainInput;
+
+  tianguan::runSunshineSession(bridge, options);
+
+  // A PIN typed while the session was closing must not survive it.
+  {
+    std::lock_guard<std::mutex> lock(state->pin);
+    wipeString(state->pendingPin);
+    state->hasPendingPin = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    state->connected = false;
+    state->running = false;
+    state->retryInMs = 0;
+    if (state->phase != PhaseFailed && state->phase != PhaseTrustRequired)
+      state->phase = PhaseDisconnected;
+  }
+}
+
+#endif  // TIANGUAN_WITH_SUNSHINE
+
 // Entry point of one session thread. The VNC body lives in runVncSession() and
 // is unchanged; RDP sessions go to the FreeRDP backend.
 void sessionMain(std::shared_ptr<SessionState> state) {
@@ -2824,6 +3215,29 @@ void sessionMain(std::shared_ptr<SessionState> state) {
     // shared system library and incompatible with the OHOS static prefix).
     // Fail honestly instead of silently running the VNC loop against port 3389.
     setPhase(*state, PhaseFailed, "RDP support is not compiled into this build",
+             "protocol", 0);
+    waitForReconnect(*state);
+    std::lock_guard<std::mutex> lock(state->meta);
+    state->connected = false;
+    state->running = false;
+    state->retryInMs = 0;
+    if (state->phase != PhaseFailed) state->phase = PhaseDisconnected;
+    return;
+  }
+#endif
+  // Sunshine (Moonlight) sessions. The OHOS target compiles in the backend
+  // (identity -> /serverinfo -> /pair -> /applist -> /launch -> common-c);
+  // without TIANGUAN_WITH_SUNSHINE (the host build) fail explicitly instead of
+  // silently running the VNC loop against Sunshine's ports: VNC/RDP ports and
+  // handshakes are entirely different from Sunshine's.
+#if defined(TIANGUAN_WITH_SUNSHINE)
+  if (state->protocol == "sunshine") {
+    runSunshineSession(state);
+    return;
+  }
+#else
+  if (state->protocol == "sunshine") {
+    setPhase(*state, PhaseFailed, "Sunshine support is not compiled into this build",
              "protocol", 0);
     waitForReconnect(*state);
     std::lock_guard<std::mutex> lock(state->meta);
@@ -2932,7 +3346,43 @@ struct SessionOptions {
   std::string expectedPin;
   std::string name;
   std::string securityTypes = "RA2_256,RA2";
+  // Sunshine/Moonlight (protocol == "sunshine").
+  std::string sunshineStateDir;
+  std::string sunshineApp = "Desktop";
+  int sunshineWidth = 1280;
+  int sunshineHeight = 720;
+  int sunshineFps = 60;
+  // 20000 kbps：Moonlight 只在视频码率 >= common-c 的
+  // HIGH_AUDIO_BITRATE_THRESHOLD（15000 kbps）时才请求高音质音频
+  // （每声道 256 kbps，否则 96 kbps），5000 会让声音明显发闷。
+  int sunshineBitrate = 20000;
+  std::string sunshineFormats;
+  bool sunshineEncryption = true;
 };
+
+// Reads an optional integer option. Missing key -> *out untouched (keeps the
+// default). Present but not an integer in [minValue, maxValue] -> false with an
+// "invalid <label>" error, exactly like the existing port validation.
+bool readIntOption(const std::string& json, const char* key, int minValue,
+                   int maxValue, int* out, std::string& error,
+                   const char* label) {
+  if (json.find("\"" + std::string(key) + "\"") == std::string::npos) return true;
+  const std::string text = jsonValue(json, key);
+  size_t used = 0;
+  int value = 0;
+  try {
+    value = std::stoi(text, &used);
+  } catch (...) {
+    error = std::string("invalid ") + label;
+    return false;
+  }
+  if (used != text.size() || value < minValue || value > maxValue) {
+    error = std::string("invalid ") + label;
+    return false;
+  }
+  *out = value;
+  return true;
+}
 
 bool parseSessionOptions(const std::string& json, SessionOptions& options,
                          std::string& error) {
@@ -2968,6 +3418,28 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
       const std::string requested = jsonValue(json, "security");
       if (!requested.empty()) options.securityTypes = requested;
     }
+    // Sunshine/Moonlight options. They are only honoured for
+    // protocol="sunshine", but parsing them unconditionally keeps the error
+    // reporting identical (and harmless) for the other protocols.
+    if (json.find("\"sunshineStateDir\"") != std::string::npos)
+      options.sunshineStateDir = jsonValue(json, "sunshineStateDir");
+    if (json.find("\"sunshineApp\"") != std::string::npos)
+      options.sunshineApp = jsonValue(json, "sunshineApp");
+    if (!readIntOption(json, "sunshineWidth", 1, 4096, &options.sunshineWidth,
+                       error, "sunshine width") ||
+        !readIntOption(json, "sunshineHeight", 1, 4096, &options.sunshineHeight,
+                       error, "sunshine height") ||
+        !readIntOption(json, "sunshineFps", 1, 480, &options.sunshineFps, error,
+                       "sunshine fps") ||
+        !readIntOption(json, "sunshineBitrate", 1, 200000,
+                       &options.sunshineBitrate, error, "sunshine bitrate"))
+      return false;
+    if (json.find("\"sunshineFormats\"") != std::string::npos)
+      options.sunshineFormats = jsonValue(json, "sunshineFormats");
+    if (json.find("\"sunshineEncryption\"") != std::string::npos) {
+      const std::string requested = jsonValue(json, "sunshineEncryption");
+      if (!requested.empty()) options.sunshineEncryption = requested != "none";
+    }
   } catch (const std::exception& failure) {
     error = sanitizeLine(failure.what());
     return false;
@@ -2976,7 +3448,8 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
     error = "invalid host";
     return false;
   }
-  if (options.protocol != "vnc" && options.protocol != "rdp") {
+  if (options.protocol != "vnc" && options.protocol != "rdp" &&
+      options.protocol != "sunshine") {
     error = "unsupported protocol";
     return false;
   }
@@ -3009,6 +3482,53 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
     error = "security types too long";
     return false;
   }
+  // Sunshine/Moonlight. An empty sunshineStateDir is accepted here on purpose:
+  // the session is still created and then fails with errorCode=protocol plus an
+  // `error` that names the missing directory, because the UI needs a session in
+  // order to show that message (createSession() ERROR: strings are not shown in
+  // the session list).
+  if (options.sunshineStateDir.size() > 4096) {
+    error = "sunshine state dir too long";
+    return false;
+  }
+  if (options.sunshineStateDir.find('\0') != std::string::npos) {
+    error = "sunshine state dir contains NUL";
+    return false;
+  }
+  if (!options.sunshineStateDir.empty() && options.sunshineStateDir[0] != '/') {
+    error = "sunshine state dir must be an absolute path";
+    return false;
+  }
+  if (options.sunshineApp.size() > 256) {
+    error = "sunshine app too long";
+    return false;
+  }
+  if (options.sunshineApp.find('\0') != std::string::npos) {
+    error = "sunshine app contains NUL";
+    return false;
+  }
+  if (options.sunshineFormats.size() > 64) {
+    error = "sunshine formats too long";
+    return false;
+  }
+  if (!options.sunshineFormats.empty()) {
+    // "h264" / "hevc" (alias "h265"), comma separated, case insensitive.
+    size_t start = 0;
+    while (true) {
+      size_t end = options.sunshineFormats.find(',', start);
+      if (end == std::string::npos) end = options.sunshineFormats.size();
+      std::string token = options.sunshineFormats.substr(start, end - start);
+      for (size_t i = 0; i < token.size(); ++i)
+        token[i] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(token[i])));
+      if (token != "h264" && token != "hevc" && token != "h265") {
+        error = "unsupported sunshine format";
+        return false;
+      }
+      if (end == options.sunshineFormats.size()) break;
+      start = end + 1;
+    }
+  }
   return true;
 }
 
@@ -3025,6 +3545,14 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   state->expectedPin = options.expectedPin;
   state->profileName = options.name.empty() ? "session" : options.name;
   state->securityTypes = options.securityTypes;
+  state->sunshineStateDir = options.sunshineStateDir;
+  state->sunshineApp = options.sunshineApp;
+  state->sunshineWidth = options.sunshineWidth;
+  state->sunshineHeight = options.sunshineHeight;
+  state->sunshineFps = options.sunshineFps;
+  state->sunshineBitrate = options.sunshineBitrate;
+  state->sunshineFormats = options.sunshineFormats;
+  state->sunshineEncryption = options.sunshineEncryption;
   // Start the thread before publishing the session so closeSession() can never
   // find a session whose thread is still not joinable.
   try {
@@ -3106,6 +3634,7 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   int phase = PhaseFailed;
   int retryInMs = 0;
   std::string error, errorCode, fingerprint;
+  std::string pairingAppVersion, appTitle;
   {
     std::lock_guard<std::mutex> lock(state->meta);
     phase = state->phase.load();
@@ -3113,6 +3642,8 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
     error = state->error;
     errorCode = state->errorCode;
     fingerprint = state->fingerprint;
+    pairingAppVersion = state->pairingAppVersion;
+    appTitle = state->appTitle;
   }
   int width = 0, height = 0, version = 0;
   int cursorW = 0, cursorH = 0, cursorHotX = 0, cursorHotY = 0, cursorVersion = 0;
@@ -3187,7 +3718,18 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   // (requestDesktopSize). "unknown" also means "nothing asked/settled yet".
   out += ",\"resizeSupport\":\"";
   out += resizeSupportName(resizeSupport);
-  out += "\"}";
+  out += "\"";
+  // Additive, Sunshine only: the user action a pairing-required session waits
+  // for. host is the endpoint already shown for the session; appVersion is the
+  // server's /serverinfo appversion (empty until the probe succeeded).
+  if (phase == PhasePairingRequired) {
+    out += ",\"pairing\":{\"host\":\"" + jsonEscape(state->host) +
+           "\",\"appVersion\":\"" + jsonEscape(pairingAppVersion) + "\"}";
+  }
+  // Additive, Sunshine only: the /applist title that was actually launched
+  // (the requested title may match a different app, or none at all).
+  if (!appTitle.empty()) out += ",\"app\":\"" + jsonEscape(appTitle) + "\"";
+  out += "}";
   return out;
 }
 
@@ -3312,6 +3854,14 @@ std::string tianguan::closeSession(const std::string& sessionId) {
   // short polls, and the reaper waits out anything that cannot be interrupted.
   state->sock.interrupt();
   {
+    // A Sunshine backend may be blocked in waitForPin(): drop the slot and wake
+    // it so closing never waits for the PIN poll.
+    std::lock_guard<std::mutex> lock(state->pin);
+    wipeString(state->pendingPin);
+    state->hasPendingPin = false;
+  }
+  state->pinCv.notify_all();
+  {
     std::lock_guard<std::mutex> lock(state->input);
     state->inputs.clear();
   }
@@ -3420,6 +3970,30 @@ std::string tianguan::forgetTrustedFingerprint(const std::string& sessionId) {
   state->fingerprint.clear();
   triggerReconnectLocked(*state);
   return "OK";
+}
+
+// Sunshine only: the PIN the server's web page shows is handed to the session
+// thread blocked in waitForPin(). Validation happens before anything is stored:
+// exactly 4 ASCII digits, an existing Sunshine session, and a session that is
+// actually in pairing-required right now. Everything else is silently ignored
+// (the boolean is the only signal the caller needs).
+bool tianguan::submitPin(const std::string& sessionId, const std::string& pin) {
+  if (pin.size() != 4) return false;
+  for (size_t i = 0; i < pin.size(); ++i) {
+    if (pin[i] < '0' || pin[i] > '9') return false;
+  }
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  if (state->protocol != "sunshine") return false;
+  if (state->phase.load() != PhasePairingRequired) return false;
+  {
+    std::lock_guard<std::mutex> lock(state->pin);
+    state->pendingPin = pin;
+    state->hasPendingPin = true;
+  }
+  // notify outside the lock so a woken waiter cannot immediately block on it.
+  state->pinCv.notify_all();
+  return true;
 }
 
 // Times one takeFrame() call (including calls that return NONE). Declared

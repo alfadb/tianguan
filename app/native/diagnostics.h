@@ -32,6 +32,13 @@ std::string reconnectSession(const std::string& sessionId);
 // It trusts nothing and never touches the ArkTS trust store: the user still has
 // to confirm, and the UI still saves the pin and calls reconnectSession().
 std::string forgetTrustedFingerprint(const std::string& sessionId);
+// Sunshine only: hands the 4-digit PIN shown by the server's web page to the
+// session currently waiting in state=pairing-required. Returns true when the
+// PIN was accepted into that session's slot; false for an unknown / non-
+// Sunshine session, a session that is not waiting for a PIN, or a value that is
+// not exactly 4 digits. The backend takes it once ("PIN 用完即清"); it is never
+// logged and never part of the status JSON.
+bool submitPin(const std::string& sessionId, const std::string& pin);
 // Writes the pending region or a full BGRA_8888 frame into dst. Returns JSON
 // metadata, "NONE" when there is nothing newer than afterVersion, or
 // "ERROR:BUFFER_TOO_SMALL" without touching dst.
