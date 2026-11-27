@@ -85,7 +85,11 @@ import {
   SESSION_ERROR_SESSION_TAKEN_OVER
 } from '../diag/SessionApi';
 import type { CursorInfo, FrameMeta, SessionStatus } from '../diag/SessionApi';
-import { findSession, markWindowOpen, closeSessionById } from '../model/SessionRegistry';
+import {
+  findSession, markWindowOpen, closeSessionById,
+  addSessionsListener, removeSessionsListener, vncEndpointSessionCount
+} from '../model/SessionRegistry';
+import type { SessionsChangeListener } from '../model/SessionRegistry';
 import {
   findConnection, pinKeyFor, readTrustedFingerprint, trustFingerprint
 } from '../model/ConnectionStore';
@@ -501,7 +505,8 @@ const BUBBLE_MENU_DISMISS_TIMEOUT_MS: number = 2000;
 // tablet only the long side is capped at 1920 px, so a portrait screen gets a
 // portrait remote desktop and the screen aspect ratio is preserved. Requests
 // are debounced so a drag does not emit one per frame, and a session stops
-// following for good after a refusal / timeout.
+// following after a refusal (permanent) or a timeout / refused submit (for the
+// current connection generation only).
 const FOLLOW_MAX_WIDTH_PX: number = 1920;
 const FOLLOW_MAX_HEIGHT_PX: number = 1200;
 const FOLLOW_MIN_WIDTH_PX: number = 640;
@@ -510,8 +515,26 @@ const FOLLOW_MIN_HEIGHT_PX: number = 400;
 const FOLLOW_MAX_LONG_SIDE_PX: number = 1920;
 const FOLLOW_MOBILE_MIN_SHORT_SIDE_PX: number = 480;
 const FOLLOW_SETTLE_MS: number = 500;
-const FOLLOW_TIMEOUT_MS: number = 3000;
+// How long a request may take to change the remote size before it counts as "no
+// response". 5 s, not 3: a real RDP server was measured applying a new dynamic
+// resolution 2.94 s after the request (and one sample landed exactly at 3.000 s),
+// so 3 s disabled the follow on a healthy server.
+const FOLLOW_TIMEOUT_MS: number = 5000;
 const FOLLOW_TOLERANCE_PX: number = 2;
+// Reason string for the ONLY disable that outlives a reconnect: the server
+// answered ExtendedDesktopSize / DISPLAY_CONTROL with an outright rejection, a
+// capability verdict a new connection cannot change. Timeouts and refused
+// submits are connection-scoped and are cleared by
+// resetResizeFollowForReconnect().
+const RESIZE_DISABLE_REASON_REJECTED: string = 'resizeSupport=rejected';
+// A timeout / refused submit is NOT a capability verdict: it only burns the one
+// target it was sent for (that target is never retried), and a different window
+// size may well succeed. Only after this many DISTINCT failed targets does the
+// follow stop for the current connection generation, and a reconnect clears the
+// count. p3 real-device runs: a slow RDP apply used 5 s once, and under the old
+// "one failure disables the whole generation" rule the window then ignored every
+// later drag and stayed letterboxed until a reconnect.
+const RESIZE_MAX_FAILED_TARGETS: number = 3;
 
 // --- Fullscreen -------------------------------------------------------------
 // recover() resolves before the window manager has re-laid out the restored
@@ -678,6 +701,10 @@ struct Remote {
   private ownWindow: window.Window | undefined = undefined;
   private windowEventCallback: ((event: window.WindowEventType) => void) | undefined = undefined;
   private windowStatusCallback: ((status: window.WindowStatusType) => void) | undefined = undefined;
+  // Session-registry listener: another window on the same VNC endpoint opening
+  // or closing changes whether this page may request a remote size (see
+  // syncResizePeerState()). Kept as a field so teardown can remove exactly it.
+  private sessionsChangedCallback: SessionsChangeListener | undefined = undefined;
   // --- Fullscreen (per session window) --------------------------------------
   // Whether THIS window is in full screen. It is page state, not a process-wide
   // singleton: every session has its own window and its own Remote page, so
@@ -765,9 +792,10 @@ struct Remote {
   // both replace "最小化" with "主列表" (see bubbleMenuAction()).
   private readonly phoneUi: boolean = deviceInfo.deviceType === 'phone';
   // --- Remote-resolution follow ---------------------------------------------
-  // PC, phone and tablet. resizeDisabled is sticky for this page/window: a
-  // refusal, a timeout or a false return permanently stops automatic requests
-  // here, even across a reconnect (the page instance survives reconnects).
+  // PC, phone and tablet. resizeDisabled stops automatic requests for this
+  // page/window. Whether that outlives a reconnect depends on WHY it stopped
+  // (see disableResizeFollow): a server rejection does, a timeout or a refused
+  // submit does not — a reconnect brings a desktop that may well accept it.
   private readonly followRemoteSize: boolean =
     deviceInfo.deviceType === '2in1' ||
     deviceInfo.deviceType === 'phone' ||
@@ -776,6 +804,15 @@ struct Remote {
   private readonly resizePcForm: boolean = deviceInfo.deviceType === '2in1';
   private readonly resizeForm: string = deviceInfo.deviceType === '2in1' ? 'pc' : 'mobile';
   private resizeDisabled: boolean = false;
+  // Why it stopped ('' while enabled). RESIZE_DISABLE_REASON_REJECTED is
+  // permanent; any other reason is only valid for the connection generation that
+  // produced it.
+  private resizeDisabledReason: string = '';
+  // Distinct targets whose request timed out / was refused during THIS
+  // connection generation (one entry per target, so retrying the same target
+  // never counts twice). Reaching RESIZE_MAX_FAILED_TARGETS disables the follow
+  // for the generation; resetResizeFollowForReconnect() empties it.
+  private resizeFailedTargets: Set<string> = new Set<string>();
   private resizeFollowTimer: number = -1;
   private resizeTimeoutTimer: number = -1;
   private resizePending: boolean = false;
@@ -800,6 +837,19 @@ struct Remote {
   // during settlement can be evaluated once afterwards.
   private resizeWantedW: number = 0;
   private resizeWantedH: number = 0;
+  // True while >= 2 live sessions share this session's VNC desktop. The desktop
+  // size is global and RFB has no multi-client arbitration, so none of those
+  // sessions may request a new size; each window scales its picture locally
+  // instead. Recomputed from the session registry (never guessed) whenever it
+  // changes and right before a request.
+  private resizePeerPaused: boolean = false;
+  // A reconnect (generation bump) puts a NEW remote desktop behind the same
+  // window: resizeRequested* from the old connection is forgotten and the
+  // follow is re-evaluated once after the new generation's first presented
+  // frame (the page-lifetime "first frame" hook never fires a second time).
+  // -1 = not armed; otherwise the render frame count seen at the generation
+  // change.
+  private resizeResyncFrameBase: number = -1;
   private lastTouchX: number = -1;
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
@@ -1007,6 +1057,11 @@ struct Remote {
     // even before the first connection status arrives.
     this.sessionResolved = true;
     this.startPolling();
+    // This page may already be the second window on its VNC endpoint (opened
+    // while this one was still booting): start in the paused state instead of
+    // waiting for the next registry change, before the first frame can ask.
+    this.startSessionsListener();
+    this.syncResizePeerState(false);
   }
 
   /**
@@ -1067,6 +1122,7 @@ struct Remote {
     this.gestureActive = false;
     this.statsGeometryValid = false;
     this.detachWindowEvents();
+    this.stopSessionsListener();
     this.detachRendererSurface('teardown');
     this.dropFramePixels();
     this.releaseCursorPixelMap();
@@ -2213,11 +2269,18 @@ struct Remote {
   // Target = the XComponent surface in PHYSICAL pixels. PC is proportionally
   // scaled down to 1920x1200; phone / tablet keep the screen aspect ratio and
   // only cap the long side at 1920, so a portrait window asks for a portrait
-  // remote desktop. Both round to even numbers. A session that is refused,
-  // times out or whose request is not accepted stops following permanently;
-  // a target is sent at most once, so an approximate server answer cannot
-  // trigger a "few pixels off" loop.
+  // remote desktop. Both round to even numbers. A session that is refused stops
+  // following permanently; one that times out or whose request is not accepted
+  // burns that target and only after RESIZE_MAX_FAILED_TARGETS distinct failures
+  // stops the follow for the current connection generation (a reconnect clears
+  // the count). A target is sent at most once per connection, so an approximate
+  // server answer cannot trigger a "few pixels off" loop.
   // -------------------------------------------------------------------------
+
+  /** Identity of one requested target, used to remember failed sizes. */
+  private static resizeTargetKey(width: number, height: number): string {
+    return width.toString() + 'x' + height.toString();
+  }
 
   /** Target remote size in px, or [] when this session must not request one. */
   private resizeTarget(): number[] {
@@ -2283,6 +2346,14 @@ struct Remote {
     if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
       return;
     }
+    // Read the peer count NOW: the first-frame request of this window and the
+    // second window's registration can be almost simultaneous, so the listener
+    // may not have run since that second session appeared. The count seen at
+    // request time decides; a request already sent is never recalled.
+    this.syncResizePeerState(false);
+    if (this.resizePeerPaused) {
+      return;
+    }
     if (!this.canvasShown || this.lastState !== SESSION_STATE_CONNECTED) {
       return;
     }
@@ -2297,6 +2368,12 @@ struct Remote {
     this.resizeWantedW = targetW;
     this.resizeWantedH = targetH;
     if (this.resizePending) {
+      return;
+    }
+    if (this.resizeFailedTargets.has(Remote.resizeTargetKey(targetW, targetH))) {
+      // This exact size already timed out / was refused on this connection. It
+      // is not retried (only a DIFFERENT window size may try again); the entry
+      // is dropped by a reconnect.
       return;
     }
     if (this.remoteDesktopW <= 0 || this.remoteDesktopH <= 0) {
@@ -2336,7 +2413,7 @@ struct Remote {
         ' prevArea=%{public}dx%{public}d target=%{public}dx%{public}d remote=%{public}dx%{public}d',
         this.sessionId, this.resizeForm, areaW, areaH, prevAreaW, prevAreaH,
         targetW, targetH, beforeW, beforeH);
-      this.disableResizeFollow('requestDesktopSize returned false');
+      this.noteResizeFailure(targetW, targetH, 'requestDesktopSize returned false');
       return;
     }
     this.resizePending = true;
@@ -2357,8 +2434,8 @@ struct Remote {
         return;
       }
       // Final look at the status right at the deadline: the poll runs every
-      // 250 ms and a change landing just before 3 s must not be misread as
-      // "no response".
+      // 250 ms and a change landing just before the deadline must not be misread
+      // as "no response".
       const latest = sessionStatus(this.sessionId);
       if (latest !== undefined && latest.width > 0 && latest.height > 0 &&
           (latest.width !== this.resizeBaselineW || latest.height !== this.resizeBaselineH)) {
@@ -2389,19 +2466,23 @@ struct Remote {
     if (!success) {
       hilog.warn(DOMAIN, TAG,
         'remote resize settle session=%{public}s target=%{public}dx%{public}d before=%{public}dx%{public}d' +
-        ' after=%{public}dx%{public}d verdict=disabled reason=%{public}s',
+        ' after=%{public}dx%{public}d verdict=failed reason=%{public}s',
         this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
         this.resizeBaselineW, this.resizeBaselineH, afterW, afterH, reason);
-      this.disableResizeFollow(reason);
-      return;
+      // Keep following: this counts ONE failed target. The whole generation only
+      // stops after RESIZE_MAX_FAILED_TARGETS distinct failures; the failed
+      // target itself is now in resizeRequested* and is never retried.
+      this.noteResizeFailure(this.resizeRequestedW, this.resizeRequestedH, reason);
+    } else {
+      hilog.info(DOMAIN, TAG,
+        'remote resize settled session=%{public}s target=%{public}dx%{public}d before=%{public}dx%{public}d' +
+        ' after=%{public}dx%{public}d verdict=size-changed',
+        this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
+        this.resizeBaselineW, this.resizeBaselineH, afterW, afterH);
     }
-    hilog.info(DOMAIN, TAG,
-      'remote resize settled session=%{public}s target=%{public}dx%{public}d before=%{public}dx%{public}d' +
-      ' after=%{public}dx%{public}d verdict=size-changed',
-      this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
-      this.resizeBaselineW, this.resizeBaselineH, afterW, afterH);
     // The window may have moved on while the request was in flight. Re-check
-    // the latest target once; the same-target guard still applies.
+    // the latest target once; the same-target guard still applies, so on a
+    // failure only a genuinely different size may send again.
     if (!this.resizeDisabled &&
         (this.resizeWantedW !== this.resizeRequestedW ||
          this.resizeWantedH !== this.resizeRequestedH)) {
@@ -2409,12 +2490,19 @@ struct Remote {
     }
   }
 
-  /** Sticky for this page/window: no further automatic requests. */
+  /**
+   * Stops automatic requests for this window and records why. The reason decides
+   * the lifetime: a server rejection (RESIZE_DISABLE_REASON_REJECTED) is a
+   * capability verdict and is permanent, while the counted timeout / refused
+   * submit failures only cover the connection that produced them and are cleared
+   * when the session reconnects (resetResizeFollowForReconnect).
+   */
   private disableResizeFollow(reason: string): void {
     if (this.resizeDisabled) {
       return;
     }
     this.resizeDisabled = true;
+    this.resizeDisabledReason = reason;
     this.resizePending = false;
     if (this.resizeFollowTimer >= 0) {
       clearTimeout(this.resizeFollowTimer);
@@ -2425,9 +2513,160 @@ struct Remote {
       this.resizeTimeoutTimer = -1;
     }
     hilog.warn(DOMAIN, TAG,
-      'remote resize follow disabled session=%{public}s target=%{public}dx%{public}d remote=%{public}dx%{public}d reason=%{public}s',
+      'remote resize follow disabled session=%{public}s target=%{public}dx%{public}d remote=%{public}dx%{public}d reason=%{public}s lifetime=%{public}s',
       this.sessionId, this.resizeRequestedW, this.resizeRequestedH,
-      this.remoteDesktopW, this.remoteDesktopH, reason);
+      this.remoteDesktopW, this.remoteDesktopH, reason,
+      reason === RESIZE_DISABLE_REASON_REJECTED ? 'permanent' : 'generation');
+  }
+
+  /**
+   * One request timed out or was refused: count it per TARGET and keep following
+   * for now. The failed target is remembered (resizeFailedTargets) and never
+   * retried, but dragging the window to another size tries a fresh one; only
+   * RESIZE_MAX_FAILED_TARGETS distinct failures stop the follow for this
+   * connection generation. That keeps a one-off slow server from freezing the
+   * window until the next reconnect (p3: a single 5 s timeout did exactly that
+   * under the old rule).
+   */
+  private noteResizeFailure(targetW: number, targetH: number, reason: string): void {
+    this.resizeFailedTargets.add(Remote.resizeTargetKey(targetW, targetH));
+    const failures = this.resizeFailedTargets.size;
+    hilog.warn(DOMAIN, TAG,
+      'remote resize attempt failed target=%{public}dx%{public}d reason=%{public}s failures=%{public}d/%{public}d session=%{public}s',
+      targetW, targetH, reason, failures, RESIZE_MAX_FAILED_TARGETS, this.sessionId);
+    if (failures >= RESIZE_MAX_FAILED_TARGETS) {
+      this.disableResizeFollow(reason);
+    }
+  }
+
+  /**
+   * A reconnect (generation bump) is a NEW remote desktop behind the same
+   * window. Forget what was requested for the old one: "a target is sent at most
+   * once" exists to stop pixel-chasing against an approximate server answer, not
+   * to hide the size the new connection came back with (an RDP reconnect can
+   * return to 1920x1200 after the old session asked for 1620x1024; keeping the
+   * old record then leaves the picture letterboxed until the window changes
+   * again). A request still in flight belonged to the dead connection and can
+   * never settle here — waiting for it would end in the timeout and disable the
+   * follow for the generation that is already gone. The multi-session pause is
+   * window state, not connection state, and stays exactly as it is.
+   */
+  private resetResizeFollowForReconnect(generation: number): void {
+    if (!this.followRemoteSize) {
+      return;
+    }
+    // A server rejection is a capability verdict: keep it. A timeout / refused
+    // submit only described the connection that just died (a slow apply can take
+    // 5 s), and a generation-scoped disable is lifted here together with its
+    // failure count: the new connection starts with a clean slate and may ask
+    // once per window size again.
+    if (this.resizeDisabled && this.resizeDisabledReason !== RESIZE_DISABLE_REASON_REJECTED) {
+      hilog.info(DOMAIN, TAG,
+        'remote resize follow re-enabled for reconnect session=%{public}s reason=%{public}s',
+        this.sessionId, this.resizeDisabledReason);
+      this.resizeDisabled = false;
+      this.resizeDisabledReason = '';
+    }
+    this.resizeFailedTargets.clear();
+    this.resizePending = false;
+    if (this.resizeTimeoutTimer >= 0) {
+      clearTimeout(this.resizeTimeoutTimer);
+      this.resizeTimeoutTimer = -1;
+    }
+    this.resizeRequestedW = 0;
+    this.resizeRequestedH = 0;
+    this.resizeBaselineW = 0;
+    this.resizeBaselineH = 0;
+    this.resizeWantedW = 0;
+    this.resizeWantedH = 0;
+    // Arm one re-evaluation for the new generation (fires on its first
+    // presented frame, both render paths).
+    this.resizeResyncFrameBase = this.renderFrames;
+    hilog.info(DOMAIN, TAG,
+      'remote resize follow reset for reconnect session=%{public}s generation=%{public}d',
+      this.sessionId, generation);
+  }
+
+  // -------------------------------------------------------------------------
+  // Two or more windows on the same VNC endpoint.
+  //
+  // A VNC desktop has exactly ONE size. RFB has no multi-client arbitration:
+  // the last accepted request wins and the server broadcasts that size to every
+  // client. So when two windows of the same server are open, each window
+  // requesting its own size just overwrites the other's. The client-side rule
+  // (the same one AnyDesk / TeamViewer / noVNC follow): while two or more live
+  // sessions share the endpoint, NONE of them requests a size and every window
+  // scales the picture it gets; when the count drops back to one, the remaining
+  // window follows again. RDP is untouched: its sessions count 0 here (a second
+  // RDP session for one account is already forbidden by the connection list).
+  // -------------------------------------------------------------------------
+
+  private startSessionsListener(): void {
+    if (this.sessionsChangedCallback !== undefined) {
+      return;
+    }
+    const callback: SessionsChangeListener = (): void => {
+      this.onSessionsChanged();
+    };
+    addSessionsListener(callback);
+    this.sessionsChangedCallback = callback;
+  }
+
+  private stopSessionsListener(): void {
+    const callback = this.sessionsChangedCallback;
+    this.sessionsChangedCallback = undefined;
+    if (callback !== undefined) {
+      removeSessionsListener(callback);
+    }
+  }
+
+  /** Registry changed; only the count of sessions sharing the endpoint matters. */
+  private onSessionsChanged(): void {
+    this.syncResizePeerState(true);
+  }
+
+  /**
+   * Re-reads how many live sessions share this session's VNC desktop and logs
+   * each pause / resume crossing once (never per registry change). A resume
+   * evaluates this window at once, because it may have been resized while the
+   * follow was paused. `followOnResume` is false when the caller is already the
+   * evaluation that may request right now (maybeRequestRemoteSize).
+   */
+  private syncResizePeerState(followOnResume: boolean): void {
+    if (!this.followRemoteSize || this.disposed || this.sessionId.length === 0) {
+      return;
+    }
+    const count = vncEndpointSessionCount(this.sessionId);
+    const paused = count >= 2;
+    if (paused === this.resizePeerPaused) {
+      return;
+    }
+    this.resizePeerPaused = paused;
+    if (paused) {
+      // A request already on its way is not recalled (RFB cannot take one
+      // back); only new requests are suppressed from here on.
+      hilog.info(DOMAIN, TAG,
+        'remote resize follow paused reason=multi-session count=%{public}d session=%{public}s',
+        count, this.sessionId);
+      return;
+    }
+    // Only "back to exactly one live session" is the resume the rule describes.
+    // 0 means the endpoint can no longer be confirmed (this session was removed
+    // / failed, or its owner entry is gone): clear the flag silently, and do not
+    // evaluate — a session that is going away must not slip one last request in
+    // through the poll lag. A later real resize still follows normally.
+    if (count !== 1) {
+      return;
+    }
+    hilog.info(DOMAIN, TAG,
+      'remote resize follow resumed count=%{public}d session=%{public}s',
+      count, this.sessionId);
+    if (followOnResume) {
+      // 0 ms: evaluate the current picture area now instead of waiting out the
+      // drag debounce. resizeDisabled still wins, so a window that had already
+      // stopped following stays stopped.
+      this.scheduleResizeFollow(0);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2538,6 +2777,16 @@ struct Remote {
       this.canvasShown = true;
       // First frame on the GL path: give the status one poll to report the
       // remote size, then issue the resolution-follow request once.
+      this.scheduleResizeFollow();
+    }
+    // Same one-shot, but for a reconnected desktop: the hook above only fires
+    // once per page, so a generation bump arms its own. Any change of the
+    // presented-frame count means a swap happened; "differs from" rather than
+    // "greater than" also covers a render thread that restarted and reset its
+    // counter to 0.
+    if (this.resizeResyncFrameBase >= 0 && stats.frames > 0 &&
+        stats.frames !== this.resizeResyncFrameBase) {
+      this.resizeResyncFrameBase = -1;
       this.scheduleResizeFollow();
     }
     // Input mapping and cursor placement must follow the PRESENTED geometry
@@ -2924,6 +3173,11 @@ struct Remote {
         this.canvasShown = true;
         // First frame on the Canvas path: same one-shot follow request.
         this.scheduleResizeFollow();
+      } else if (this.resizeResyncFrameBase >= 0) {
+        // A reconnected desktop gets its own one-shot after its first applied
+        // frame (the hook above only fires once per page).
+        this.resizeResyncFrameBase = -1;
+        this.scheduleResizeFollow();
       }
     } catch (error) {
       hilog.error(DOMAIN, TAG, '应用画面失败：%{public}s', String(error));
@@ -3105,7 +3359,7 @@ struct Remote {
     if (this.followRemoteSize && !this.resizeDisabled) {
       const support = status.resizeSupport;
       if (support === 'rejected') {
-        this.disableResizeFollow('resizeSupport=rejected');
+        this.disableResizeFollow(RESIZE_DISABLE_REASON_REJECTED);
       } else if (this.resizePending && width > 0 && height > 0 &&
           (width !== this.resizeBaselineW || height !== this.resizeBaselineH)) {
         // ANY remote size change settles the request, exact or approximate.
@@ -3136,6 +3390,9 @@ struct Remote {
         this.resetViewTransform('reconnect');
         this.invalidateRender();
         this.requestFull();
+        // The new desktop may have come back at another size: forget the old
+        // connection's requested target and evaluate once after its first frame.
+        this.resetResizeFollowForReconnect(generation);
       }
       this.lastGeneration = generation;
     }

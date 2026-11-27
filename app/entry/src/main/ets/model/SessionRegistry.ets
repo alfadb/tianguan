@@ -7,10 +7,10 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   closeSession, listSessions, reconnectSession, sessionStatus,
-  SESSION_STATE_CONNECTED
+  SESSION_STATE_CONNECTED, SESSION_STATE_DISCONNECTED, SESSION_STATE_FAILED
 } from '../diag/SessionApi';
 import type { ListedSession } from '../diag/SessionApi';
-import { markConnected } from './ConnectionStore';
+import { findConnection, markConnected } from './ConnectionStore';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -113,6 +113,63 @@ export function sessionsForConnection(connectionId: string): RuntimeSession[] {
 export function activeSessions(): RuntimeSession[] {
   return allSessions().filter((item: RuntimeSession) =>
     item.state !== 'disconnected' && item.state !== 'failed');
+}
+
+/**
+ * Endpoint key of the VNC desktop one session is looking at, or '' when that
+ * cannot be confirmed. A VNC desktop has ONE size: it belongs to the server at
+ * host:port, not to a saved connection entry. The size is global and RFB has no
+ * multi-client arbitration, so the key deliberately spans connection entries (a
+ * 复制 copy has its own id but the same desktop) and ignores the user name; the
+ * host is lower-cased because host names are case-insensitive. An orphan
+ * session (no owner connection entry) or a session that is not provably VNC
+ * yields '' — only a confirmed same-endpoint match may count (same rule as the
+ * RDP account guard in the connection list).
+ */
+function vncEndpointKey(session: RuntimeSession): string {
+  if (session.connectionId.length === 0) {
+    return '';
+  }
+  const entry = findConnection(session.connectionId);
+  if (entry === undefined || entry.protocol !== 'vnc') {
+    return '';
+  }
+  const host = entry.host.trim().toLowerCase();
+  const port = entry.port.trim();
+  if (host.length === 0 || port.length === 0) {
+    return '';
+  }
+  return host + ':' + port;
+}
+
+/**
+ * Live sessions sharing one VNC desktop with `sessionId`, that session included.
+ * 0 means "cannot be confirmed" (unknown session, no owner connection entry, or
+ * not VNC) and must never be read as "no other session". Failed and
+ * disconnected sessions are not counted: they hold no remote desktop and can
+ * linger in the table for a long time. Read-only over the registry — the remote
+ * page uses it to stop requesting a desktop size while two or more windows on
+ * the same VNC server are open.
+ */
+export function vncEndpointSessionCount(sessionId: string): number {
+  const own = sessions.get(sessionId);
+  if (own === undefined) {
+    return 0;
+  }
+  const key = vncEndpointKey(own);
+  if (key.length === 0) {
+    return 0;
+  }
+  let count = 0;
+  sessions.forEach((item: RuntimeSession) => {
+    if (item.state === SESSION_STATE_DISCONNECTED || item.state === SESSION_STATE_FAILED) {
+      return;
+    }
+    if (vncEndpointKey(item) === key) {
+      count += 1;
+    }
+  });
+  return count;
 }
 
 export function reconnectById(sessionId: string): void {
