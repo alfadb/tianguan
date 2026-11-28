@@ -377,11 +377,25 @@ struct InputWindowStats {
   unsigned long long sendFail;
 };
 
+// 鼠标按键窗口统计（5 秒）：按下/抬起/合成抬起/纯移动事件的次数。只读日志用，
+// 不参与任何输入逻辑。
+struct MouseWindowStats {
+  MouseWindowStats()
+      : press(0), release(0), releaseSynth(0), moveEvents(0) {}
+  unsigned long long press;
+  unsigned long long release;
+  unsigned long long releaseSynth;
+  unsigned long long moveEvents;
+};
+
 class InputTranslator {
  public:
   InputTranslator()
       : streamWidth_(1280), streamHeight_(720), pointerMask_(0), modifiers_(0),
-        dropLogs_(0), lagCount_(0), lagSumUs_(0), sendCalls_(0), sendFail_(0) {}
+        dropLogs_(0), lastX_(0), lastY_(0), lagCount_(0), lagSumUs_(0),
+        sendCalls_(0), sendFail_(0), lastButtonEventMs_(0), buttonLogSecond_(0),
+        buttonLogLines_(0), buttonLogSkipped_(0), pressCount_(0), releaseCount_(0),
+        releaseSynthCount_(0), moveEventCount_(0) {}
 
   // 一条「入队 -> 发送返回」的延迟样本（微秒）。只在输入线程调用。
   void noteLag(unsigned long long lagUs) {
@@ -411,6 +425,20 @@ class InputTranslator {
     return stats;
   }
 
+  // 取走并清空鼠标按键窗口（5 秒汇总日志用）。
+  MouseWindowStats takeMouseStats() {
+    MouseWindowStats stats;
+    stats.press = pressCount_;
+    stats.release = releaseCount_;
+    stats.releaseSynth = releaseSynthCount_;
+    stats.moveEvents = moveEventCount_;
+    pressCount_ = 0;
+    releaseCount_ = 0;
+    releaseSynthCount_ = 0;
+    moveEventCount_ = 0;
+    return stats;
+  }
+
   void setStreamSize(int width, int height) {
     if (width > 0) streamWidth_.store(width);
     if (height > 0) streamHeight_.store(height);
@@ -435,20 +463,26 @@ class InputTranslator {
     noteSend(LiSendMousePositionEvent(static_cast<short>(x), static_cast<short>(y),
                                       static_cast<short>(width),
                                       static_cast<short>(height)));
+    lastX_ = x;
+    lastY_ = y;
     const int held = mask & 7;
     const int changed = held ^ (pointerMask_ & 7);
     if ((changed & 1) != 0)
-      noteSend(LiSendMouseButtonEvent((held & 1) != 0 ? BUTTON_ACTION_PRESS
-                                                      : BUTTON_ACTION_RELEASE,
-                                      BUTTON_LEFT));
+      buttonEvent("LEFT", (held & 1) != 0, x, y, "mask",
+                  LiSendMouseButtonEvent((held & 1) != 0 ? BUTTON_ACTION_PRESS
+                                                        : BUTTON_ACTION_RELEASE,
+                                         BUTTON_LEFT));
     if ((changed & 2) != 0)
-      noteSend(LiSendMouseButtonEvent((held & 2) != 0 ? BUTTON_ACTION_PRESS
-                                                      : BUTTON_ACTION_RELEASE,
-                                      BUTTON_MIDDLE));
+      buttonEvent("MIDDLE", (held & 2) != 0, x, y, "mask",
+                  LiSendMouseButtonEvent((held & 2) != 0 ? BUTTON_ACTION_PRESS
+                                                        : BUTTON_ACTION_RELEASE,
+                                         BUTTON_MIDDLE));
     if ((changed & 4) != 0)
-      noteSend(LiSendMouseButtonEvent((held & 4) != 0 ? BUTTON_ACTION_PRESS
-                                                      : BUTTON_ACTION_RELEASE,
-                                      BUTTON_RIGHT));
+      buttonEvent("RIGHT", (held & 4) != 0, x, y, "mask",
+                  LiSendMouseButtonEvent((held & 4) != 0 ? BUTTON_ACTION_PRESS
+                                                        : BUTTON_ACTION_RELEASE,
+                                         BUTTON_RIGHT));
+    if (changed == 0 && (mask & 0x18) == 0) ++moveEventCount_;
     pointerMask_ = held;
     // 一个 mask 最多带一个方向的滚轮位；两个都有时按上滚处理（与 RDP 路径一致）。
     if ((mask & 8) != 0)
@@ -493,11 +527,14 @@ class InputTranslator {
     modifiers_ = 0;
     const int held = pointerMask_ & 7;
     if ((held & 1) != 0)
-      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT));
+      buttonEvent("LEFT", false, lastX_, lastY_, "release-synth",
+                  LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT));
     if ((held & 2) != 0)
-      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE));
+      buttonEvent("MIDDLE", false, lastX_, lastY_, "release-synth",
+                  LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE));
     if ((held & 4) != 0)
-      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT));
+      buttonEvent("RIGHT", false, lastX_, lastY_, "release-synth",
+                  LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT));
     pointerMask_ = 0;
   }
 
@@ -512,6 +549,42 @@ class InputTranslator {
     if (result != 0) ++sendFail_;
   }
 
+  // 鼠标按键状态变化日志（W 级，每秒最多 40 行；超出的只计数，在下一行末尾汇总）。
+  // 只观察，不影响发送：result 已经由调用处的 LiSendMouseButtonEvent 返回。
+  void buttonEvent(const char* button, bool press, int x, int y,
+                   const char* source, int result) {
+    noteSend(result);
+    // release() 合成（releaseEpoch/失焦）的抬起单独计数，便于和真实 mask 变化区分。
+    if (press) {
+      ++pressCount_;
+    } else {
+      ++releaseCount_;
+      if (std::strcmp(source, "release-synth") == 0) ++releaseSynthCount_;
+    }
+    const unsigned long long now = monotonicMillis();
+    const unsigned long long dt =
+        lastButtonEventMs_ == 0 ? 0 : now - lastButtonEventMs_;
+    lastButtonEventMs_ = now;
+    if (now / 1000 != buttonLogSecond_) {
+      buttonLogSecond_ = now / 1000;
+      buttonLogLines_ = 0;
+    }
+    if (buttonLogLines_ >= 40) {
+      ++buttonLogSkipped_;
+      return;
+    }
+    ++buttonLogLines_;
+    std::string suffix;
+    if (buttonLogSkipped_ > 0) {
+      suffix = formatText(" (+%llu skipped)", buttonLogSkipped_);
+      buttonLogSkipped_ = 0;
+    }
+    logWarn(formatText(
+        "sunshine mouse: %s %s at (%d,%d) dt=%llums src=%s%s%s", button,
+        press ? "press" : "release", x, y, dt, source,
+        result != 0 ? " send_failed" : "", suffix.c_str()));
+  }
+
   static const size_t kLagSamples = 4096;
   std::atomic<int> streamWidth_;
   std::atomic<int> streamHeight_;
@@ -519,11 +592,21 @@ class InputTranslator {
   int pointerMask_;
   char modifiers_;
   int dropLogs_;
+  int lastX_;
+  int lastY_;
   unsigned long long lagUs_[kLagSamples];
   size_t lagCount_;
   unsigned long long lagSumUs_;
   unsigned long long sendCalls_;
   unsigned long long sendFail_;
+  unsigned long long lastButtonEventMs_;
+  unsigned long long buttonLogSecond_;
+  int buttonLogLines_;
+  unsigned long long buttonLogSkipped_;
+  unsigned long long pressCount_;
+  unsigned long long releaseCount_;
+  unsigned long long releaseSynthCount_;
+  unsigned long long moveEventCount_;
 };
 
 // ---------------------------------------------------------------------------
@@ -536,7 +619,8 @@ struct MediaContext {
         failedStage(0), failedStageError(0), pictureFrameMs(0),
         pictureBlackStartMs(0), pictureFirstNonBlackMs(0),
         pictureLastNonBlackMs(0), terminationPictureMs(0), currentStage(0),
-        firstFrameTimeoutLogged(false), negotiatedVideoFormat(0) {}
+        firstFrameTimeoutLogged(false), negotiatedVideoFormat(0), rttAvgMs(0),
+        rttMinMs(0), rttValid(false) {}
 
   const SunshineHost* host;
   int generation;
@@ -572,6 +656,12 @@ struct MediaContext {
   // 当前流实际协商到的 VIDEO_FORMAT_*（videoSetup 成功时写入）；分辨率调整时的
   // 码率系数按它判断 HEVC。0 = 还没有协商过。
   std::atomic<int> negotiatedVideoFormat;
+  // 网络往返时延（common-c 的 ENet 统计，LiGetEstimatedRttInfo）：平均 RTT 与
+  // 「本窗口最小估计」（avg - variance，接口没有单独的 min 字段）。只在
+  // LiStartConnection..LiStopConnection 之间的输入线程里采样，NAPI 线程只读。
+  std::atomic<unsigned int> rttAvgMs;
+  std::atomic<unsigned int> rttMinMs;
+  std::atomic<bool> rttValid;
 
   std::mutex textMutex;
   std::string terminationText;
@@ -1140,6 +1230,9 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   media.terminationPictureMs.store(0);
   media.currentStage.store(0);
   media.firstFrameTimeoutLogged.store(false);
+  media.rttAvgMs.store(0);
+  media.rttMinMs.store(0);
+  media.rttValid.store(false);
   media.input.reset();
   {
     std::lock_guard<std::mutex> lock(media.textMutex);
@@ -1365,30 +1458,61 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
         // 2 ms 的兜底轮询等待（不做任何额外 sleep 或攒批），把输入延迟压到最低。
         if (host.drainInput != nullptr)
           host.drainInput(host.user, &inputSink, &applied);
-        // 主机光标切换（本地光标模式）：Sunshine input.cpp apply_shortcut 在
-        // Ctrl+Alt+Shift+VKEY_N 按下时翻转全局 display_cursor，并且这个组合键
-        // 不传给桌面。必须在输入流就绪后发送，所以放在这里（2 ms 节拍）；
-        // 发送失败（例如 -2 输入流未就绪）时保持待发，下一 tick 重试。
+        // 主机光标切换（本地光标模式）：Sunshine input.cpp apply_shortcut 只在
+        // shortcutFlags == SHORTCUT 时翻转全局 display_cursor，而 shortcutFlags
+        // 是由「修饰键本身」的按下/抬起事件经 update_shortcutFlags 维护的。只发
+        // 一个带修饰位标记的 N 键不会触发快捷键，N 还会被传给桌面。所以这里按
+        // 真实按键顺序模拟：Ctrl↓ Alt↓ Shift↓ N↓ N↑ Shift↑ Alt↑ Ctrl↑。
+        // 必须在输入流就绪后发送，所以放在这里（2 ms 节拍）；任一步返回非 0 立即
+        // 中止并保持待发，下一 tick 重试。该路径直接调用 LiSendKeyboardEvent、
+        // 不经过 InputTranslator::key()，因此不会污染它对修饰键/按下键的跟踪。
         if (host.takeCursorHiddenRequest != nullptr) {
           bool hidden = false;
           if (host.takeCursorHiddenRequest(host.user, &hidden)) {
-            const char chordModifiers = static_cast<char>(
-                MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT);
-            const int down =
-                LiSendKeyboardEvent(0x4E, KEY_ACTION_DOWN, chordModifiers);
-            const int up =
-                LiSendKeyboardEvent(0x4E, KEY_ACTION_UP, chordModifiers);
-            if (down == 0 && up == 0) {
+            struct ChordStep {
+              short key;
+              char action;
+              char modifiers;
+            };
+            const ChordStep steps[] = {
+                {0x11, KEY_ACTION_DOWN, static_cast<char>(MODIFIER_CTRL)},
+                {0x12, KEY_ACTION_DOWN,
+                 static_cast<char>(MODIFIER_CTRL | MODIFIER_ALT)},
+                {0x10, KEY_ACTION_DOWN,
+                 static_cast<char>(MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT)},
+                {0x4E, KEY_ACTION_DOWN,
+                 static_cast<char>(MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT)},
+                {0x4E, KEY_ACTION_UP,
+                 static_cast<char>(MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT)},
+                {0x10, KEY_ACTION_UP,
+                 static_cast<char>(MODIFIER_CTRL | MODIFIER_ALT)},
+                {0x12, KEY_ACTION_UP, static_cast<char>(MODIFIER_CTRL)},
+                {0x11, KEY_ACTION_UP, static_cast<char>(0)},
+            };
+            const size_t stepCount = sizeof(steps) / sizeof(steps[0]);
+            std::string codes;
+            size_t failedStep = stepCount;
+            for (size_t i = 0; i < stepCount; ++i) {
+              const int result = LiSendKeyboardEvent(
+                  steps[i].key, steps[i].action, steps[i].modifiers);
+              codes += formatText("%s%d", i == 0 ? "" : "/", result);
+              if (result != 0) {
+                failedStep = i;
+                break;  // 中止：保持待发，下一 tick 重试整串
+              }
+            }
+            if (failedStep == stepCount) {
               logWarn(formatText(
-                  "sunshine: host cursor %s (Ctrl+Alt+Shift+N sent)",
-                  hidden ? "hidden" : "shown"));
+                  "sunshine: host cursor %s (Ctrl+Alt+Shift+N, rc=%s)",
+                  hidden ? "hidden" : "shown", codes.c_str()));
               if (host.noteCursorHidden != nullptr)
                 host.noteCursorHidden(host.user, generation, hidden);
             } else if (cursorToggleLogs < 3) {
               ++cursorToggleLogs;
               logWarn(formatText(
-                  "sunshine: host cursor toggle deferred (down=%d, up=%d); will retry",
-                  down, up));
+                  "sunshine: host cursor toggle aborted at step %llu (rc=%s); "
+                  "will retry",
+                  static_cast<unsigned long long>(failedStep), codes.c_str()));
             }
           }
         }
@@ -1425,14 +1549,29 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
               videoStats.frames, videoStats.idrFrames, videoStats.bytes,
               audioStats.packets, audioStats.bytes, picture.blackMs,
               picture.lastFrameAgeMs, g_autoReconnects.load()));
-          // 输入延迟窗口：入队 -> LiSend* 返回的平均/P95（毫秒）+ 发送次数/失败数。
+          // 输入延迟窗口（入队 -> LiSend* 返回）与网络 RTT 一起放进下面的 perf
+          // 行，方便一行对照「鼠标传递延迟」和「画面延迟」。LiGetEstimatedRttInfo
+          // 只能在 LiStartConnection()/LiStopConnection() 之间调用（输入线程正好
+          // 只在这个窗口里运行）；它内部是 ENet 统计的 trylock + 原子缓存，不阻塞。
           const InputWindowStats inputStats = media.input.takeStats();
-          logWarn(formatText(
-              "sunshine input: queueLag=%.2f/%.2f sendCalls=%llu sendFail=%llu "
-              "(avg/p95 ms, samples=%llu)",
-              inputStats.avgMs, inputStats.p95Ms, inputStats.sendCalls,
-              inputStats.sendFail,
-              static_cast<unsigned long long>(inputStats.samples)));
+          uint32_t rttMs = 0;
+          uint32_t rttVarianceMs = 0;
+          const bool rttOk = LiGetEstimatedRttInfo(&rttMs, &rttVarianceMs);
+          std::string rttText = "n/a";
+          if (rttOk) {
+            // 接口只给 avg 与 variance（enet roundTripTime/Variance，毫秒），没有
+            // 单独的 min：本窗口最小估计取 max(0, avg - variance)，并保留本次串流
+            // 观察到的最小值。
+            const unsigned int minEstimate =
+                rttMs > rttVarianceMs ? rttMs - rttVarianceMs : 0;
+            const unsigned int previousMin = media.rttMinMs.load();
+            const unsigned int sessionMin =
+                previousMin == 0 ? minEstimate : std::min(previousMin, minEstimate);
+            media.rttAvgMs.store(rttMs);
+            media.rttMinMs.store(sessionMin);
+            media.rttValid.store(true);
+            rttText = formatText("%u/%u", rttMs, sessionMin);
+          }
           // 视频链路分段耗时（同一 5 秒窗口，avg/p95 毫秒）：
           //   解码侧（sunshine_video.cxx）netToSubmit / submitToOutput / convert /
           //     commit 与 in/dec 帧率；
@@ -1443,10 +1582,14 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
           const SunshineVideoPerf videoPerf = sunshineVideoPerf();
           const RenderFramePerf renderPerf = renderFramePerf();
           logWarn(formatText(
-              "sunshine perf: in=%.1ffps dec=%.1ffps out=%.1ffps "
+              "sunshine perf: rtt=%s inputLag=%.2f/%.2f "
+              "in=%.1ffps dec=%.1ffps out=%.1ffps "
               "netToSubmit=%.1f/%.1f submitToOutput=%.1f/%.1f convert=%.1f/%.1f "
               "commit=%.1f/%.1f lag=%.1f/%.1f swap=%.1f/%.1f surface=%.1f/%.1f "
-              "(avg/p95 ms, window=%llums, dropped=%llu)",
+              "captureToSwap=%.1f/%.1f receiveToSwap=%.1f/%.1f "
+              "(avg/p95 ms, latency=%s, window=%llums, dropped=%llu, "
+              "sendCalls=%llu sendFail=%llu%s)",
+              rttText.c_str(), inputStats.avgMs, inputStats.p95Ms,
               videoPerf.inFps, videoPerf.decFps, renderPerf.outFps,
               videoPerf.netToSubmitAvgMs, videoPerf.netToSubmitP95Ms,
               videoPerf.submitToOutputAvgMs, videoPerf.submitToOutputP95Ms,
@@ -1455,8 +1598,22 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
               renderPerf.lagAvgMs, renderPerf.lagP95Ms,
               renderPerf.pickupToSwapAvgMs, renderPerf.pickupToSwapP95Ms,
               renderPerf.frameAvailableToSwapAvgMs,
-              renderPerf.frameAvailableToSwapP95Ms, videoPerf.windowMs,
-              videoPerf.droppedUnits));
+              renderPerf.frameAvailableToSwapP95Ms, renderPerf.captureToSwapAvgMs,
+              renderPerf.captureToSwapP95Ms, renderPerf.receiveToSwapAvgMs,
+              renderPerf.receiveToSwapP95Ms,
+              renderPerf.latencySource == 1 ? "pts"
+              : (renderPerf.latencySource == 2 ? "recv" : "none"),
+              videoPerf.windowMs, videoPerf.droppedUnits, inputStats.sendCalls,
+              inputStats.sendFail,
+              rttOk ? "" : ", rtt unavailable (ENet stats not ready yet)"));
+          // 鼠标按键窗口汇总：真实按下/抬起、releaseEpoch/失焦合成的抬起、纯移动
+          // 事件次数。只做日志，用来排查「按住移动时锁定丢失」这类多余按键问题。
+          const MouseWindowStats mouseStats = media.input.takeMouseStats();
+          logWarn(formatText(
+              "sunshine mouse: press=%llu release=%llu releaseSynth=%llu "
+              "moveEvents=%llu",
+              mouseStats.press, mouseStats.release, mouseStats.releaseSynth,
+              mouseStats.moveEvents));
         }
       }
         });
@@ -1537,6 +1694,15 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
 void sunshineNoteInputQueueLag(unsigned long long lagUs) {
   if (!g_media.active.load()) return;
   g_media.input.noteLag(lagUs);
+}
+
+// 当前串流最近一次采到的网络 RTT（毫秒）与本串流观察到的最小估计；还没采到
+// （ENet 统计未就绪 / 未连接）时返回 false。NAPI 线程可调用，只读原子量。
+bool sunshineRttStatus(unsigned int* avgMs, unsigned int* minMs) {
+  if (!g_media.rttValid.load()) return false;
+  if (avgMs != nullptr) *avgMs = g_media.rttAvgMs.load();
+  if (minMs != nullptr) *minMs = g_media.rttMinMs.load();
+  return true;
 }
 
 // 视频解码回调线程每帧上报一次（见 sunshine_backend.h）。这里只写原子时间戳：

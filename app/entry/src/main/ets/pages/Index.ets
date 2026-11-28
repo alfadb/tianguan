@@ -458,8 +458,12 @@ struct Index {
   /** Form-facing bitrate unit is Mbps; connect() converts it to native kbps. */
   @State private formSunshineBitrate: string = '20';
   @State private formSunshineCodec: string = SUNSHINE_CODEC_AUTO;
-  /** Sunshine local cursor (Moonlight style): ON unless the user turns it off. */
-  @State private formSunshineLocalCursor: boolean = true;
+  /** Experimental local cursor: OFF by default (the remote cursor is shown). */
+  @State private formSunshineLocalCursor: boolean = false;
+  /** Follow the window size by restarting the stream at the best host mode. */
+  @State private formSunshineFollowWindow: boolean = true;
+  /** true waits for vsync; the form checkbox is the inverse (low latency). */
+  @State private formSunshineVsync: boolean = true;
   @State private formPort: string = DEFAULT_PORT;
   @State private formGroup: string = '';
   @State private formPassword: string = '';
@@ -847,7 +851,9 @@ struct Index {
     this.formUsername = '';
     this.formDomain = '';
     this.formSunshineApp = '';
-    this.formSunshineLocalCursor = true;
+    this.formSunshineLocalCursor = false;
+    this.formSunshineFollowWindow = true;
+    this.formSunshineVsync = true;
     this.resetSunshineQuality(SUNSHINE_PRESET_BALANCED, SUNSHINE_CODEC_AUTO);
     this.formPort = DEFAULT_PORT;
     this.formGroup = this.selectedGroup === '__all__' || this.selectedGroup === UNGROUPED
@@ -884,7 +890,9 @@ struct Index {
       ? entry.sunshineBitrate : tier.bitrateMbps);
     this.formSunshineCodec = typeof entry.sunshineCodec === 'string' &&
       isSunshineCodec(entry.sunshineCodec) ? entry.sunshineCodec : SUNSHINE_CODEC_AUTO;
-    this.formSunshineLocalCursor = entry.sunshineLocalCursor !== false;
+    this.formSunshineLocalCursor = entry.sunshineLocalCursor === true;
+    this.formSunshineFollowWindow = entry.sunshineFollowWindow !== false;
+    this.formSunshineVsync = entry.sunshineVsync !== false;
     this.formPort = entry.port;
     this.formGroup = entry.group;
     this.formSavePassword = entry.savePassword;
@@ -1053,11 +1061,13 @@ struct Index {
       sunshineFps: sunshineFps,
       sunshineBitrate: sunshineBitrate,
       sunshineCodec: sunshineCodec,
-      sunshineLocalCursor: sunshine ? this.formSunshineLocalCursor : true,
+      sunshineLocalCursor: sunshine ? this.formSunshineLocalCursor : false,
       // The host cursor state is not edited in the form: keep whatever the
       // session page last recorded, so editing a connection cannot reset it.
       sunshineHostCursorHidden: previous === undefined ? false :
-        previous.sunshineHostCursorHidden === true
+        previous.sunshineHostCursorHidden === true,
+      sunshineFollowWindow: sunshine ? this.formSunshineFollowWindow : true,
+      sunshineVsync: sunshine ? this.formSunshineVsync : true
     };
     return entry;
   }
@@ -1110,7 +1120,9 @@ struct Index {
       sunshineBitrate: entry.sunshineBitrate,
       sunshineCodec: entry.sunshineCodec,
       sunshineLocalCursor: entry.sunshineLocalCursor,
-      sunshineHostCursorHidden: entry.sunshineHostCursorHidden
+      sunshineHostCursorHidden: entry.sunshineHostCursorHidden,
+      sunshineFollowWindow: entry.sunshineFollowWindow,
+      sunshineVsync: entry.sunshineVsync
     };
     upsertConnection(copy);
     this.connections = savedConnections();
@@ -1595,6 +1607,10 @@ struct Index {
         if (entry.sunshineHostCursorHidden === true) {
           options.sunshineHostCursorHidden = true;
         }
+        // Low-latency presentation: true (default) waits for vsync; false lets
+        // the Sunshine zero-copy path present without waiting (may tear).
+        // VNC/RDP and the buffer fallback are never affected.
+        options.sunshineVsync = entry.sunshineVsync !== false;
       } else if (entry.protocol === 'rdp') {
         // RDP shares the session state machine; only the endpoint options
         // differ. security stays unset (RFB security types only), but
@@ -2063,18 +2079,38 @@ struct Index {
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
-        // Moonlight-style local cursor: the host hides its cursor and this
-        // client shows the system pointer, so it follows the hand with no lag.
+        // Experimental local cursor: hides the remote cursor and shows the local
+        // system pointer (lower latency, fixed arrow shape). OFF by default.
         Row({ space: 8 }) {
           Checkbox()
             .select(this.formSunshineLocalCursor)
             .onChange((checked: boolean) => { this.formSunshineLocalCursor = checked; })
-          Text('本地光标（更跟手，但光标形状固定为箭头）').fontSize(14)
+          Text('本地光标（实验性：隐藏远端光标，改显示本地箭头，更跟手但光标形状固定）')
+            .fontSize(14)
+            .layoutWeight(1)
         }
         Text('主机光标状态是主机级的，会保留到下次会话；Sunshine 重启后恢复显示')
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
+        // Follow the window size by restarting the stream at the best host mode.
+        // Each switch stops the stream for several seconds (measured ~10 s).
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(this.formSunshineFollowWindow)
+            .onChange((checked: boolean) => { this.formSunshineFollowWindow = checked; })
+          Text('跟随窗口分辨率（拖动/最大化/全屏后自动选最合适的分辨率，切换时约 10 秒黑屏）')
+            .fontSize(14)
+            .layoutWeight(1)
+        }
+        // The entry stores "wait for vsync" (default true); this checkbox is the
+        // inverse: checked = low latency = vsync off.
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(!this.formSunshineVsync)
+            .onChange((checked: boolean) => { this.formSunshineVsync = !checked; })
+          Text('低延迟呈现（不等待屏幕刷新，可能撕裂）').fontSize(14).layoutWeight(1)
+        }
       }
       TextInput({ text: this.formGroup, placeholder: '分组（可留空）' })
         .height(40)

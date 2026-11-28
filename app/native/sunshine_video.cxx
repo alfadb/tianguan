@@ -270,6 +270,60 @@ class VideoPerfAggregator {
 
 VideoPerfAggregator g_videoPerf;
 
+// ---------------------------------------------------------------------------
+// 端到端延迟的时间戳快照（见 sunshine_video.h 的 SunshineFrameTiming）
+//
+// presentationTimeUs 是主机 RTP 时钟（Limelight.h:169-171：epoch 为主机第一帧抓屏），
+// 不能和客户端 now 直接相减；这里用「客户端 receiveTimeUs - 主机 presentationTimeUs」
+// 的滑动最小值估计两端的固定偏移（最小值对应最快的一帧，即最优路径；因此算出的
+// captureToSwap 会偏低约「最小单向延迟」，报告里注明）。样本有界（240 帧）。
+// ---------------------------------------------------------------------------
+const size_t kFrameClockOffsetSamples = 240;
+
+std::mutex g_frameTimingMutex;
+SunshineFrameTiming g_latestFrameTiming;
+std::deque<long long> g_frameClockOffsets;  // receiveTimeUs - presentationTimeUs（可负）
+
+void resetFrameTimingLocked() {
+  g_frameClockOffsets.clear();
+  g_latestFrameTiming = SunshineFrameTiming();
+}
+
+long long currentClockOffsetLocked() {
+  if (g_frameClockOffsets.empty()) return 0;
+  long long best = g_frameClockOffsets.front();
+  for (std::deque<long long>::const_iterator it = g_frameClockOffsets.begin();
+       it != g_frameClockOffsets.end(); ++it) {
+    if (*it < best) best = *it;
+  }
+  return best;
+}
+
+// 一帧解码输出（Surface 模式的 RenderOutputBuffer / Buffer 模式的 commit 之后）。
+// presentationTimeUs 来自 DECODE_UNIT，receiveTimeUs 来自同一解码单元的配对记录。
+void noteFrameTiming(long long presentationTimeUs, long long receiveTimeUs) {
+  SunshineFrameTiming timing;
+  timing.presentationTimeUs = presentationTimeUs;
+  timing.receiveTimeUs = receiveTimeUs;
+  timing.notedAtUs = static_cast<long long>(LiGetMicroseconds());
+  std::lock_guard<std::mutex> lock(g_frameTimingMutex);
+  if (presentationTimeUs != 0 && receiveTimeUs != 0) {
+    const long long candidate = receiveTimeUs - presentationTimeUs;
+    g_frameClockOffsets.push_back(candidate);
+    while (g_frameClockOffsets.size() > kFrameClockOffsetSamples)
+      g_frameClockOffsets.pop_front();
+    timing.hostToClientOffsetUs = currentClockOffsetLocked();
+    timing.offsetValid = true;
+    timing.valid = true;
+  } else {
+    // 主机 PTS 无效（0）：只留 receiveTimeUs，渲染线程会退化成 receiveToSwap。
+    timing.offsetValid = !g_frameClockOffsets.empty();
+    if (timing.offsetValid) timing.hostToClientOffsetUs = currentClockOffsetLocked();
+    timing.valid = receiveTimeUs != 0;
+  }
+  g_latestFrameTiming = timing;
+}
+
 // 有界输入队列的深度：解码器自己还有若干在途 buffer，超过这个数再攒只会增加
 // 端到端延迟；满了就让 common-c 去要一个 IDR（画面会跳一下，但不会无限积压）。
 const size_t kMaxQueuedDecodeUnits = 4;
@@ -289,10 +343,11 @@ const char* mimeForVideoFormat(int videoFormat) {
 
 // 一个待下发的解码单元：AnnexB 字节 + PTS(µs) + 是否同步帧。
 struct QueuedDecodeUnit {
-  QueuedDecodeUnit() : ptsUs(0), syncFrame(false) {}
+  QueuedDecodeUnit() : ptsUs(0), syncFrame(false), receiveTimeUs(0) {}
   std::vector<uint8_t> annexB;
   int64_t ptsUs;
   bool syncFrame;
+  uint64_t receiveTimeUs;  // DECODE_UNIT.receiveTimeUs（端到端延迟用）
 };
 
 // 解码器交还的一个可用输入 buffer（索引 + 实例，回调里给什么就存什么）。
@@ -307,10 +362,12 @@ struct FreeInputBuffer {
 // 一次输入下发的记录：输出回调拿同样的 PTS 回来配对 submitToOutput 间隔。
 // 有界（解码器同时在途的帧远少于这个数），满了丢最旧的。
 struct PendingSubmit {
-  PendingSubmit() : ptsUs(0), submitUs(0) {}
-  PendingSubmit(int64_t pts, uint64_t atUs) : ptsUs(pts), submitUs(atUs) {}
+  PendingSubmit() : ptsUs(0), submitUs(0), receiveTimeUs(0) {}
+  PendingSubmit(int64_t pts, uint64_t atUs, uint64_t receiveUs)
+      : ptsUs(pts), submitUs(atUs), receiveTimeUs(receiveUs) {}
   int64_t ptsUs;
   uint64_t submitUs;
+  uint64_t receiveTimeUs;  // DECODE_UNIT.receiveTimeUs（客户端 common-c 时钟）
 };
 const size_t kMaxPendingSubmits = 240;
 
@@ -455,6 +512,11 @@ class AvCodecVideoSink : public SunshineVideoSink {
     }
     // 新的连接从空的 5 秒统计窗口开始（进程级聚合器，见文件头的统计说明）。
     g_videoPerf.reset();
+    // 新连接 = 新的 RTP 时间基，主机/客户端时钟偏移要重新估计。
+    {
+      std::lock_guard<std::mutex> lock(g_frameTimingMutex);
+      resetFrameTimingLocked();
+    }
     OH_AVErrCode result = OH_VideoDecoder_Start(codec);
     if (result != AV_ERR_OK) {
       logWarn(formatText("sunshine video: Start failed: %d", static_cast<int>(result)));
@@ -501,6 +563,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
       unit.annexB.insert(unit.annexB.end(), data, data + entry->length);
     }
     unit.syncFrame = decodeUnit->frameType == FRAME_TYPE_IDR;
+    unit.receiveTimeUs = decodeUnit->receiveTimeUs;
 
     // 2. 入队 / 直接下发。freeInputs_ 非空说明解码器有空闲输入 buffer，立刻填
     //    并 Push（在锁外做）；否则进有界队列。队列满则丢弃这一帧并要 IDR。
@@ -766,7 +829,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
     // 分段耗时 2：记下「送进解码器」的时刻，输出回调用同一个 PTS 配对。
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      pendingSubmits_.push_back(PendingSubmit(unit.ptsUs, submitUs));
+      pendingSubmits_.push_back(PendingSubmit(unit.ptsUs, submitUs, unit.receiveTimeUs));
       while (pendingSubmits_.size() > kMaxPendingSubmits) pendingSubmits_.pop_front();
     }
     return true;
@@ -970,6 +1033,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
     // 的 pts 原样带回；配不上（pts 被改写/为 0）时用最近已配对样本的运行均值，
     // 这样统计不会因为个别帧配不上就断档（见文件末尾的说明）。
     const uint64_t outputUs = monotonicMicros();
+    uint64_t matchedReceiveTimeUs = 0;
     {
       uint64_t submitToOutputUs = 0;
       {
@@ -978,6 +1042,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
              it != pendingSubmits_.end(); ++it) {
           if (it->ptsUs != attr.pts) continue;
           if (outputUs > it->submitUs) submitToOutputUs = outputUs - it->submitUs;
+          matchedReceiveTimeUs = it->receiveTimeUs;
           // 运行均值，配对不上时的兜底就是这个均值。
           matchedSubmitToOutputSumUs_ += submitToOutputUs;
           ++matchedSubmitToOutputCount_;
@@ -1007,6 +1072,10 @@ class AvCodecVideoSink : public SunshineVideoSink {
       if (OH_VideoDecoder_RenderOutputBuffer(codec, index) != AV_ERR_OK) {
         OH_VideoDecoder_FreeOutputBuffer(codec, index);
       }
+      // 端到端延迟：这一帧紧接着就会被渲染线程取走并呈现，记下它的主机抓屏时刻与
+      // 首包接收时刻（渲染线程在 swap 返回时用最近一帧算 captureToSwap）。
+      noteFrameTiming(static_cast<long long>(attr.pts),
+                      static_cast<long long>(matchedReceiveTimeUs));
       return;
     }
     uint8_t* addr = OH_AVBuffer_GetAddr(buffer);
@@ -1125,6 +1194,10 @@ class AvCodecVideoSink : public SunshineVideoSink {
       sink.commit(sink.user, generation, &rect, 1, frameWidth_, frameHeight_);
       g_videoPerf.noteCommit(monotonicMicros() - commitStartUs);
     }
+    // 端到端延迟（Buffer 回退路径同样可用）：这一帧刚提交进宿主镜像，紧接着会被
+    // 渲染线程取走并呈现。
+    noteFrameTiming(static_cast<long long>(attr.pts),
+                    static_cast<long long>(matchedReceiveTimeUs));
     OH_VideoDecoder_FreeOutputBuffer(codec, index);
 
     if (!loggedFirstFrame_) {
@@ -1261,6 +1334,11 @@ SunshineVideoSink* SunshineVideoSink::create() {
 // 交叉。
 SunshineVideoPerf sunshineVideoPerf() {
   return g_videoPerf.snapshot();
+}
+
+SunshineFrameTiming sunshineLatestFrameTiming() {
+  std::lock_guard<std::mutex> lock(g_frameTimingMutex);
+  return g_latestFrameTiming;
 }
 
 }  // namespace tianguan

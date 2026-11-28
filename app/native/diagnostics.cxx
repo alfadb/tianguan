@@ -24,6 +24,8 @@ namespace tianguan {
 // sample (microseconds) from the drain adapter into the backend's 5 s window.
 // Only called on the Sunshine backend's input thread.
 void sunshineNoteInputQueueLag(unsigned long long lagUs);
+// 当前串流最近一次采到的网络 RTT（毫秒）与本串流最小估计；无值时返回 false。
+bool sunshineRttStatus(unsigned int* avgMs, unsigned int* minMs);
 }  // namespace tianguan
 #endif
 #include <rfb/CConnection.h>
@@ -1234,6 +1236,9 @@ struct SessionState {
   int sunshineBitrate = 20000;
   std::string sunshineFormats;     // "h264,hevc"; empty = auto by HW decoder
   bool sunshineEncryption = true;  // false = ENCFLG_NONE
+  // true（默认）= 等垂直同步；false = 只对 Sunshine 的零拷贝呈现把 EGL swap
+  // interval 设为 0（不等 vsync），降低一帧以上的排队延迟。VNC/RDP 不受影响。
+  bool sunshineVsync = true;
 
   std::mutex meta;   // phase/error/retry/generation decisions
   std::mutex input;  // queued input + release epoch + pending lock sync
@@ -1292,6 +1297,12 @@ struct SessionState {
   bool cursorHidden = false;        // input
   bool cursorPending = false;       // input
   bool cursorDesiredHidden = false;  // input
+  // Whether setRemoteCursorHidden() has set a target in this session; resync falls
+  // back to the inverse of the session option (default desire: "shown").
+  bool cursorDesiredSet = false;    // input
+  // Session option copy (immutable after launch): the caller's record of the host
+  // cursor state at connect time.
+  bool sunshineHostCursorHidden = false;  // set before the thread starts
 
   std::deque<QueuedInput> inputs;  // input
   // syncRemoteLockState(): newest absolute CapsLock/NumLock state for RDP.
@@ -3239,6 +3250,9 @@ bool sunshineAcquireExternalSource(void* user, int generation, unsigned int* tex
   NativeWindow* window = nullptr;
   if (!tianguan::renderCreateExternalSource(state.id, textureId, &window)) return false;
   if (window == nullptr) return false;
+  // sunshineVsync=false：只把本会话（零拷贝呈现）的 swap interval 设成 0。放在
+  // 外部纹理源创建成功之后，Buffer 回退路径与 VNC/RDP 因此始终是默认的 1。
+  tianguan::renderSetSwapInterval(state.id, state.sunshineVsync ? 1 : 0);
   *nativeWindow = window;
   return true;
 }
@@ -3526,6 +3540,8 @@ struct SessionOptions {
   int sunshineBitrate = 20000;
   std::string sunshineFormats;
   bool sunshineEncryption = true;
+  // Sunshine only: 默认等 vsync；false 时零拷贝呈现把 swap interval 设为 0。
+  bool sunshineVsync = true;
   // 上次记录的主机光标隐藏状态（Sunshine 的 display_cursor 客户端无法查询，只能
   // 记录并由 ArkTS 持久化到连接条目；主机进程重启后会回到「显示」）。
   bool sunshineHostCursorHidden = false;
@@ -3650,6 +3666,10 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
       error = "invalid sunshine host cursor state";
       return false;
     }
+    if (!readBoolOption(json, "sunshineVsync", &options.sunshineVsync)) {
+      error = "invalid sunshine vsync";
+      return false;
+    }
   } catch (const std::exception& failure) {
     error = sanitizeLine(failure.what());
     return false;
@@ -3763,7 +3783,9 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   state->sunshineBitrate = options.sunshineBitrate;
   state->sunshineFormats = options.sunshineFormats;
   state->sunshineEncryption = options.sunshineEncryption;
+  state->sunshineVsync = options.sunshineVsync;
   state->cursorHidden = options.sunshineHostCursorHidden;
+  state->sunshineHostCursorHidden = options.sunshineHostCursorHidden;
   // Start the thread before publishing the session so closeSession() can never
   // find a session whose thread is still not joinable.
   try {
@@ -3946,18 +3968,32 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
   if (state->protocol == "sunshine" && phase == PhaseConnected) {
     const tianguan::SunshineVideoPerf video = tianguan::sunshineVideoPerf();
     const tianguan::RenderFramePerf render = tianguan::renderFramePerf();
-    char numbers[384];
+    char numbers[512];
     std::snprintf(numbers, sizeof(numbers),
                   "\"inFps\":%.1f,\"decFps\":%.1f,\"outFps\":%.1f,"
                   "\"lagMsAvg\":%.2f,\"lagMsP95\":%.2f,"
                   "\"convertMsAvg\":%.2f,\"commitMsAvg\":%.2f,"
                   "\"netToSubmitMsAvg\":%.2f,\"submitToOutputMsAvg\":%.2f,"
+                  "\"captureToSwapMsAvg\":%.2f,\"captureToSwapMsP95\":%.2f,"
+                  "\"receiveToSwapMsAvg\":%.2f,\"latencySource\":%d,"
                   "\"perfWindowMs\":%llu",
                   video.inFps, video.decFps, render.outFps, render.lagAvgMs,
                   render.lagP95Ms, video.convertAvgMs, video.commitAvgMs,
                   video.netToSubmitAvgMs, video.submitToOutputAvgMs,
-                  video.windowMs);
-    perfExtra = numbers;
+                  render.captureToSwapAvgMs, render.captureToSwapP95Ms,
+                  render.receiveToSwapAvgMs, render.latencySource, video.windowMs);
+    // 网络 RTT（common-c ENet 统计，后端输入线程每 5 秒采样）：和视频链路分段
+    // 耗时放在同一个 perf 对象里，便于区分「鼠标传递延迟」与「画面延迟」。
+    unsigned int rttAvg = 0;
+    unsigned int rttMin = 0;
+    if (tianguan::sunshineRttStatus(&rttAvg, &rttMin)) {
+      char rttNumbers[96];
+      std::snprintf(rttNumbers, sizeof(rttNumbers),
+                    ",\"rttMsAvg\":%u,\"rttMsMin\":%u", rttAvg, rttMin);
+      perfExtra = std::string(numbers) + rttNumbers;
+    } else {
+      perfExtra = numbers;
+    }
   }
 #endif
   out += ",\"perf\":" + perfJson(state->perf.snapshot(), perfExtra);
@@ -4300,9 +4336,51 @@ bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden) 
       return true;
     }
     state->cursorDesiredHidden = hidden;
+    state->cursorDesiredSet = true;
     state->cursorPending = true;
   }
   return connected;
+}
+
+// Sunshine only: re-align the locally recorded host-cursor state with reality.
+// The record can be inverted (earlier broken chord sends were recorded as success),
+// so this flips the record without sending anything and then applies the current
+// desired state: the last setRemoteCursorHidden() target, or — when none was set
+// in this session — the inverse of sunshineHostCursorHidden (i.e. "shown" for the
+// usual corrupted-record case). If the flipped record already equals the desired
+// state nothing is sent; otherwise the chord is queued for the input thread (sent
+// once connected). Returns false only for an unknown / non-Sunshine session.
+bool tianguan::resyncRemoteCursor(const std::string& sessionId) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  if (state->protocol != "sunshine") return false;
+  bool previous = false;
+  bool flipped = false;
+  bool desired = false;
+  bool willSend = false;
+  {
+    std::lock_guard<std::mutex> lock(state->input);
+    previous = state->cursorHidden;
+    state->cursorHidden = !previous;  // flip the record only, no key events
+    flipped = state->cursorHidden;
+    desired = state->cursorDesiredSet
+                  ? state->cursorDesiredHidden
+                  : !state->sunshineHostCursorHidden;
+    if (state->cursorHidden != desired) {
+      state->cursorDesiredHidden = desired;
+      state->cursorPending = true;
+      willSend = true;
+    } else {
+      state->cursorPending = false;
+    }
+  }
+  char line[192];
+  std::snprintf(line, sizeof(line),
+                "sunshine: resync host cursor: recorded %d -> %d, desired %d, %s",
+                previous ? 1 : 0, flipped ? 1 : 0, desired ? 1 : 0,
+                willSend ? "chord queued" : "no send");
+  emitDiagWarn(line);
+  return true;
 }
 
 // Times one takeFrame() call (including calls that return NONE). Declared

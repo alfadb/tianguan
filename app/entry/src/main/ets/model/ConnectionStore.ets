@@ -123,7 +123,9 @@ function sameConnection(a: ConnectionEntry, b: ConnectionEntry): boolean {
     a.sunshineFps === b.sunshineFps && a.sunshineBitrate === b.sunshineBitrate &&
     a.sunshineCodec === b.sunshineCodec &&
     a.sunshineLocalCursor === b.sunshineLocalCursor &&
-    a.sunshineHostCursorHidden === b.sunshineHostCursorHidden;
+    a.sunshineHostCursorHidden === b.sunshineHostCursorHidden &&
+    a.sunshineFollowWindow === b.sunshineFollowWindow &&
+    a.sunshineVsync === b.sunshineVsync;
 }
 
 function connectionsRoundTripEqual(expected: ConnectionEntry[],
@@ -187,10 +189,13 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
   // can never reach createSession as "invalid sunshine width".
   const quality = normalizeSunshineQuality(entry.sunshinePreset, entry.sunshineWidth,
     entry.sunshineHeight, entry.sunshineFps, entry.sunshineBitrate, entry.sunshineCodec);
-  // Local cursor defaults ON (including records written before the setting
-  // existed); the recorded host cursor state is true only when known hidden.
-  const sunshineLocalCursor = entry.sunshineLocalCursor !== false;
+  // Local cursor is OFF by default (old records too): only an explicit true
+  // enables it. The recorded host cursor state is true only when known hidden.
+  const sunshineLocalCursor = entry.sunshineLocalCursor === true;
   const sunshineHostCursorHidden = entry.sunshineHostCursorHidden === true;
+  // Follow-window and vsync both default ON; only a literal false disables them.
+  const sunshineFollowWindow = entry.sunshineFollowWindow !== false;
+  const sunshineVsync = entry.sunshineVsync !== false;
   const normalized: ConnectionEntry = {
     id: id,
     name: entry.name.trim().length > 0 ? entry.name.trim() : host,
@@ -211,7 +216,9 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
     sunshineBitrate: quality.bitrateMbps,
     sunshineCodec: quality.codec,
     sunshineLocalCursor: sunshineLocalCursor,
-    sunshineHostCursorHidden: sunshineHostCursorHidden
+    sunshineHostCursorHidden: sunshineHostCursorHidden,
+    sunshineFollowWindow: sunshineFollowWindow,
+    sunshineVsync: sunshineVsync
   };
   const kept: ConnectionEntry[] = [];
   let replaced = false;

@@ -53,6 +53,14 @@ export const submitPin: (sessionId: string, pin: string) => boolean;
 // non-Sunshine / not-connected session — in the not-connected case the desired
 // state is still recorded and sent once the connection is established.
 export const setRemoteCursorHidden: (sessionId: string, hidden: boolean) => boolean;
+// Sunshine/Moonlight only: re-align the recorded host-cursor state when it got out
+// of sync (e.g. "local cursor on" still shows the remote cursor, "local cursor off"
+// shows none, or Sunshine restarted and went back to showing its cursor). Flips the
+// local record without sending anything, then applies the desired state (the last
+// setRemoteCursorHidden target, or the inverse of sunshineHostCursorHidden when none
+// was set); only if the flipped record still differs is the corrected chord queued.
+// Returns false for an unknown / non-Sunshine session.
+export const resyncRemoteCursor: (sessionId: string) => boolean;
 // RDP only: set the remote CapsLock/NumLock toggle state to the given absolute
 // values through the Client Synchronize Event (Sync PDU). The key events
 // themselves are not forwarded on RDP. VNC is a no-op. Returns "OK" or

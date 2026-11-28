@@ -129,4 +129,39 @@ struct SunshineVideoPerf {
 // 最近一个完整 5 秒窗口的耗时快照；没有连接或还没到 5 秒时全 0。
 SunshineVideoPerf sunshineVideoPerf();
 
+// 端到端延迟用的「最近一帧」时间戳快照（进程级，视频线程写、渲染线程读）。
+//
+// 语义与时钟基：
+//   presentationTimeUs    DECODE_UNIT.presentationTimeUs，主机抓屏时刻。Limelight.h
+//                         （sunshine-deps 前缀里的 Limelight.h:169-171）写明它是
+//                         「epoch 为主机第一帧抓屏」的微秒；common-c 的实现
+//                         （RtpVideoQueue.c:158）直接由 RTP 90kHz 时间戳换算，
+//                         并没有做任何主机/客户端时钟换算（控制流的周期性 ping
+//                         只用于 RTT/FEC 统计，见 ControlStream.c:1609）。所以它
+//                         不能和客户端 now 直接相减。
+//   receiveTimeUs        common-c 收到该帧首包的客户端单调时钟微秒，与
+//                         LiGetMicroseconds() 同源（PltGetMicroseconds 的启动偏移
+//                         时间基），可以直接和 LiGetMicroseconds() 相减。
+//   hostToClientOffsetUs 客户端侧估计的「客户端时钟 - 主机时钟」偏移：取最近若干帧
+//                         (receiveTimeUs - presentationTimeUs) 的最小值（最优路径），
+//                         用于把 presentationTimeUs 换算到客户端时钟。
+//   notedAtUs            记录上述值时的客户端时钟；渲染线程用新鲜度判断（>1s 视为
+//                         过期，避免不同会话/上一代连接的快照被误用）。
+struct SunshineFrameTiming {
+  SunshineFrameTiming()
+      : presentationTimeUs(0),
+        receiveTimeUs(0),
+        hostToClientOffsetUs(0),
+        notedAtUs(0),
+        offsetValid(false),
+        valid(false) {}
+  long long presentationTimeUs;
+  long long receiveTimeUs;
+  long long hostToClientOffsetUs;
+  long long notedAtUs;
+  bool offsetValid;  // 偏移估计至少有一个样本
+  bool valid;        // presentationTimeUs 与 receiveTimeUs 都非 0
+};
+SunshineFrameTiming sunshineLatestFrameTiming();
+
 }  // namespace tianguan

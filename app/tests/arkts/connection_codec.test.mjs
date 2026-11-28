@@ -137,7 +137,8 @@ function entry(overrides) {
     protocol: 'vnc', username: '', domain: '', sunshineApp: '',
     sunshinePreset: 'balanced', sunshineWidth: 1920, sunshineHeight: 1080,
     sunshineFps: 60, sunshineBitrate: 20, sunshineCodec: 'auto',
-    sunshineLocalCursor: true, sunshineHostCursorHidden: false
+    sunshineLocalCursor: false, sunshineHostCursorHidden: false,
+    sunshineFollowWindow: true, sunshineVsync: true
   }, overrides || {});
 }
 
@@ -352,31 +353,33 @@ test('legacy record without quality fields loads as 均衡 and keeps its id', ()
   assert.equal(record.sunshineFps, 60);
   assert.equal(record.sunshineBitrate, 20);
   assert.equal(record.sunshineCodec, SUNSHINE_CODEC_AUTO);
-  // Local cursor defaults ON for every record; the recorded host state is
-  // "shown" until a session reports otherwise.
-  assert.equal(record.sunshineLocalCursor, true);
+  // Local cursor defaults OFF for every record (the remote cursor stays
+  // visible); the recorded host state is "shown" until a session reports
+  // otherwise.
+  assert.equal(record.sunshineLocalCursor, false);
   assert.equal(record.sunshineHostCursorHidden, false);
 });
 
-test('local cursor only a literal false disables it; host state only literal true', () => {
+test('local cursor is enabled only by an explicit true; host state only literal true', () => {
   const parsed = parseConnectionRecords(JSON.stringify([
-    { id: 'c1', host: 'a', protocol: 'sunshine', sunshineLocalCursor: 'false' },
-    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineLocalCursor: 0 },
-    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineLocalCursor: false },
-    { id: 'c4', host: 'd', protocol: 'sunshine', sunshineHostCursorHidden: 'true' },
-    { id: 'c5', host: 'e', protocol: 'sunshine', sunshineHostCursorHidden: 1 },
-    { id: 'c6', host: 'f', protocol: 'sunshine', sunshineHostCursorHidden: true }
+    { id: 'c1', host: 'a', protocol: 'sunshine', sunshineLocalCursor: 'true' },
+    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineLocalCursor: 1 },
+    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineLocalCursor: true },
+    { id: 'c4', host: 'd', protocol: 'sunshine', sunshineLocalCursor: false },
+    { id: 'c5', host: 'e', protocol: 'sunshine', sunshineHostCursorHidden: 'true' },
+    { id: 'c6', host: 'f', protocol: 'sunshine', sunshineHostCursorHidden: 1 },
+    { id: 'c7', host: 'g', protocol: 'sunshine', sunshineHostCursorHidden: true }
   ]));
   assert.deepEqual(parsed.map((record) => record.sunshineLocalCursor),
-    [true, true, false, true, true, true]);
+    [false, false, true, false, false, false, false]);
   assert.deepEqual(parsed.map((record) => record.sunshineHostCursorHidden),
-    [false, false, false, false, false, true]);
+    [false, false, false, false, false, false, true]);
 });
 
 test('local cursor preference and recorded host state round-trip', () => {
   const expected = [entry({
     id: 'csun-cursor', host: '10.0.0.5', port: '47989', protocol: 'sunshine',
-    sunshineLocalCursor: false, sunshineHostCursorHidden: true
+    sunshineLocalCursor: true, sunshineHostCursorHidden: true
   })];
   const text = serializeConnectionRecords(expected);
   assert.deepEqual(parseConnectionRecords(text), expected);
@@ -384,8 +387,50 @@ test('local cursor preference and recorded host state round-trip', () => {
   assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(parseConnectionRecords(text))),
     expected);
   const raw = JSON.parse(text)[0];
-  assert.equal(raw.sunshineLocalCursor, false);
+  assert.equal(raw.sunshineLocalCursor, true);
   assert.equal(raw.sunshineHostCursorHidden, true);
+});
+
+test('follow-window defaults ON for old records; only a literal false disables it', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'c1', host: 'a', protocol: 'sunshine' },
+    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineFollowWindow: 'false' },
+    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineFollowWindow: false },
+    { id: 'c4', host: 'd', protocol: 'sunshine', sunshineFollowWindow: true }
+  ]));
+  assert.deepEqual(parsed.map((record) => record.sunshineFollowWindow),
+    [true, true, false, true]);
+  // Round trip keeps the explicit false and the default true.
+  const expected = [
+    entry({ id: 'csun-follow-off', host: '10.0.0.6', port: '47989',
+      protocol: 'sunshine', sunshineFollowWindow: false }),
+    entry({ id: 'csun-follow-on', host: '10.0.0.7', port: '47989',
+      protocol: 'sunshine' })
+  ];
+  const text = serializeConnectionRecords(expected);
+  assert.deepEqual(parseConnectionRecords(text), expected);
+  assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(parseConnectionRecords(text))),
+    expected);
+});
+
+test('vsync defaults ON for old records; only a literal false disables it', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'c1', host: 'a', protocol: 'sunshine' },
+    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineVsync: 'false' },
+    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineVsync: false },
+    { id: 'c4', host: 'd', protocol: 'sunshine', sunshineVsync: true }
+  ]));
+  assert.deepEqual(parsed.map((record) => record.sunshineVsync),
+    [true, true, false, true]);
+  const expected = [entry({
+    id: 'csun-vsync-off', host: '10.0.0.8', port: '47989',
+    protocol: 'sunshine', sunshineVsync: false
+  })];
+  const text = serializeConnectionRecords(expected);
+  assert.deepEqual(parseConnectionRecords(text), expected);
+  assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(parseConnectionRecords(text))),
+    expected);
+  assert.equal(JSON.parse(text)[0].sunshineVsync, false);
 });
 
 test('username/domain default to empty string and reject non-strings', () => {

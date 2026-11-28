@@ -82,7 +82,7 @@ import {
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, submitPin,
   takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
-  syncRemoteLockState, setRemoteCursorHidden,
+  syncRemoteLockState, setRemoteCursorHidden, resyncRemoteCursor,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
   SESSION_STATE_PAIRING_REQUIRED, SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_ERROR_PAIR_FAILED
 } from '../diag/SessionApi';
@@ -481,9 +481,12 @@ const BUBBLE_MENU_ICON_VP: number = 16;
 const BUBBLE_MENU_EDGE_GAP_VP: number = 2;
 const BUBBLE_MENU_SAFE_VP: number =
   BUBBLE_MENU_BUTTON_RADIUS_VP + BUBBLE_MENU_EDGE_GAP_VP;
-// A 110 deg fan separates three buttons; it shrinks towards the inside of the
-// picture (down to 30 deg) when an edge would clip a button.
+// A 110 deg fan separates three / four buttons; it shrinks towards the inside of
+// the picture (down to 30 deg) when an edge would clip a button. A Sunshine
+// session with the local cursor adds a fifth button (本地光标 + 重新同步), which
+// needs a wider fan so the 44 vp circles stay apart.
 const BUBBLE_MENU_MAX_SPAN_DEG: number = 110;
+const BUBBLE_MENU_WIDE_MAX_SPAN_DEG: number = 145;
 const BUBBLE_MENU_MIN_SPAN_DEG: number = 30;
 const BUBBLE_MENU_ANIM_MS: number = 200;
 // PC: retract the menu ~1 s after the pointer leaves the bubble and its
@@ -931,7 +934,16 @@ struct Remote {
   // one of the host's virtual-display modes, chosen by the picture area. Its own
   // debounce (700 ms) / minimum interval (2 s) / first-report guard apply.
   private sunshineProtocol: boolean = false;
+  /**
+   * Connection preference (default true): follow the window size by restarting
+   * the stream at the best host mode. false disables the whole Sunshine follow
+   * (window changes AND the post-reconnect re-evaluation), so the stream keeps
+   * the configured tier / custom size.
+   */
+  private sunshineFollowWindow: boolean = true;
   private sunshineFollowTimer: number = -1;
+  /** One-shot status pull 1 s after a cursor resync (see resyncSunshineCursor). */
+  private sunshineCursorResyncTimer: number = -1;
   /** Last size sent to requestDesktopSize() / reported as the stream size. */
   private sunshineStreamW: number = 0;
   private sunshineStreamH: number = 0;
@@ -1148,13 +1160,22 @@ struct Remote {
     this.sunshineProtocol = this.sessionProtocol() === 'sunshine';
     this.resyncSunshineResizeFollow();
     // Sunshine local cursor: the saved connection preference decides whether the
-    // host cursor is hidden for this page; the recorded host state seeds the
-    // value until the first status poll reports the authoritative one.
+    // host cursor is hidden for this page (OFF unless explicitly enabled); the
+    // recorded host state seeds the value until the first status poll reports the
+    // authoritative one.
     const cursorEntry = this.connectionEntry();
     this.sunshineLocalCursor = this.sunshineProtocol && cursorEntry !== undefined &&
-      cursorEntry.sunshineLocalCursor !== false;
+      cursorEntry.sunshineLocalCursor === true;
     this.remoteCursorHidden = cursorEntry !== undefined &&
       cursorEntry.sunshineHostCursorHidden === true;
+    // Follow-window preference (default true). When off, no window change ever
+    // restarts the stream: the configured tier / custom size is kept.
+    this.sunshineFollowWindow = cursorEntry === undefined ? true :
+      cursorEntry.sunshineFollowWindow !== false;
+    if (!this.sunshineFollowWindow && this.sunshineFollowTimer >= 0) {
+      clearTimeout(this.sunshineFollowTimer);
+      this.sunshineFollowTimer = -1;
+    }
     markWindowOpen(this.sessionId, true);
     clipboardRegisterSession(this.sessionId);
     // onPageShow may have run (or not) before the session id was known; keep the
@@ -1220,6 +1241,10 @@ struct Remote {
     if (this.resizeTimeoutTimer >= 0) {
       clearTimeout(this.resizeTimeoutTimer);
       this.resizeTimeoutTimer = -1;
+    }
+    if (this.sunshineCursorResyncTimer >= 0) {
+      clearTimeout(this.sunshineCursorResyncTimer);
+      this.sunshineCursorResyncTimer = -1;
     }
     // Drop pending view-transform work before the surface goes away: the
     // timers would otherwise fire against a detached renderer.
@@ -2063,12 +2088,20 @@ struct Remote {
   /**
    * PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps 3 (fullscreen), but
    * its first button is "主列表" like the phone. A Sunshine session adds the
-   * 本地光标 toggle just before 断开. The first button is always at the -end of
+   * 本地光标 toggle just before 断开, and — while the local cursor is ON (the
+   * host cursor is hidden and its recorded state can be inverted) — a
+   * 重新同步远端光标 item next to it. The first button is always at the -end of
    * the fan and 断开 at the +end.
    */
   private bubbleMenuCount(): number {
-    const base = this.phoneUi ? 2 : 3;
-    return this.sunshineProtocol ? base + 1 : base;
+    let count = this.phoneUi ? 2 : 3;
+    if (this.sunshineProtocol) {
+      count += 1;
+      if (this.sunshineLocalCursor) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   private bubbleMenuAction(index: number): string {
@@ -2076,7 +2109,10 @@ struct Remote {
     if (index === count - 1) {
       return 'disconnect';
     }
-    if (this.sunshineProtocol && index === count - 2) {
+    if (this.sunshineProtocol && this.sunshineLocalCursor && index === count - 2) {
+      return 'resync-cursor';
+    }
+    if (this.sunshineProtocol && index === count - (this.sunshineLocalCursor ? 3 : 2)) {
       return 'local-cursor';
     }
     if (index === 0) {
@@ -2091,6 +2127,9 @@ struct Remote {
     const action = this.bubbleMenuAction(index);
     if (action === 'local-cursor') {
       return '本地光标（' + (this.sunshineLocalCursor ? '开' : '关') + '）';
+    }
+    if (action === 'resync-cursor') {
+      return '重新同步远端光标';
     }
     if (action === 'minimize') {
       return '最小化';
@@ -2173,6 +2212,14 @@ struct Remote {
       // Arrow pointer outline (16-unit grid): the "local cursor" mark.
       return m(3, 1.5) + l(3, 13) + l(6.2, 10) + l(8.4, 14.5) +
         l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
+    }
+    if (action === 'resync-cursor') {
+      // Clockwise refresh arrow: an octagon approximates the circle, with a
+      // small arrow head at the top (16-unit grid, ink 1.4..13.6).
+      return m(6.8, 1.8) + l(10.6, 2.6) + l(13.2, 5.6) + l(13.6, 9.4) +
+        l(11.6, 12.6) + l(8.2, 14.2) + l(4.4, 13.4) + l(1.8, 10.4) +
+        l(1.6, 6.6) + l(3.6, 3.4) + l(6.8, 1.8) +
+        m(7.4, 0.6) + l(10.6, 2.4) + l(7.2, 3.8);
     }
     return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
@@ -2269,7 +2316,10 @@ struct Remote {
     if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
       inward = Math.atan2(dy, dx) * 180 / Math.PI;
     }
-    for (let span = BUBBLE_MENU_MAX_SPAN_DEG;
+    // Five buttons (Sunshine + local cursor) need a wider fan to keep the same
+    // spacing; three / four keep the historical 110 deg.
+    const maxSpan = count >= 5 ? BUBBLE_MENU_WIDE_MAX_SPAN_DEG : BUBBLE_MENU_MAX_SPAN_DEG;
+    for (let span = maxSpan;
          span >= BUBBLE_MENU_MIN_SPAN_DEG; span -= 10) {
       let bestCenter = 0;
       let bestGap = 361;
@@ -2303,6 +2353,8 @@ struct Remote {
       this.toggleFullscreen();
     } else if (action === 'local-cursor') {
       this.toggleSunshineLocalCursor();
+    } else if (action === 'resync-cursor') {
+      this.resyncSunshineCursor();
     } else if (action === 'disconnect') {
       this.disconnectThisSession();
     }
@@ -2537,7 +2589,7 @@ struct Remote {
 
   /** 700 ms debounce for Sunshine (a drag produces many interim sizes). */
   private scheduleSunshineResizeFollow(delayMs: number = SUNSHINE_RESIZE_SETTLE_MS): void {
-    if (this.disposed || this.sessionId.length === 0) {
+    if (this.disposed || this.sessionId.length === 0 || !this.sunshineFollowWindow) {
       return;
     }
     if (this.sunshineFollowTimer >= 0) {
@@ -2556,7 +2608,10 @@ struct Remote {
    * must differ from both the last request and the current stream size.
    */
   private maybeRequestSunshineSize(): void {
-    if (this.disposed || this.sessionId.length === 0 || !this.sunshineProtocol) {
+    if (this.disposed || this.sessionId.length === 0 || !this.sunshineProtocol ||
+        !this.sunshineFollowWindow) {
+      // Follow-window OFF: never restart the stream for a window change, not even
+      // from the post-reconnect re-evaluation in applyStatus().
       return;
     }
     if (this.lastState !== SESSION_STATE_CONNECTED) {
@@ -2695,6 +2750,45 @@ struct Remote {
       this.sunshineLocalCursor = !next;
       this.refreshCursorVisibility(true);
     }
+  }
+
+  /**
+   * 重新同步远端光标: the backend's host-cursor record can be inverted (a chord
+   * that never reached the host was recorded as applied). resyncRemoteCursor()
+   * flips the record and re-applies the current desired state; the new
+   * authoritative value arrives via status.remoteCursorHidden, and this method
+   * also pulls the status once after 1 s so the saved connection is refreshed
+   * even when that poll is slow.
+   */
+  private resyncSunshineCursor(): void {
+    if (!this.sunshineProtocol || this.sessionId.length === 0) {
+      return;
+    }
+    const accepted = resyncRemoteCursor(this.sessionId);
+    if (!accepted) {
+      hilog.warn(DOMAIN, TAG, 'sunshine 重新同步远端光标未被受理 session=%{public}s',
+        this.sessionId);
+      return;
+    }
+    if (this.sunshineCursorResyncTimer >= 0) {
+      clearTimeout(this.sunshineCursorResyncTimer);
+    }
+    this.sunshineCursorResyncTimer = setTimeout((): void => {
+      this.sunshineCursorResyncTimer = -1;
+      if (this.disposed || this.sessionId.length === 0) {
+        return;
+      }
+      const latest = sessionStatus(this.sessionId);
+      if (latest === undefined || typeof latest.remoteCursorHidden !== 'boolean') {
+        return;
+      }
+      if (this.remoteCursorHidden !== latest.remoteCursorHidden) {
+        this.remoteCursorHidden = latest.remoteCursorHidden;
+      }
+      // The status value is authoritative for the host cursor state.
+      this.persistSunshineCursorState(this.sunshineLocalCursor, latest.remoteCursorHidden);
+      this.refreshCursorVisibility(true);
+    }, 1000);
   }
 
   /** (Re)starts the debounce; only a real area size change calls this. */
@@ -6554,8 +6648,9 @@ struct Remote {
             // The fan is computed so every button circle stays fully inside the
             // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
             // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone. A
-            // Sunshine session inserts 本地光标 just before 断开:
-            // [最小化/主列表, 全屏, 本地光标, 断开].
+            // Sunshine session inserts 本地光标 just before 断开, and (while the
+            // local cursor is on) 重新同步远端光标 between them:
+            // [最小化/主列表, 全屏, 本地光标, 重新同步, 断开].
             this.bubbleMenuButton(0)
             if (this.bubbleMenuAngles.length > 1) {
               this.bubbleMenuButton(1)
@@ -6565,6 +6660,9 @@ struct Remote {
             }
             if (this.bubbleMenuAngles.length > 3) {
               this.bubbleMenuButton(3)
+            }
+            if (this.bubbleMenuAngles.length > 4) {
+              this.bubbleMenuButton(4)
             }
             if (this.bubbleMenuHintIndex >= 0 &&
                 this.bubbleMenuHintIndex < this.bubbleMenuAngles.length) {

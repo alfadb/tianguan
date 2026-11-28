@@ -40,6 +40,7 @@
   "sunshineBitrate": 20000,   // 可选，默认 1280/720/60/20000（bitrate 单位 kbps）
   "sunshineFormats": "h264,hevc", // 可选，缺省按设备硬解能力自动
   "sunshineEncryption": "none",  // 可选，默认 ENCFLG_ALL；"none" 关闭
+  "sunshineVsync": false,        // 可选，默认 true（等 vsync）；false 仅对零拷贝呈现关闭 vsync
   "sunshineHostCursorHidden": false }  // 可选，上次记录的主机光标隐藏状态
 ```
 
@@ -53,6 +54,7 @@
 - `sunshineWidth`/`sunshineHeight`/`sunshineFps`/`sunshineBitrate` 默认 1280/720/60/20000 kbps，即 `/launch` 的 `mode=WxHxFPS`。默认码率取 20000 是因为 Moonlight 只有在视频码率 ≥ 15000 kbps（common-c `Limelight-internal.h` 的 `HIGH_AUDIO_BITRATE_THRESHOLD`）时才请求高音质音频（每声道 256 kbps，否则 96 kbps）。
 - `sunshineFormats` 缺省时自动选择：H.264 恒有；HEVC 需要设备有 `video/hevc` 硬解**且**服务端 `/serverinfo` 声明支持（否则协商会失败）。显式给出时按给定值（`h264` / `hevc`，`h265` 为 `hevc` 的别名）。
 - `sunshineEncryption` 缺省为 `ENCFLG_ALL`（音视频都加密）；传 `"none"` 时关成 `ENCFLG_NONE`（远端输入加密始终开启，无法关闭）。
+- `sunshineVsync`（布尔，缺省 `true`）：`false` 时**只对 Sunshine 的零拷贝呈现**把该会话的 EGL swap interval 设为 0（不等垂直同步），可去掉一帧以上的呈现排队；VNC/RDP 与 Buffer 回退路径始终是默认的 1。设置只在本会话的外部纹理源创建成功后生效，释放时恢复为 1。平台对 swap interval 没有查询接口（`eglSwapInterval` 即使被钳制也返回成功），判断是否真的生效要看 `perf.swap`/`outFps`：若 `swap` 仍集中在约一个刷新周期、`outFps` 仍≈屏幕刷新率，说明系统忽略了该设置。
 - **残留会话**：服务端上一条会话没被取消时，`/launch` 会返回 `status_code=400: An app is already running on this host`（旧版本直接把这条当成「连接已断开」）。现在按 Moonlight 客户端的通行做法处理：`/serverinfo` 的 `state=SUNSHINE_SERVER_BUSY` 且 `currentgame` 等于要启动的应用 ID → 用 `/resume` 接管续播（参数与 `/launch` 相同，服务端上的应用继续跑）；BUSY 但是别的应用 → 先 `/cancel`，每 500ms 轮询 `/serverinfo`、最多 10 秒等服务端回到空闲，再按服务端当时的状态用 `/resume`（仍指向同一应用）或 `/launch`。`/launch` 仍返回 400 且消息含 `already running` 时，再执行一次同样的「cancel → 等空闲 → launch/resume」，只重试一次；`/cancel` 自身失败只记日志，不让会话失败。
 - 停止/关窗（含 `closeSession` 打断会话线程）、`reconnectSession` 换代、对端结束或网络断开，只要本次尝试走到过 `/launch`，都会尽力向服务端发 `/cancel`；进程被杀来不及发的情况由上面的连接时处理兜底。
 - **主机结束串流时的重连规则**：`connectionTerminated(0)` 是 `ML_ERROR_GRACEFUL_TERMINATION`（`Limelight.h:421`，主机主动结束）；`connectionTerminated(-1)` 是控制流被对端断开且没有 termination 消息（`ControlStream.c:1600` 的 `ENET_EVENT_TYPE_DISCONNECT`，另有 `ControlStream.c:1369` 的断开握手超时），Sunshine 的 `/cancel` 与主机端应用退出都走这条，协议层无法与真正的网络中断区分。两者都按「终止前正常画面的持续时长」（首个非黑帧到最近非黑帧的跨度）判定：**< 3000 ms（含从未有画面）** → 视为主机显示会话状态变化（控制台会话被接回、被远程桌面占用等）造成的瞬时黑屏，会话进入 `state=reconnecting`，按 2s/4s/8s 退避自动重连，每次重新走 `/serverinfo` →（必要时 `/resume`，或 `/cancel`→等空闲）→`/launch`；**最多自动重连 3 次**，仍失败则 `state=failed`、`errorCode="network"`，`error` 固定为「主机多次结束串流且始终无画面：请确认主机控制台已登录（未被远程桌面占用）后重试」，由用户手动重连。**≥ 3000 ms** → 用户已正常观看，按主机主动结束处理：不自动重连，停在 `state=disconnected`（`error`「主机结束了串流」），保留会话供用户手动重连。其它错误码（网络中断、无视频流量等）的重连策略不变（`reconnecting` + 1s/2s/4s 退避）。代价：若纯网络中断先以 -1 到达、且此前已正常观看 ≥3 秒，会停在下线状态而不是自动重连，需用户手动重连。
@@ -106,11 +108,15 @@
 | `convertMsAvg` | 输出回调里 NV12/NV21 → BGRA 的 libswscale 转换平均耗时 |
 | `commitMsAvg` | `commitFrame`（含镜像拷贝）平均耗时 |
 | `lagMsAvg` / `lagMsP95` | Buffer 模式：镜像提交时间戳到渲染线程取走该帧的滞后；Surface 模式：帧可用回调到完成 `UpdateSurfaceImage`（见「零拷贝」一节） |
+| `captureToSwapMsAvg` / `captureToSwapMsP95` | 端到端延迟：`eglSwapBuffers` 返回到**最近一帧**的主机抓屏时刻（`DECODE_UNIT.presentationTimeUs`）。该字段的时间基是主机 RTP 时钟（`Limelight.h:169-171`「epoch 为主机第一帧抓屏」；common-c 由 RTP 90kHz 时间戳直接换算，见 `RtpVideoQueue.c:158`，并不做主机↔客户端时钟换算），所以客户端用「首包接收时刻 − 该时间戳」的滑动最小值估计两端偏移后再相减（估计值偏低约最小单向延迟）；PTS 无效或结果异常（>2 s 或 < −5 ms）时不采样 |
+| `receiveToSwapMsAvg` | PTS 不可用时的退化度量：`eglSwapBuffers` 返回到该帧首包接收时刻（同属客户端单调时钟，`LiGetMicroseconds()` 时间基） |
+| `latencySource` | 上一次 5 秒窗口用的时间源：`1` = presentationTimeUs，`2` = receiveTimeUs 退化，`0` = 无样本 |
+| `rttMsAvg` / `rttMsMin` | 网络往返时延（毫秒，`common-c` 的 ENet 统计 `LiGetEstimatedRttInfo`）：`rttMsAvg` 是最近一个窗口的平均 RTT；接口只给 avg 与 variance，`rttMsMin` 取本串流观察到的最小估计 `max(0, avg − variance)`。只能在 `LiStartConnection()` 与 `LiStopConnection()` 之间采样；ENet 统计还没就绪（刚连上/对端不用 ENet）时这两个字段不出现 |
 | `perfWindowMs` | 上述 5 秒窗口的实际长度 |
 
 - 这些都是**只读快照**，读取不等待解码或渲染；窗口没有样本时为 `0`。未连接、还没攒满一个 5 秒窗口、或没有挂载原生渲染器时，对应字段为 `0`（`perfWindowMs=0` 表示解码侧尚未发布过窗口）。
 - 只有 Sunshine 的帧镜像会写提交时间戳（`commitTimeUs`），所以 `lagMsAvg`/`lagMsP95` 只对 Sunshine 有意义；VNC/RDP 不产生这两个字段。Surface 模式下 `convertMsAvg`/`commitMsAvg` 恒为 0（CPU 转换与镜像拷贝都不存在）。
-- 后端同时每 5 秒打一条 W 级日志：`sunshine perf: in=…fps dec=…fps out=…fps netToSubmit=…/… submitToOutput=…/… convert=…/… commit=…/… lag=…/… swap=…/… surface=…/… (avg/p95 ms, window=…ms, dropped=…)`，其中 `swap` 是「取到帧（Surface 模式是完成 `UpdateSurfaceImage`）到 `eglSwapBuffers` 返回」，`surface` 只在 Surface 模式下非 0（帧可用到 swap 返回）；渲染线程自己的 `TianguanRender` 统计行也带 `lag=`/`pickupSwap=`（Surface 模式带 `src=surface`/`frameToSwap=`）。这些数字只用于定位瓶颈，不改变任何渲染或解码行为。
+- 后端同时每 5 秒打一条 W 级日志：`sunshine perf: rtt=…/… inputLag=…/… in=…fps dec=…fps out=…fps netToSubmit=…/… submitToOutput=…/… convert=…/… commit=…/… lag=…/… swap=…/… surface=…/… captureToSwap=…/… receiveToSwap=…/… (avg/p95 ms, latency=pts|recv|none, window=…ms, dropped=…, sendCalls=… sendFail=…)`——`rtt` 是 `avg/min` 网络往返时延（取不到时打印 `rtt=n/a` 并在行尾注明 `rtt unavailable`），`inputLag` 是「入队 → `LiSend*` 返回」的平均/P95（原 `sunshine input:` 行已并入本行），三项放在一起便于区分鼠标传递延迟与画面延迟，其中 `swap` 是「取到帧（Surface 模式是完成 `UpdateSurfaceImage`）到 `eglSwapBuffers` 返回」，`surface` 只在 Surface 模式下非 0（帧可用到 swap 返回），`captureToSwap` 是端到端延迟（见上表，`latency` 标明用的是 PTS 还是退化到首包接收时刻）；渲染线程自己的 `TianguanRender` 统计行也带 `lag=`/`pickupSwap=`/`captureToSwap=`/`receiveToSwap=`（Surface 模式带 `src=surface`/`frameToSwap=`/`swapInterval=`）。这些数字只用于定位瓶颈，不改变任何渲染或解码行为。
 
 ### 重新确认服务端指纹
 
@@ -240,12 +246,20 @@ releaseSessionInput(sessionId: string): string   // 释放按键/按钮并清指
 setRemoteCursorHidden(sessionId: string, hidden: boolean): boolean
 ```
 
-- **Sunshine/Moonlight 专用**。Sunshine 的光标编在视频里，跟随延迟等于视频链路；隐藏主机光标后由客户端显示本地系统光标。切换方式是发送 Sunshine 快捷键 **Ctrl+Alt+Shift+N**（`src/input.cpp` 的 `apply_shortcut` 翻转主机全局 `display_cursor`，且该组合键不传给桌面）。
+- **Sunshine/Moonlight 专用**。Sunshine 的光标编在视频里，跟随延迟等于视频链路；隐藏主机光标后由客户端显示本地系统光标。切换方式是发送 Sunshine 快捷键 **Ctrl+Alt+Shift+N**（`src/input.cpp` 的 `apply_shortcut` 翻转主机全局 `display_cursor`，且该组合键不传给桌面）。注意必须**真实按下/抬起修饰键**（`Ctrl↓ Alt↓ Shift↓ N↓ N↑ Shift↑ Alt↑ Ctrl↑`，每步 `LiSendKeyboardEvent`）：Sunshine 的 `shortcutFlags` 由修饰键本身的按下/抬起事件维护，只发一个带修饰位标记的 N 键不会触发快捷键、N 还会被传给桌面。
 - **同步**返回。会话已是目标状态 → `true`（不发送；同时取消尚未发出的反向请求）；请求被受理 → `true`（组合键由后端输入线程在 ~2 ms 内发出，发送成功后 `remoteCursorHidden` 才更新）；会话不存在 / 非 Sunshine / 未连接 → `false`（未连接时仍记录「期望状态」，连接建立后补发一次）。
 - 状态是**主机进程级、跨会话保持**的，客户端无法查询：原生只记录，ArkTS 负责持久化到连接条目并通过 `sunshineHostCursorHidden` 传回。**Sunshine 重启后会回到「显示」**，界面若怀疑主机重启过，应把记录重置为 `false` 再做切换。
 - 发送与前后状态均打 W 级日志；不涉及 PIN/密钥。
 
-- **Sunshine 输入低延迟**：输入线程每 **2 ms** 轮询一次共享队列（条件唤醒尚未接入，2 ms 即兜底上限），`drainInput` 内逐条同步调用 `LiSend*`，返回后立刻处理下一条，不做攒批或额外 sleep。绝对坐标用 `LiSendMousePositionEvent(x, y, 流宽, 流高)`，参考尺寸取**当前流**的最新值（分辨率调整后随视频 setup 更新）。同 mask 且非 boundary 的尾部移动才会合并（保留最新位置与时间戳），按下/抬起/滚轮等 boundary 事件永不合并或丢弃。每 5 秒一条 W 级日志 `sunshine input: queueLag=avg/p95 sendCalls=N sendFail=M (avg/p95 ms, samples=S)`：queueLag 是「入队 → `LiSend*` 返回」的间隔（`QueuedInput` 带 `steady_clock` 入队时刻），`sendFail` 单独统计 `LiSend*` 返回非 0（如 -2 输入流未就绪）的次数。
+```
+resyncRemoteCursor(sessionId: string): boolean
+```
+
+- **Sunshine/Moonlight 专用**。用于本地记录与主机真实状态不一致时重新对齐（例如修正组合键之前那些「无效发送被记成成功」留下的反向记录）：**先把本地记录翻转**（不发送任何按键），再按「当前期望状态」走一遍上面的逻辑——期望值取本会话最近一次 `setRemoteCursorHidden()` 的目标；从未设置过则取会话选项 `sunshineHostCursorHidden` 的反义（即默认期望「显示」）。翻转后的记录若与期望不同，就排队发送修正后的 `Ctrl↓ Alt↓ Shift↓ N↓ N↑ Shift↑ Alt↑ Ctrl↑`；相同则不发。
+- 返回 `false` 仅表示会话不存在或不是 Sunshine；其余情况返回 `true`（未连接时会排队，连接建立后由输入线程补发）。翻转前后、期望值与是否发送均打 W 级日志。
+- **使用场景**：发现「开本地光标时远端光标仍在」或「关本地光标时看不到任何光标」时点一次即可对齐；**Sunshine 重启后主机光标会恢复显示**，也需要对齐一次（此时界面可先按当前开关调一次 `setRemoteCursorHidden`，再调本接口）。
+
+- **Sunshine 输入低延迟**：输入线程每 **2 ms** 轮询一次共享队列（条件唤醒尚未接入，2 ms 即兜底上限），`drainInput` 内逐条同步调用 `LiSend*`，返回后立刻处理下一条，不做攒批或额外 sleep。绝对坐标用 `LiSendMousePositionEvent(x, y, 流宽, 流高)`，参考尺寸取**当前流**的最新值（分辨率调整后随视频 setup 更新）。同 mask 且非 boundary 的尾部移动才会合并（保留最新位置与时间戳），按下/抬起/滚轮等 boundary 事件永不合并或丢弃。该平均/P95 以 `inputLag=` 与 `sendCalls=`/`sendFail=` 的形式并入上面的 `sunshine perf:` 5 秒行（不再单独打 `sunshine input:` 行）：`inputLag` 是「入队 → `LiSend*` 返回」的间隔（`QueuedInput` 带 `steady_clock` 入队时刻），`sendFail` 单独统计 `LiSend*` 返回非 0（如 -2 输入流未就绪）的次数。
 
 ### RDP 锁定状态同步
 

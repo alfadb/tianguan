@@ -8,6 +8,7 @@
 #include "diagnostics.h"
 #include "render.h"
 #include "sunshine_backend.h"
+#include "sunshine_video.h"
 #include "view_geometry.h"
 
 #include <EGL/egl.h>
@@ -267,10 +268,14 @@ struct Renderer {
   // context); the caller blocks on taskDone. At most one command is in flight.
   std::mutex taskMutex;
   std::condition_variable taskDone;
-  int taskKind = 0;  // 0 = none, 1 = create external source, 2 = release it
+  int taskKind = 0;  // 0 = none, 1 = create external source, 2 = release it, 3 = swap interval
   bool taskFinished = false;
   bool taskOk = false;
   unsigned int taskTextureId = 0;
+  int taskSwapInterval = 1;  // 受 taskMutex 保护（kind == 3 的参数）
+  // 本会话生效的 EGL swap interval（0 = 不等 vsync，1 = 等 vsync）。默认 1；只有
+  // Sunshine 会话在 sunshineVsync=false 时才设 0（渲染线程执行）。
+  std::atomic<int> swapInterval{1};
   NativeWindow* taskWindow = nullptr;
   std::atomic<bool> loopFinished{false};
   // Frame-arrival signal shared with OH_NativeImage's listener callback.
@@ -529,6 +534,10 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
   FramePerfHistogram externalLag;          // 帧可用 -> UpdateSurfaceImage 完成
   FramePerfHistogram externalPickupSwap;   // UpdateSurfaceImage 完成 -> swap 返回
   FramePerfHistogram externalFrameToSwap;  // 帧可用 -> swap 返回
+  // 端到端延迟（每次 swap 返回采样一次；VNC/RDP 没有新鲜的 Sunshine 帧时间戳，
+  // 因此不会被计入）。captureToSwap 用主机抓屏时刻，拿不到时退化 receiveToSwap。
+  FramePerfHistogram latencyCaptureToSwap;
+  FramePerfHistogram latencyReceiveToSwap;
   std::string failure;
   EGLint lastEglError = EGL_SUCCESS;
   int clientVersion = 3;
@@ -899,6 +908,44 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     const bool black = sum < 4ull * 3 * (sizeof(pixels) / 4);
     tianguan::sunshineNoteVideoLuma(static_cast<unsigned long long>(NowMs()), black);
   };
+  // 端到端延迟采样：每次 swap 返回后调用。用「最近一帧」的 Sunshine 时间戳
+  // （sunshineLatestFrameTiming，视频线程写、这里读）：
+  //   captureToSwap = LiGetMicroseconds() - (presentationTimeUs + 主机/客户端偏移)；
+  //   PTS 无效/偏移未估计/结果异常（>2s 或 < -5ms）时退化
+  //   receiveToSwap = LiGetMicroseconds() - receiveTimeUs。
+  // 快照超过 1s 视为过期（别的会话或上一代连接的残留），不计样本；VNC/RDP 因此
+  // 永远不会被计入。
+  auto noteEndToEndLatency = [&]() {
+    const tianguan::SunshineFrameTiming timing = tianguan::sunshineLatestFrameTiming();
+    if (!timing.valid || timing.notedAtUs == 0) return;
+    const long long nowUs = static_cast<long long>(LiGetMicroseconds());
+    if (nowUs - timing.notedAtUs > 1000000 || nowUs < timing.notedAtUs) return;
+    if (timing.presentationTimeUs != 0 && timing.offsetValid) {
+      const long long captureToSwap =
+          nowUs - timing.presentationTimeUs - timing.hostToClientOffsetUs;
+      if (captureToSwap <= 2000000 && captureToSwap >= -5000) {
+        latencyCaptureToSwap.add(captureToSwap > 0 ? captureToSwap : 0);
+        return;
+      }
+    }
+    if (timing.receiveTimeUs != 0 && nowUs >= timing.receiveTimeUs) {
+      const long long receiveToSwap = nowUs - timing.receiveTimeUs;
+      if (receiveToSwap <= 2000000) latencyReceiveToSwap.add(receiveToSwap);
+    }
+  };
+  auto fillLatencyPerf = [&](tianguan::RenderFramePerf* perf) {
+    perf->captureToSwapAvgMs = latencyCaptureToSwap.avgMs();
+    perf->captureToSwapP95Ms = latencyCaptureToSwap.p95Ms();
+    perf->receiveToSwapAvgMs = latencyReceiveToSwap.avgMs();
+    perf->receiveToSwapP95Ms = latencyReceiveToSwap.p95Ms();
+    perf->latencySource = latencyCaptureToSwap.count != 0
+                              ? 1
+                              : (latencyReceiveToSwap.count != 0 ? 2 : 0);
+  };
+  auto resetLatencyWindow = [&]() {
+    latencyCaptureToSwap.reset();
+    latencyReceiveToSwap.reset();
+  };
   // Surface 模式的 5 秒窗口：发布 RenderFramePerf（后端 5 秒汇总行与 statusJson.perf
   // 读它），并打一条带 src=surface 的统计行。
   auto logExternalStatsIfDue = [&]() {
@@ -919,6 +966,7 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     perf.pickupToSwapP95Ms = externalPickupSwap.p95Ms();
     perf.frameAvailableToSwapAvgMs = externalFrameToSwap.avgMs();
     perf.frameAvailableToSwapP95Ms = externalFrameToSwap.p95Ms();
+    fillLatencyPerf(&perf);
     {
       std::lock_guard<std::mutex> lock(g_framePerfMutex);
       g_framePerf = perf;
@@ -926,16 +974,24 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     externalLag.reset();
     externalPickupSwap.reset();
     externalFrameToSwap.reset();
+    resetLatencyWindow();
     externalPerfSwaps = 0;
     externalPerfWindowStartUs = NowUs();
-    char line[640];
+    char line[768];
     std::snprintf(line, sizeof(line),
                   "session=%s src=surface frames=%lld fps=%.1f size=%dx%d tex=%dx%d "
-                  "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms frameToSwap=%.1f/%.1fms",
+                  "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms frameToSwap=%.1f/%.1fms "
+                  "captureToSwap=%.1f/%.1fms receiveToSwap=%.1f/%.1fms latencySrc=%s "
+                  "swapInterval=%d",
                   renderer->sessionId.c_str(), frames, perf.outFps, surfaceWidth,
                   surfaceHeight, texWidth, texHeight, perf.lagAvgMs, perf.lagP95Ms,
                   perf.pickupToSwapAvgMs, perf.pickupToSwapP95Ms,
-                  perf.frameAvailableToSwapAvgMs, perf.frameAvailableToSwapP95Ms);
+                  perf.frameAvailableToSwapAvgMs, perf.frameAvailableToSwapP95Ms,
+                  perf.captureToSwapAvgMs, perf.captureToSwapP95Ms,
+                  perf.receiveToSwapAvgMs, perf.receiveToSwapP95Ms,
+                  perf.latencySource == 1 ? "pts"
+                  : (perf.latencySource == 2 ? "recv" : "none"),
+                  renderer->swapInterval.load());
     LogDebug(line);
   };
   auto hasPendingTask = [&]() -> bool {
@@ -1083,12 +1139,37 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
       }
       externalActive = false;
       renderer->externalSourceActive.store(false);
+      // 回到 vsync 节流：Buffer 回退路径与 VNC/RDP 必须保持默认行为。
+      eglSwapInterval(display, 1);
+      renderer->swapInterval.store(1);
       texWidth = 0;
       texHeight = 0;
       ok = true;
-      char line[192];
-      std::snprintf(line, sizeof(line), "session=%s surface source released",
+      char line[224];
+      std::snprintf(line, sizeof(line),
+                    "session=%s surface source released, swapInterval restored to 1",
                     renderer->sessionId.c_str());
+      LogLine(line);
+    } else if (kind == 3) {
+      int interval = 1;
+      {
+        std::lock_guard<std::mutex> lock(renderer->taskMutex);
+        interval = renderer->taskSwapInterval;
+      }
+      if (interval < 0) interval = 0;
+      if (interval > 1) interval = 1;
+      // 只对本会话生效：eglSwapInterval 作用于当前 context/surface。
+      const EGLBoolean applied = eglSwapInterval(display, interval);
+      renderer->swapInterval.store(interval);
+      ok = applied == EGL_TRUE;
+      char line[224];
+      std::snprintf(line,
+                    sizeof(line),
+                    "session=%s swap interval set to %d (vsync %s, egl=%s); if fps stays "
+                    "at the panel rate the system clamps it",
+                    renderer->sessionId.c_str(), interval,
+                    interval == 0 ? "off" : "on",
+                    applied == EGL_TRUE ? "ok" : "failed");
       LogLine(line);
     }
     {
@@ -1301,6 +1382,8 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
               if (pickedUpUs != 0) externalPickupSwap.add(NowUs() - pickedUpUs);
               if (arrivedUs > 0 && NowUs() >= arrivedUs)
                 externalFrameToSwap.add(NowUs() - arrivedUs);
+              // 端到端：swap 已返回，用最近一帧的主机抓屏时刻算 captureToSwap。
+              noteEndToEndLatency();
               const long long nowMs = NowMs();
               if (lastLumaProbeMs == 0 || nowMs - lastLumaProbeMs >= 500) {
                 lastLumaProbeMs = nowMs;
@@ -1453,6 +1536,8 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
         geometryDirty = false;
         // 帧延迟 2：取到这一帧到 eglSwapBuffers 返回（拷贝/上传/绘制都在内）。
         if (pickupUs != 0) framePerfPickupToSwap.add(NowUs() - pickupUs);
+        // 端到端延迟（Sunshine Buffer 回退路径）：swap 返回后用最近一帧算。
+        noteEndToEndLatency();
       } else if (swapFailures >= kMaxSwapFailures) {
         setFailure(EglErrorText("eglSwapBuffers (repeated)", lastEglError));
         break;
@@ -1476,24 +1561,31 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
         framePerf.lagP95Ms = framePerfLag.p95Ms();
         framePerf.pickupToSwapAvgMs = framePerfPickupToSwap.avgMs();
         framePerf.pickupToSwapP95Ms = framePerfPickupToSwap.p95Ms();
+        fillLatencyPerf(&framePerf);
         {
           std::lock_guard<std::mutex> lock(g_framePerfMutex);
           g_framePerf = framePerf;
         }
         framePerfLag.reset();
         framePerfPickupToSwap.reset();
+        resetLatencyWindow();
         framePerfSwaps = 0;
         framePerfWindowStartUs = NowUs();
-        char line[640];
+        char line[768];
         std::snprintf(line, sizeof(line),
                       "session=%s frames=%lld fps=%.1f uploads=%lld full=%lld skips=%lld "
                       "swapFail=%lld size=%dx%d tex=%dx%d ver=%d elapsed=%lldms "
-                      "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms",
+                      "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms captureToSwap=%.1f/%.1fms "
+                      "receiveToSwap=%.1f/%.1fms latencySrc=%s",
                       renderer->sessionId.c_str(), frames, fps, uploads, fullUploads, skips,
                       swapFailures, surfaceWidth, surfaceHeight, texWidth, texHeight,
                       afterVersion, nowMs - startedAt, framePerf.lagAvgMs,
                       framePerf.lagP95Ms, framePerf.pickupToSwapAvgMs,
-                      framePerf.pickupToSwapP95Ms);
+                      framePerf.pickupToSwapP95Ms, framePerf.captureToSwapAvgMs,
+                      framePerf.captureToSwapP95Ms, framePerf.receiveToSwapAvgMs,
+                      framePerf.receiveToSwapP95Ms,
+                      framePerf.latencySource == 1 ? "pts"
+                      : (framePerf.latencySource == 2 ? "recv" : "none"));
         LogDebug(line);
       }
       publishStatsIfDue("running");
@@ -1836,6 +1928,33 @@ void renderReleaseExternalSource(const std::string& sessionId) {
     });
     if (renderer->loopFinished.load()) return;
     renderer->taskKind = 2;
+    renderer->taskOk = false;
+    renderer->taskFinished = false;
+  }
+  renderer->wake.notify_all();
+  {
+    std::unique_lock<std::mutex> lock(renderer->taskMutex);
+    renderer->taskDone.wait_until(lock, deadline, [&]() {
+      return renderer->taskFinished || renderer->loopFinished.load();
+    });
+  }
+}
+
+void renderSetSwapInterval(const std::string& sessionId, int interval) {
+  if (interval < 0) interval = 0;
+  if (interval > 1) interval = 1;
+  const std::shared_ptr<Renderer> renderer = FindRenderer(sessionId);
+  if (!renderer) return;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  {
+    std::unique_lock<std::mutex> lock(renderer->taskMutex);
+    // 等上一个控制命令结束（正常不会有）；渲染线程已结束就什么都不用做。
+    renderer->taskDone.wait_until(lock, deadline, [&]() {
+      return renderer->taskKind == 0 || renderer->loopFinished.load();
+    });
+    if (renderer->loopFinished.load()) return;
+    renderer->taskKind = 3;
+    renderer->taskSwapInterval = interval;
     renderer->taskOk = false;
     renderer->taskFinished = false;
   }

@@ -65,6 +65,10 @@ std::string renderStats(const std::string& sessionId);
 //                  下是 UpdateSurfaceImage 完成到 swap 返回；
 //   frameAvailableToSwapAvgMs/P95Ms  仅 Surface 源有意义：帧可用回调到 swap 返回
 //                  （上面两段之和，含 eglSwapInterval(1) 等待的 vsync）。
+//   captureToSwap   端到端延迟：swap 返回时刻 - 最近一帧的主机抓屏时刻（把
+//                  presentationTimeUs 用客户端估计的主机/客户端时钟偏移换算到
+//                  客户端时钟）；主机 PTS 无效或结果异常时退化为 receiveToSwap
+//                  （swap 返回 - 首包接收时刻），latencySource 标明用的哪一个。
 struct RenderFramePerf {
   RenderFramePerf()
       : outFps(0.0),
@@ -74,6 +78,11 @@ struct RenderFramePerf {
         pickupToSwapP95Ms(0.0),
         frameAvailableToSwapAvgMs(0.0),
         frameAvailableToSwapP95Ms(0.0),
+        captureToSwapAvgMs(0.0),
+        captureToSwapP95Ms(0.0),
+        receiveToSwapAvgMs(0.0),
+        receiveToSwapP95Ms(0.0),
+        latencySource(0),
         windowMs(0) {}
   double outFps;
   double lagAvgMs;
@@ -82,6 +91,11 @@ struct RenderFramePerf {
   double pickupToSwapP95Ms;
   double frameAvailableToSwapAvgMs;
   double frameAvailableToSwapP95Ms;
+  double captureToSwapAvgMs;
+  double captureToSwapP95Ms;
+  double receiveToSwapAvgMs;
+  double receiveToSwapP95Ms;
+  int latencySource;           // 0 = 无样本, 1 = presentationTimeUs, 2 = receiveTimeUs
   unsigned long long windowMs;  // 0 = 还没有发布过
 };
 RenderFramePerf renderFramePerf();
@@ -102,6 +116,12 @@ bool renderCreateExternalSource(const std::string& sessionId, unsigned int* text
                                 NativeWindow** nativeWindow);
 void renderSetExternalSourceSize(const std::string& sessionId, int width, int height);
 void renderReleaseExternalSource(const std::string& sessionId);
+
+// 按会话设置 EGL swap interval（0 = 不等垂直同步，1 = 等 vsync，默认 1）。只对
+// 该会话生效，在渲染线程（GL 上下文当前）执行；其它会话的渲染器不受影响。
+// Sunshine 的 sunshineVsync=false 会在这里传 0；释放外部纹理源时恢复为 1，
+// 保证 Buffer 回退路径与 VNC/RDP 仍是 vsync 节流。
+void renderSetSwapInterval(const std::string& sessionId, int interval);
 // Sets this session's view transform. zoom is clamped to [1, kMaxViewZoom];
 // panX/panY are surface-pixel offsets from the centred position and are
 // clamped against the live surface size while drawing. Returns "OK" or

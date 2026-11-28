@@ -58,6 +58,10 @@ export interface SessionOptions {
   // session (default false = host cursor shown). Passed so the backend can
   // restore the host-wide state without a needless toggle.
   sunshineHostCursorHidden?: boolean;
+  // Sunshine only: true (default) waits for vertical sync; false sets the EGL
+  // swap interval to 0 for the Sunshine zero-copy presentation only (lower
+  // latency, may tear). VNC/RDP and the buffer fallback are never affected.
+  sunshineVsync?: boolean;
 }
 
 /** Sunshine pairing info attached to state="pairing-required". */
@@ -421,6 +425,21 @@ export function setRemoteCursorHidden(sessionId: string, hidden: boolean): boole
     return diag.setRemoteCursorHidden(sessionId, hidden) === true;
   } catch (error) {
     warn('setRemoteCursorHidden', error);
+    return false;
+  }
+}
+
+/**
+ * Sunshine only: re-aligns the backend's host-cursor record with reality (it can
+ * be inverted). The backend flips its record and re-applies the current desired
+ * state; the authoritative value then arrives via status.remoteCursorHidden.
+ * Returns false only for an unknown / non-Sunshine session.
+ */
+export function resyncRemoteCursor(sessionId: string): boolean {
+  try {
+    return diag.resyncRemoteCursor(sessionId) === true;
+  } catch (error) {
+    warn('resyncRemoteCursor', error);
     return false;
   }
 }

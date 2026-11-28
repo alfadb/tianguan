@@ -33,6 +33,8 @@ interface StoredConnection {
   sunshineCodec?: string;
   sunshineLocalCursor?: boolean;
   sunshineHostCursorHidden?: boolean;
+  sunshineFollowWindow?: boolean;
+  sunshineVsync?: boolean;
 }
 
 /**
@@ -80,10 +82,11 @@ export interface ConnectionEntry {
   /** Sunshine video codec: 'auto' (native picks) | 'h264' | 'hevc'. */
   sunshineCodec?: string;
   /**
-   * Sunshine only: Moonlight-style local cursor. The host hides its own cursor
-   * and this client shows the system pointer, which follows the hand with zero
-   * latency. Default true (records written before this setting existed also get
-   * true).
+   * Sunshine only: experimental Moonlight-style local cursor. The host hides its
+   * own cursor and this client shows the system pointer, which follows the hand
+   * with zero latency but always looks like an arrow. Default false — the remote
+   * cursor is shown unless this is explicitly true (records written before this
+   * setting existed also get false).
    */
   sunshineLocalCursor?: boolean;
   /**
@@ -93,6 +96,19 @@ export interface ConnectionEntry {
    * authoritative and overwrites it whenever it changes.
    */
   sunshineHostCursorHidden?: boolean;
+  /**
+   * Sunshine only: follow the window size (drag / maximize / fullscreen) by
+   * picking the best host mode and restarting the stream. Default true (old
+   * records too). false keeps the stream at the configured tier / custom size
+   * and the remote page never calls requestDesktopSize for this connection.
+   */
+  sunshineFollowWindow?: boolean;
+  /**
+   * Sunshine only: true (default) waits for vertical sync; false disables vsync
+   * for the Sunshine zero-copy presentation only (lower latency, may tear).
+   * VNC/RDP are never affected.
+   */
+  sunshineVsync?: boolean;
 }
 
 /**
@@ -307,10 +323,14 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
     // 均衡 and the numbers follow that tier, so nothing has to be migrated.
     const quality = normalizeSunshineQuality(item.sunshinePreset, item.sunshineWidth,
       item.sunshineHeight, item.sunshineFps, item.sunshineBitrate, item.sunshineCodec);
-    // Local cursor defaults to ON for every record (including old ones); only a
-    // literal false disables it. The recorded host state defaults to shown.
-    const sunshineLocalCursor = item.sunshineLocalCursor !== false;
+    // Local cursor is OFF by default for every record (including old ones): the
+    // remote cursor is shown unless it was explicitly enabled. The recorded host
+    // state defaults to shown.
+    const sunshineLocalCursor = item.sunshineLocalCursor === true;
     const sunshineHostCursorHidden = item.sunshineHostCursorHidden === true;
+    // Both behaviour switches default to ON; only a literal false turns them off.
+    const sunshineFollowWindow = item.sunshineFollowWindow !== false;
+    const sunshineVsync = item.sunshineVsync !== false;
     const entry: ConnectionEntry = {
       id: id,
       name: name,
@@ -331,7 +351,9 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
       sunshineBitrate: quality.bitrateMbps,
       sunshineCodec: quality.codec,
       sunshineLocalCursor: sunshineLocalCursor,
-      sunshineHostCursorHidden: sunshineHostCursorHidden
+      sunshineHostCursorHidden: sunshineHostCursorHidden,
+      sunshineFollowWindow: sunshineFollowWindow,
+      sunshineVsync: sunshineVsync
     };
     result.push(entry);
   }
