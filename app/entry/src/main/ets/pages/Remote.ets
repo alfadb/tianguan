@@ -103,6 +103,9 @@ import { closeRemoteWindow, remoteReopenKeyForSession, sessionKeyForWindow } fro
 import { selectSunshineMode } from '../model/SunshineResolutions';
 import { containGeometry, pointInPicture, remotePointInPicture, hidesSystemPointer } from '../model/PictureGeometry';
 import type { PictureGeometry } from '../model/PictureGeometry';
+import { bubbleMenuAnglesFor, bubbleMenuSpanFor, cursorSubmenuEntries,
+  fanButtonX, fanButtonY, mainBubbleMenuEntries, submenuLabelRects } from '../model/BubbleMenu';
+import type { BubbleMenuEntry, MenuRect } from '../model/BubbleMenu';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -470,25 +473,28 @@ const BUBBLE_EDGE_OPACITY: number = 0.3;
 // Read on the first layout, written after a drag/snap and on relayout, and
 // removed when the session ends (kept across a phone minimize -> reopen).
 const BUBBLE_STORE_PREFIX: string = 'remote.bubble.';
-// Radial menu geometry: circular buttons on a 76 vp arc around the bubble.
+// Radial menu geometry: circular buttons on an arc around the bubble. VNC/RDP
+// keep the historical 76 vp radius / 44 vp buttons (visual unchanged). A Sunshine
+// session uses slightly larger buttons (50 vs 44 vp, +14 %) and a longer arc
+// radius: the default bubble sits near the bottom-right corner, where the
+// picture edge limits the fan to ~90 deg; the longer radius keeps the four main
+// buttons well apart inside that window. Both fans share the radius.
 const BUBBLE_MENU_RADIUS_VP: number = 76;
 const BUBBLE_MENU_BUTTON_VP: number = 44;
-const BUBBLE_MENU_BUTTON_RADIUS_VP: number = BUBBLE_MENU_BUTTON_VP / 2;
+const BUBBLE_MENU_RADIUS_LARGE_VP: number = 112;
+const BUBBLE_MENU_BUTTON_LARGE_VP: number = 50;
 // Fixed icon drawing area inside every button (vp). The icon is centred in this
 // box and the box is centred in the circular button.
 const BUBBLE_MENU_ICON_VP: number = 16;
+const BUBBLE_MENU_ICON_LARGE_VP: number = 18;
 // Clearance kept between a button circle and the picture edge.
 const BUBBLE_MENU_EDGE_GAP_VP: number = 2;
-const BUBBLE_MENU_SAFE_VP: number =
-  BUBBLE_MENU_BUTTON_RADIUS_VP + BUBBLE_MENU_EDGE_GAP_VP;
-// A 110 deg fan separates three / four buttons; it shrinks towards the inside of
-// the picture (down to 30 deg) when an edge would clip a button. A Sunshine
-// session adds two cursor switches (本地光标 + 远端光标) for a fifth button, which
-// needs a wider fan so the 44 vp circles stay apart.
-const BUBBLE_MENU_MAX_SPAN_DEG: number = 110;
-const BUBBLE_MENU_WIDE_MAX_SPAN_DEG: number = 145;
+// The narrowest fan the search may fall back to (a picture only a few vp wide).
 const BUBBLE_MENU_MIN_SPAN_DEG: number = 30;
 const BUBBLE_MENU_ANIM_MS: number = 200;
+// Size of the permanent label capsule beside a sub-fan button (vp).
+const BUBBLE_MENU_SUB_LABEL_W_VP: number = 64;
+const BUBBLE_MENU_SUB_LABEL_H_VP: number = 20;
 // PC: retract the menu ~1 s after the pointer leaves the bubble and its
 // buttons. Touch has no hover, so the menu stays until it is dismissed.
 const BUBBLE_MENU_HIDE_DELAY_MS: number = 1000;
@@ -811,6 +817,8 @@ struct Remote {
   @State private bubbleHovered: boolean = false;
   @State private bubblePressed: boolean = false;
   @State private bubbleMenuVisible: boolean = false;
+  /** '' = main fan; 'cursor' = the 光标 sub-fan. Only one fan is shown at a time. */
+  @State private bubbleMenuSubmenu: string = '';
   // Absolute angles (deg) of the menu buttons around the bubble centre, one per
   // button; empty while the menu is closed.
   @State private bubbleMenuAngles: number[] = [];
@@ -1828,7 +1836,7 @@ struct Remote {
     if (index < 0 || index >= this.bubbleMenuAngles.length) {
       return 0;
     }
-    const gap = BUBBLE_MENU_BUTTON_RADIUS_VP + 10;
+    const gap = this.bubbleMenuButtonRadius() + 10;
     return this.bubbleMenuHintAbove()
       ? this.bubbleMenuButtonY(index) - gap
       : this.bubbleMenuButtonY(index) + gap;
@@ -1994,6 +2002,8 @@ struct Remote {
     this.resetBubbleMenuHint();
     this.bubbleMenuLongPressIndex = -1;
     this.bubbleMenuEscPending = false;
+    // Every open starts on the main ring.
+    this.bubbleMenuSubmenu = '';
     const angles = this.computeBubbleMenuAngles();
     if (angles.length === 0) {
       return;
@@ -2002,6 +2012,54 @@ struct Remote {
     // their final positions for the appear transition to start at the bubble.
     this.bubbleMenuAngles = angles;
     this.bubbleMenuVisible = true;
+  }
+
+  /**
+   * 光标 ▸: swap the main ring for its child fan at the SAME anchor. The bubble
+   * button does not move and the main ring is hidden while the sub-fan is up.
+   */
+  private openCursorSubmenu(): void {
+    if (this.bubbleMenuSubmenu === 'cursor') {
+      return;
+    }
+    this.bubbleMenuSubmenu = 'cursor';
+    this.resetBubbleMenuHint();
+    const angles = this.computeBubbleMenuAngles();
+    if (angles.length === 0) {
+      // No room for the sub-fan: keep the main ring instead of showing nothing.
+      this.bubbleMenuSubmenu = '';
+      const mainAngles = this.computeBubbleMenuAngles();
+      this.bubbleMenuAngles = mainAngles;
+      return;
+    }
+    this.bubbleMenuAngles = angles;
+  }
+
+  /** 返回 / an outside press while the sub-fan is shown: back to the main ring. */
+  private backToMainBubbleMenu(): void {
+    if (this.bubbleMenuSubmenu === '') {
+      return;
+    }
+    this.bubbleMenuSubmenu = '';
+    this.resetBubbleMenuHint();
+    const angles = this.computeBubbleMenuAngles();
+    if (angles.length === 0) {
+      this.closeBubbleMenu('menu-no-fit');
+      return;
+    }
+    this.bubbleMenuAngles = angles;
+  }
+
+  /** An outside press: the sub-fan collapses to the main ring, the main ring closes. */
+  private dismissBubbleMenuOutside(reason: string): void {
+    if (!this.bubbleMenuVisible) {
+      return;
+    }
+    if (this.bubbleMenuSubmenu !== '') {
+      this.backToMainBubbleMenu();
+      return;
+    }
+    this.closeBubbleMenu(reason);
   }
 
   private closeBubbleMenu(reason: string): void {
@@ -2017,6 +2075,7 @@ struct Remote {
       return;
     }
     this.bubbleMenuVisible = false;
+    this.bubbleMenuSubmenu = '';
     this.bubbleMenuAngles = [];
     hilog.debug(DOMAIN, TAG, 'remote bubble menu closed reason=%{public}s', reason);
   }
@@ -2080,34 +2139,28 @@ struct Remote {
   }
 
   /**
-   * PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps 3 (fullscreen), but
-   * its first button is "主列表" like the phone. A Sunshine session adds TWO
-   * independent cursor switches just before 断开: 本地光标 (the client's own
-   * pointer) and 远端光标 (the cursor the host draws into the video), so the two
-   * ends are controlled separately. The first button is always at the -end of
-   * the fan and 断开 at the +end.
+   * The entries of the fan that is currently shown. The structure lives in
+   * model/BubbleMenu.ets (pure, unit-tested):
+   *   - main fan: [主列表/最小化, 全屏?, 光标?, 断开]; the Sunshine session adds
+   *     「光标」 whose children are the two cursor switches (no extra buttons in
+   *     the main ring);
+   *   - 光标 sub-fan: [本地光标, 远端光标, 返回].
+   * VNC/RDP have no children and keep the historical set and geometry.
    */
+  private bubbleMenuEntries(): BubbleMenuEntry[] {
+    if (this.bubbleMenuSubmenu === 'cursor') {
+      return cursorSubmenuEntries();
+    }
+    return mainBubbleMenuEntries(this.pcUi, this.phoneUi, this.sunshineProtocol);
+  }
+
   private bubbleMenuCount(): number {
-    return (this.phoneUi ? 2 : 3) + (this.sunshineProtocol ? 2 : 0);
+    return this.bubbleMenuEntries().length;
   }
 
   private bubbleMenuAction(index: number): string {
-    const count = this.bubbleMenuCount();
-    if (index === count - 1) {
-      return 'disconnect';
-    }
-    if (this.sunshineProtocol && index === count - 2) {
-      return 'remote-cursor';
-    }
-    if (this.sunshineProtocol && index === count - 3) {
-      return 'local-cursor';
-    }
-    if (index === 0) {
-      // 2-in-1 minimises its floating window; phone/tablet raise the connection
-      // list instead because minimize() would background the whole app task.
-      return this.pcUi ? 'minimize' : 'main-list';
-    }
-    return 'fullscreen';
+    const entries = this.bubbleMenuEntries();
+    return index >= 0 && index < entries.length ? entries[index].id : '';
   }
 
   private bubbleMenuLabel(index: number): string {
@@ -2118,46 +2171,86 @@ struct Remote {
     if (action === 'remote-cursor') {
       return '远端光标（' + (this.remoteCursorHidden ? '关' : '开') + '）';
     }
-    if (action === 'minimize') {
-      return '最小化';
-    }
-    if (action === 'main-list') {
-      return '主列表';
-    }
     if (action === 'fullscreen') {
       return this.fullscreen ? '退出全屏' : '全屏';
     }
-    return '断开';
+    const entries = this.bubbleMenuEntries();
+    return index >= 0 && index < entries.length ? entries[index].label : '';
+  }
+
+  /** Short static label of an entry (sub-fan labels; the state is the highlight). */
+  private bubbleMenuShortLabel(index: number): string {
+    const entries = this.bubbleMenuEntries();
+    return index >= 0 && index < entries.length ? entries[index].label : '';
   }
 
   private bubbleMenuDanger(index: number): boolean {
     return this.bubbleMenuAction(index) === 'disconnect';
   }
 
-  /** Icon drawing area in PHYSICAL px (vp2px(16)); cached after first use. */
+  /** Sub-fan switch state: ON buttons are highlighted (本地/远端光标). */
+  private bubbleMenuChecked(index: number): boolean {
+    if (this.bubbleMenuSubmenu !== 'cursor') {
+      return false;
+    }
+    const action = this.bubbleMenuAction(index);
+    if (action === 'local-cursor') {
+      return this.sunshineLocalCursor;
+    }
+    if (action === 'remote-cursor') {
+      // The host cursor is shown (switch ON) when it is not hidden.
+      return !this.remoteCursorHidden;
+    }
+    return false;
+  }
+
+  /** Button diameter: Sunshine's four-item fan uses the larger buttons. */
+  private bubbleMenuButtonSize(): number {
+    return this.sunshineProtocol ? BUBBLE_MENU_BUTTON_LARGE_VP : BUBBLE_MENU_BUTTON_VP;
+  }
+
+  private bubbleMenuButtonRadius(): number {
+    return this.bubbleMenuButtonSize() / 2;
+  }
+
+  /** Fan radius: the longer Sunshine arc keeps the 50 vp buttons apart. */
+  private bubbleMenuRadius(): number {
+    return this.sunshineProtocol ? BUBBLE_MENU_RADIUS_LARGE_VP : BUBBLE_MENU_RADIUS_VP;
+  }
+
+  /** Clearance from the picture edge for every button circle. */
+  private bubbleMenuSafe(): number {
+    return this.bubbleMenuButtonRadius() + BUBBLE_MENU_EDGE_GAP_VP;
+  }
+
+  private bubbleMenuIconVp(): number {
+    return this.sunshineProtocol ? BUBBLE_MENU_ICON_LARGE_VP : BUBBLE_MENU_ICON_VP;
+  }
+
+  /** Icon drawing area in PHYSICAL px (vp2px(iconVp)); cached after first use. */
   private bubbleMenuIconPx(): number {
     if (this.bubbleMenuIconPxCache > 0) {
       return this.bubbleMenuIconPxCache;
     }
     try {
-      this.bubbleMenuIconPxCache = this.getUIContext().vp2px(BUBBLE_MENU_ICON_VP);
+      this.bubbleMenuIconPxCache = this.getUIContext().vp2px(this.bubbleMenuIconVp());
     } catch (error) {
       hilog.warn(DOMAIN, TAG, '读取图标像素尺寸失败：%{public}s', String(error));
     }
     if (!(this.bubbleMenuIconPxCache > 0)) {
-      this.bubbleMenuIconPxCache = BUBBLE_MENU_ICON_VP * this.deviceDensity();
+      this.bubbleMenuIconPxCache = this.bubbleMenuIconVp() * this.deviceDensity();
     }
     return this.bubbleMenuIconPxCache;
   }
 
-  /** The 16 vp drawing area expressed in px, for Path width / height / layout. */
+  /** The icon drawing area expressed in px, for Path width / height / layout. */
   private bubbleMenuIconSize(): string {
     return this.bubbleMenuIconPx().toFixed(2) + 'px';
   }
 
   /** 2 design units of stroke scaled to the pixel drawing area. */
   private bubbleMenuIconStroke(): string {
-    return (this.bubbleMenuIconPx() * 2 / BUBBLE_MENU_ICON_VP).toFixed(2) + 'px';
+    return (this.bubbleMenuIconPx() * 2 / this.bubbleMenuIconVp()).toFixed(2) + 'px';
   }
 
   /**
@@ -2167,7 +2260,7 @@ struct Remote {
    * square pixel drawing area and its centre stays at the area centre.
    */
   private bubbleMenuIconCommands(action: string): string {
-    const scale = this.bubbleMenuIconPx() / BUBBLE_MENU_ICON_VP;
+    const scale = this.bubbleMenuIconPx() / this.bubbleMenuIconVp();
     const px = (value: number): string => (value * scale).toFixed(2);
     const m = (x: number, y: number): string => 'M' + px(x) + ' ' + px(y);
     const l = (x: number, y: number): string => 'L' + px(x) + ' ' + px(y);
@@ -2195,8 +2288,9 @@ struct Remote {
         m(14, 10) + l(14, 14) + l(10, 14) +
         m(6, 14) + l(2, 14) + l(2, 10);
     }
-    if (action === 'local-cursor') {
-      // Arrow pointer outline (16-unit grid): the "local cursor" mark.
+    if (action === 'local-cursor' || action === 'cursor') {
+      // Arrow pointer outline (16-unit grid): the "cursor" mark. The main fan's
+      // 光标 entry opens the sub-fan; 本地光标 is the same pointer on the client.
       return m(3, 1.5) + l(3, 13) + l(6.2, 10) + l(8.4, 14.5) +
         l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
     }
@@ -2206,6 +2300,10 @@ struct Remote {
         m(6.4, 6.2) + l(6.4, 13.4) + l(8.3, 10.6) + l(9.7, 14) +
         l(11.1, 13.3) + l(9.7, 9.9) + l(12.2, 9.4) + l(6.4, 6.2);
     }
+    if (action === 'back') {
+      // Left arrow: back to the main fan.
+      return m(14, 8) + l(2, 8) + m(2, 8) + l(7, 3) + m(2, 8) + l(7, 13);
+    }
     return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
 
@@ -2214,9 +2312,9 @@ struct Remote {
     if (index < 0 || index >= this.bubbleMenuAngles.length || w <= 0) {
       return this.bubbleCenterX();
     }
-    const rad = this.bubbleMenuAngles[index] * Math.PI / 180;
-    return this.clampBubble(this.bubbleCenterX() + BUBBLE_MENU_RADIUS_VP * Math.cos(rad),
-      BUBBLE_MENU_SAFE_VP, w - BUBBLE_MENU_SAFE_VP);
+    // Shared with the unit test so the label self-check sees the exact geometry.
+    return fanButtonX(this.bubbleCenterX(), this.bubbleMenuRadius(),
+      this.bubbleMenuAngles[index], this.bubbleMenuSafe(), w);
   }
 
   private bubbleMenuButtonY(index: number): number {
@@ -2224,31 +2322,8 @@ struct Remote {
     if (index < 0 || index >= this.bubbleMenuAngles.length || h <= 0) {
       return this.bubbleCenterY();
     }
-    const rad = this.bubbleMenuAngles[index] * Math.PI / 180;
-    return this.clampBubble(this.bubbleCenterY() + BUBBLE_MENU_RADIUS_VP * Math.sin(rad),
-      BUBBLE_MENU_SAFE_VP, h - BUBBLE_MENU_SAFE_VP);
-  }
-
-  /**
-   * Evenly spaced fan angles from -span/2 to +span/2. For 2 and 3 buttons this is
-   * bit-for-bit the previous layout ([±span/2] and [-span/2, 0, +span/2]); a
-   * Sunshine session adds a 4th button and gets [-span/2, -span/6, +span/6,
-   * +span/2].
-   */
-  private bubbleMenuAnglesFor(count: number, centerDeg: number, spanDeg: number): number[] {
-    const angles: number[] = [];
-    if (count <= 0) {
-      return angles;
-    }
-    if (count === 1) {
-      angles.push(centerDeg);
-      return angles;
-    }
-    const step = spanDeg / (count - 1);
-    for (let i = 0; i < count; i++) {
-      angles.push(centerDeg - spanDeg / 2 + step * i);
-    }
-    return angles;
+    return fanButtonY(this.bubbleCenterY(), this.bubbleMenuRadius(),
+      this.bubbleMenuAngles[index], this.bubbleMenuSafe(), h);
   }
 
   private bubbleMenuAngleGap(a: number, b: number): number {
@@ -2261,11 +2336,12 @@ struct Remote {
 
   /** True when every button circle of this fan is fully inside the picture. */
   private bubbleMenuFits(angles: number[], width: number, height: number): boolean {
-    const safe = BUBBLE_MENU_SAFE_VP;
+    const safe = this.bubbleMenuSafe();
+    const radius = this.bubbleMenuRadius();
     for (let i = 0; i < angles.length; i++) {
       const rad = angles[i] * Math.PI / 180;
-      const x = this.bubbleCenterX() + BUBBLE_MENU_RADIUS_VP * Math.cos(rad);
-      const y = this.bubbleCenterY() + BUBBLE_MENU_RADIUS_VP * Math.sin(rad);
+      const x = this.bubbleCenterX() + radius * Math.cos(rad);
+      const y = this.bubbleCenterY() + radius * Math.sin(rad);
       if (x < safe || x > width - safe || y < safe || y > height - safe) {
         return false;
       }
@@ -2274,17 +2350,12 @@ struct Remote {
   }
 
   /**
-   * Absolute angles for the menu buttons. The fan is centred on the direction
-   * towards the picture centre and as wide as 110 deg; when a button circle
-   * would cross an edge (any of the four edges or corners) the search shrinks
-   * the span and rotates the fan until every circle fits, so the fan always
-   * opens towards the inside of the picture. The first button is always at the
-   * -end: [最小化, 全屏, 断开] on PC, [主列表, 全屏, 断开] on tablet and
-   * [主列表, 断开] on phone. 断开 is the +end of the fan, so it is the button
-   * farthest from the first action and never sits between the bubble and the
-   * other actions. If even the narrowest fan does not fit (a picture only a few
-   * vp wide), the per-button clamp in bubbleMenuButtonX/Y still keeps every
-   * circle inside.
+   * Absolute angles for the menu buttons of the CURRENT fan (main ring or the
+   * 光标 sub-fan). The fan is centred on the direction towards the picture
+   * centre and as wide as the preferred span (model/BubbleMenu.ets); when a
+   * button circle would cross an edge the search shrinks the span and rotates
+   * the fan until every circle fits. The first button is always at the -end and
+   * 断开 at the +end, so 断开 keeps the outermost / right-top position.
    */
   private computeBubbleMenuAngles(): number[] {
     const width = this.bubbleAreaW;
@@ -2301,15 +2372,16 @@ struct Remote {
     if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
       inward = Math.atan2(dy, dx) * 180 / Math.PI;
     }
-    // Five buttons (Sunshine + local cursor) need a wider fan to keep the same
-    // spacing; three / four keep the historical 110 deg.
-    const maxSpan = count >= 5 ? BUBBLE_MENU_WIDE_MAX_SPAN_DEG : BUBBLE_MENU_MAX_SPAN_DEG;
+    const submenu = this.bubbleMenuSubmenu !== '';
+    const maxSpan = bubbleMenuSpanFor(count, submenu);
     for (let span = maxSpan;
          span >= BUBBLE_MENU_MIN_SPAN_DEG; span -= 10) {
       let bestCenter = 0;
       let bestGap = 361;
-      for (let center = 0; center < 360; center += 3) {
-        const angles = this.bubbleMenuAnglesFor(count, center, span);
+      // 1 deg steps: near an edge the set of fitting centres can be only a few
+      // degrees wide; a coarser grid would miss it and shrink the span needlessly.
+      for (let center = 0; center < 360; center += 1) {
+        const angles = bubbleMenuAnglesFor(count, center, span);
         if (!this.bubbleMenuFits(angles, width, height)) {
           continue;
         }
@@ -2320,15 +2392,43 @@ struct Remote {
         }
       }
       if (bestGap <= 360) {
-        return this.bubbleMenuAnglesFor(count, bestCenter, span);
+        return bubbleMenuAnglesFor(count, bestCenter, span);
+      }
+      if (submenu) {
+        // Never shrink the sub-fan: its 90 deg keeps the two cursor switches
+        // 90 deg apart (返回 sits between them). Near an edge the shared
+        // per-button clamp keeps every circle inside the picture instead.
+        return bubbleMenuAnglesFor(count, inward, maxSpan);
       }
     }
-    return this.bubbleMenuAnglesFor(count, inward, BUBBLE_MENU_MIN_SPAN_DEG);
+    return bubbleMenuAnglesFor(count, inward, BUBBLE_MENU_MIN_SPAN_DEG);
   }
 
-  /** Runs one menu action; every action closes the menu first. */
+  /**
+   * Runs one menu action. Actions that change the fan (光标 ▸ / 返回) or a cursor
+   * switch stay inside the menu; every other action closes it first.
+   */
   private runBubbleMenuAction(index: number): void {
     const action = this.bubbleMenuAction(index);
+    if (action.length === 0) {
+      return;
+    }
+    if (action === 'cursor') {
+      this.openCursorSubmenu();
+      return;
+    }
+    if (action === 'back') {
+      this.backToMainBubbleMenu();
+      return;
+    }
+    if (action === 'local-cursor') {
+      this.toggleSunshineLocalCursor();
+      return;
+    }
+    if (action === 'remote-cursor') {
+      this.toggleSunshineRemoteCursor();
+      return;
+    }
     this.closeBubbleMenu('action-' + action);
     if (action === 'minimize') {
       this.minimizeThisWindow();
@@ -2336,10 +2436,6 @@ struct Remote {
       this.returnToMainList();
     } else if (action === 'fullscreen') {
       this.toggleFullscreen();
-    } else if (action === 'local-cursor') {
-      this.toggleSunshineLocalCursor();
-    } else if (action === 'remote-cursor') {
-      this.toggleSunshineRemoteCursor();
     } else if (action === 'disconnect') {
       this.disconnectThisSession();
     }
@@ -5755,13 +5851,16 @@ struct Remote {
    *  - 最小化 (PC only): one horizontal bar
    *  - 主列表 (phone/tablet): three bars of different lengths
    *  - 全屏 / 退出全屏: outward / inward corner brackets
+   *  - 光标 / 本地光标: an arrow pointer (光标 opens the sub-fan)
+   *  - 远端光标: an arrow on a monitor outline
+   *  - 返回: a left arrow
    *  - 断开: a cross
    */
   @Builder
   private bubbleMenuGlyph(index: number) {
     // ArkUI Shape / Path commands are in PX and do not scale with the component,
     // so the drawing area, every command coordinate and the stroke are generated
-    // from vp2px(16). The fixed pixel-size Stack is centred in the 44 vp button;
+    // from vp2px(icon vp). The fixed pixel-size Stack is centred in the button;
     // the Path fills that box and the 16-unit design is symmetric about its
     // centre, so the ink is centred on both PC and phone at any density.
     Stack({ alignContent: Alignment.Center }) {
@@ -5785,21 +5884,23 @@ struct Remote {
     Stack({ alignContent: Alignment.Center }) {
       this.bubbleMenuGlyph(index)
     }
-    .width(BUBBLE_MENU_BUTTON_VP)
-    .height(BUBBLE_MENU_BUTTON_VP)
-    .borderRadius(BUBBLE_MENU_BUTTON_RADIUS_VP)
-    .backgroundColor(this.bubbleMenuDanger(index) ? '#CC7F1D1D' : '#CC202124')
+    .width(this.bubbleMenuButtonSize())
+    .height(this.bubbleMenuButtonSize())
+    .borderRadius(this.bubbleMenuButtonRadius())
+    .backgroundColor(this.bubbleMenuDanger(index) ? '#CC7F1D1D' :
+      (this.bubbleMenuChecked(index) ? $r('app.color.brand') : '#CC202124'))
     .border({
       width: 1,
-      color: this.bubbleMenuDanger(index) ? '#66FF8A80' : '#40FFFFFF'
+      color: this.bubbleMenuDanger(index) ? '#66FF8A80' :
+        (this.bubbleMenuChecked(index) ? '#FFFFFFFF' : '#40FFFFFF')
     })
     .shadow({ radius: 6, color: '#66000000', offsetY: 2 })
     // The fan point is the final position; the appear / disappear transition
     // translates the same node to the bubble centre with a smaller scale, so
     // the buttons pop out of the bubble and retract back into it.
     .position({
-      x: this.bubbleMenuButtonX(index) - BUBBLE_MENU_BUTTON_RADIUS_VP,
-      y: this.bubbleMenuButtonY(index) - BUBBLE_MENU_BUTTON_RADIUS_VP
+      x: this.bubbleMenuButtonX(index) - this.bubbleMenuButtonRadius(),
+      y: this.bubbleMenuButtonY(index) - this.bubbleMenuButtonRadius()
     })
     .focusable(false)
     // PC hover shows the same self-drawn label as a touch long press (bindTips
@@ -5847,6 +5948,49 @@ struct Remote {
       .combine(TransitionEffect.scale({ x: 0.4, y: 0.4 }))
       .combine(TransitionEffect.OPACITY)
       .animation({ duration: BUBBLE_MENU_ANIM_MS, curve: Curve.EaseOut }))
+  }
+
+  /**
+   * Permanent label under a sub-fan button (本地光标 / 远端光标 / 返回). The main
+   * ring has no permanent labels (its hint appears on hover / long press).
+   * Hit-test transparent so the label never steals the button tap.
+   */
+  @Builder
+  private bubbleMenuSubLabel(index: number) {
+    Row() {
+      Text(this.bubbleMenuShortLabel(index))
+        .fontSize(11)
+        .fontColor('#F2F2F2')
+        .maxLines(1)
+    }
+    .justifyContent(FlexAlign.Center)
+    .width(BUBBLE_MENU_SUB_LABEL_W_VP)
+    .height(BUBBLE_MENU_SUB_LABEL_H_VP)
+    // Semi-transparent capsule: the label keeps its contrast on dark video.
+    .backgroundColor('#E6202124')
+    .borderRadius(BUBBLE_MENU_SUB_LABEL_H_VP / 2)
+    .shadow({ radius: 4, color: '#66000000', offsetY: 1 })
+    .position({
+      x: this.bubbleMenuSubLabelRect(index).x,
+      y: this.bubbleMenuSubLabelRect(index).y
+    })
+    .focusable(false)
+    .hitTestBehavior(HitTestMode.None)
+    // Same 200 ms fade as the button fan open/close.
+    .transition(TransitionEffect.OPACITY
+      .animation({ duration: BUBBLE_MENU_ANIM_MS, curve: Curve.EaseOut }))
+  }
+
+  /** Capsule beside the button (left, right or outward); never on a button. */
+  private bubbleMenuSubLabelRect(index: number): MenuRect {
+    const rects = submenuLabelRects(this.bubbleCenterX(), this.bubbleCenterY(),
+      this.bubbleMenuRadius(), this.bubbleMenuAngles, this.bubbleMenuButtonSize(),
+      this.bubbleMenuSafe(), BUBBLE_MENU_SUB_LABEL_W_VP, BUBBLE_MENU_SUB_LABEL_H_VP,
+      this.bubbleAreaW, this.bubbleAreaH);
+    if (index >= 0 && index < rects.length) {
+      return rects[index];
+    }
+    return { x: 0, y: 0, w: 0, h: 0 };
   }
 
   /**
@@ -6201,7 +6345,8 @@ struct Remote {
                   '菜单收起吞掉触摸 type=%{public}s fingers=%{public}d',
                   Remote.touchTypeName(event.type), fingers);
                 if (this.bubbleMenuVisible) {
-                  this.closeBubbleMenu('picture-touch');
+                  // Sub-fan -> main ring; main ring -> close.
+                  this.dismissBubbleMenuOutside('picture-touch');
                 }
                 // A touch on remote_area: let the position rule decide whether
                 // the local cursor belongs here (black bars keep it hidden).
@@ -6241,7 +6386,7 @@ struct Remote {
               // event is added or removed by it.
               this.pointerOverPicture = true;
               this.refreshCursorVisibility();
-              this.closeBubbleMenu('picture-touch');
+              this.dismissBubbleMenuOutside('picture-touch');
               this.requestViewFocus();
               // Do not press yet: this touch may still become a pinch, a tap
               // or a long press. The mask-0 move keeps the remote pointer (and
@@ -6321,7 +6466,7 @@ struct Remote {
               hilog.debug(DOMAIN, TAG,
                 '菜单收起吞掉鼠标按下 x=%{public}d y=%{public}d',
                 Math.round(event.x), Math.round(event.y));
-              this.closeBubbleMenu('picture-press');
+              this.dismissBubbleMenuOutside('picture-press');
               this.bubbleMenuDismissSwallowMouse = true;
               this.armBubbleMenuDismissTimeout();
               // Focus normally follows touch, not mouse clicks, so grab it here;
@@ -6597,22 +6742,34 @@ struct Remote {
           }
           if (this.bubbleMenuVisible && this.bubbleMenuAngles.length > 0) {
             // The fan is computed so every button circle stays fully inside the
-            // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
-            // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone. A
-            // Sunshine session inserts two independent cursor switches just
-            // before 断开: [最小化/主列表, 全屏, 本地光标, 远端光标, 断开].
-            this.bubbleMenuButton(0)
-            if (this.bubbleMenuAngles.length > 1) {
-              this.bubbleMenuButton(1)
-            }
-            if (this.bubbleMenuAngles.length > 2) {
-              this.bubbleMenuButton(2)
-            }
-            if (this.bubbleMenuAngles.length > 3) {
-              this.bubbleMenuButton(3)
-            }
-            if (this.bubbleMenuAngles.length > 4) {
-              this.bubbleMenuButton(4)
+            // picture. 断开 (red) is the +end of the arc. Main ring (Sunshine):
+            // [最小化/主列表, 全屏, 光标 ▸, 断开]. The 光标 sub-fan is a separate
+            // if-branch (same anchor, main ring hidden), so switching fans plays
+            // the same 200 ms retract/pop-out transition as open/close.
+            if (this.bubbleMenuSubmenu === '') {
+              this.bubbleMenuButton(0)
+              if (this.bubbleMenuAngles.length > 1) {
+                this.bubbleMenuButton(1)
+              }
+              if (this.bubbleMenuAngles.length > 2) {
+                this.bubbleMenuButton(2)
+              }
+              if (this.bubbleMenuAngles.length > 3) {
+                this.bubbleMenuButton(3)
+              }
+            } else {
+              // Sub-fan: every item carries a permanent short label; the switch
+              // state itself is shown by the highlighted button behind it.
+              this.bubbleMenuButton(0)
+              this.bubbleMenuSubLabel(0)
+              if (this.bubbleMenuAngles.length > 1) {
+                this.bubbleMenuButton(1)
+                this.bubbleMenuSubLabel(1)
+              }
+              if (this.bubbleMenuAngles.length > 2) {
+                this.bubbleMenuButton(2)
+                this.bubbleMenuSubLabel(2)
+              }
             }
             if (this.bubbleMenuHintIndex >= 0 &&
                 this.bubbleMenuHintIndex < this.bubbleMenuAngles.length) {

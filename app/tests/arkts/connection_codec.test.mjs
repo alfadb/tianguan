@@ -3,6 +3,8 @@
 // Host-side unit test for the pure ArkTS logic that needs no device:
 //   - app/entry/src/main/ets/model/ConnectionCodec.ets   (connections.json codec)
 //   - app/entry/src/main/ets/model/SunshineResolutions.ets (Sunshine mode picker)
+//   - app/entry/src/main/ets/model/PictureGeometry.ets   (contain fit / pointer rule)
+//   - app/entry/src/main/ets/model/BubbleMenu.ets        (radial menu structure / fan)
 //
 // Runs under plain Node (no device, no network, no oh_modules):
 //   1. copies the .ets sources byte for byte into a temp dir as .ts,
@@ -28,6 +30,8 @@ const RESOLUTION_SOURCE =
   path.join(REPO_ROOT, 'app/entry/src/main/ets/model/SunshineResolutions.ets');
 const PICTURE_SOURCE =
   path.join(REPO_ROOT, 'app/entry/src/main/ets/model/PictureGeometry.ets');
+const BUBBLE_MENU_SOURCE =
+  path.join(REPO_ROOT, 'app/entry/src/main/ets/model/BubbleMenu.ets');
 const SDK_ROOT = process.env.TIANGUAN_SDK_ROOT ||
   '/home/worker/harmonyos/command-line-tools/26.0.0.821';
 const TSC = process.env.TIANGUAN_TSC ||
@@ -50,11 +54,16 @@ if (!fs.existsSync(PICTURE_SOURCE)) {
   console.error(`FAIL: source not found: ${PICTURE_SOURCE}`);
   process.exit(1);
 }
+if (!fs.existsSync(BUBBLE_MENU_SOURCE)) {
+  console.error(`FAIL: source not found: ${BUBBLE_MENU_SOURCE}`);
+  process.exit(1);
+}
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tianguan-codec-test-'));
 let codec;
 let resolutions;
 let picture;
+let bubbleMenu;
 
 try {
   // Stage the real production sources as .ts (tsc does not accept .ets) without
@@ -65,6 +74,8 @@ try {
   fs.copyFileSync(RESOLUTION_SOURCE, stagedResolutions);
   const stagedPicture = path.join(tempDir, 'PictureGeometry.ts');
   fs.copyFileSync(PICTURE_SOURCE, stagedPicture);
+  const stagedBubbleMenu = path.join(tempDir, 'BubbleMenu.ts');
+  fs.copyFileSync(BUBBLE_MENU_SOURCE, stagedBubbleMenu);
   const outDir = path.join(tempDir, 'out');
   fs.mkdirSync(outDir);
 
@@ -76,7 +87,8 @@ try {
     '--outDir', outDir,
     staged,
     stagedResolutions,
-    stagedPicture
+    stagedPicture,
+    stagedBubbleMenu
   ], { stdio: 'inherit' });
 
   // Give the emitted files an .mjs extension so Node loads them as ES modules
@@ -87,9 +99,12 @@ try {
   fs.renameSync(path.join(outDir, 'SunshineResolutions.js'), resolutionModulePath);
   const pictureModulePath = path.join(outDir, 'PictureGeometry.mjs');
   fs.renameSync(path.join(outDir, 'PictureGeometry.js'), pictureModulePath);
+  const bubbleMenuModulePath = path.join(outDir, 'BubbleMenu.mjs');
+  fs.renameSync(path.join(outDir, 'BubbleMenu.js'), bubbleMenuModulePath);
   codec = await import(pathToFileURL(modulePath).href);
   resolutions = await import(pathToFileURL(resolutionModulePath).href);
   picture = await import(pathToFileURL(pictureModulePath).href);
+  bubbleMenu = await import(pathToFileURL(bubbleMenuModulePath).href);
 } catch (error) {
   console.error(`FAIL: could not compile/load the pure ArkTS sources: ${error && error.message}`);
   fs.rmSync(tempDir, { recursive: true, force: true });
@@ -760,6 +775,60 @@ test('local-cursor mode keeps the system pointer visible even on the picture', (
   // separate (远端光标) switch and does not change this rule.
   assert.equal(hidesSystemPointer(true, true), false);
   assert.equal(hidesSystemPointer(false, true), false);
+});
+
+// ---------------------------------------------------------------------------
+
+test('4-item main fan: 118 deg, evenly spaced, narrow sub-fan', () => {
+  const { bubbleMenuAnglesFor, bubbleMenuSpanFor } = bubbleMenu;
+  assert.equal(bubbleMenuSpanFor(4, false), 118);
+  const angles = bubbleMenuAnglesFor(4, 0, 118)
+    .map((angle) => Math.round(angle * 1000) / 1000);
+  assert.deepEqual(angles, [-59, -19.667, 19.667, 59]);
+  // The 光标 sub-fan is narrower so its labels fit under the buttons.
+  assert.equal(bubbleMenuSpanFor(3, true), 90);
+  // The historical 2-item layout is unchanged (+-span/2).
+  assert.deepEqual(bubbleMenuAnglesFor(2, 90, 110), [35, 145]);
+});
+
+test('cursor submenu list and the main entry that owns it', () => {
+  const { cursorSubmenuEntries, mainBubbleMenuEntries } = bubbleMenu;
+  const sub = cursorSubmenuEntries();
+  // 返回 sits in the MIDDLE: the two switches are at the ends of the 90 deg arc.
+  assert.deepEqual(sub.map((entry) => entry.id), ['local-cursor', 'back', 'remote-cursor']);
+  assert.deepEqual(sub.map((entry) => entry.label), ['本地光标', '返回', '远端光标']);
+  // Sunshine PC main fan: [最小化, 全屏, 光标 ▸, 断开]; 断开 stays at the +end.
+  const pcSun = mainBubbleMenuEntries(true, false, true);
+  assert.deepEqual(pcSun.map((entry) => entry.id),
+    ['minimize', 'fullscreen', 'cursor', 'disconnect']);
+  assert.ok(pcSun[2].children !== undefined);
+  assert.equal(pcSun[2].children.length, 3);
+  // VNC/RDP keep the historical sets: no cursor entry, no children.
+  assert.deepEqual(mainBubbleMenuEntries(true, false, false).map((entry) => entry.id),
+    ['minimize', 'fullscreen', 'disconnect']);
+  assert.deepEqual(mainBubbleMenuEntries(false, true, false).map((entry) => entry.id),
+    ['main-list', 'disconnect']);
+});
+
+test('submenu labels never overlap a fan button (same geometry as the page)', () => {
+  const { labelsClearOfButtons, bubbleMenuAnglesFor } = bubbleMenu;
+  const cases = [
+    // Default bottom-right bubble (24 + 22 vp inset), PC-sized picture.
+    { w: 1000, h: 666, ax: 954, ay: 620, center: 225 },
+    // Center anchor: the fan can open towards the middle.
+    { w: 1000, h: 666, ax: 500, ay: 333, center: 225 },
+    // Near the left edge: the capsule flips to the right of its button.
+    { w: 1000, h: 666, ax: 46, ay: 620, center: 315 },
+    // Phone-sized portrait picture, default corner.
+    { w: 390, h: 844, ax: 344, ay: 798, center: 225 }
+  ];
+  for (const c of cases) {
+    for (const center of [c.center - 20, c.center, c.center + 20]) {
+      const angles = bubbleMenuAnglesFor(3, center, 90);
+      assert.equal(labelsClearOfButtons(c.ax, c.ay, 112, angles, 50, 27, 64, 20, c.w, c.h),
+        true, `overlap: anchor=${c.ax},${c.ay} center=${center}`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
