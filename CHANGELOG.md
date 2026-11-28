@@ -4,12 +4,23 @@
 
 ## 未发布
 
-新增第三种协议 Sunshine（Moonlight 客户端，服务端为 Sunshine），并补上获取上游的脚本与 host 侧实验目录。
+新增第三种协议 Sunshine（Moonlight 客户端，服务端为 Sunshine），并补上获取上游的脚本与 host 侧实验目录。2026-11-28 补上零拷贝呈现、跟随窗口分辨率、光标开关、手柄与延迟度量。
 
 ### 新增
 
 - Sunshine/Moonlight 协议：首次连接用 4 位 PIN 配对，配对后固定服务端证书指纹，变化即拒绝；连接表单提供流畅 / 均衡 / 高清 / 超清四档画质与自定义（宽、高、帧率、码率、H.264/HEVC）；视频经系统 AVCodec 硬解 H.264/HEVC（8-bit）后与 VNC/RDP 共用 EGL/GLES 渲染路径；音频为 Opus（libopus → OH_AudioRenderer）；键鼠按绝对鼠标与物理按键转发；强杀应用后重连可自动接管服务端残留会话。
 - 新增 `experiments/sunshine-core/`：host 侧配对、取会话参数与拉流的复现实验。
+- Sunshine 视频零拷贝（2026-11-28）：AVCodec 以 Surface 模式把帧直接渲染进 `OH_NativeImage` 的外部纹理，渲染线程按 OES 纹理采样上屏，不再做 CPU 转换、镜像拷贝与逐帧上传；渲染表面未就绪、窗口隐藏或解码器 `SetSurface` 失败时回退原 Buffer 模式。实测 3000×2000 全屏下 CPU 转换 25.6 ms→0、送解码到出帧 P95 82–94 ms→4–5 ms。
+- Sunshine 跟随窗口分辨率（2026-11-28，默认开、可关）：内置 74 条主机模式表，按「黑边面积最小 + 缩放接近 1:1」为目标窗口选档，拖动 / 最大化 / 全屏后防抖 700 ms 触发；原生停流后以新分辨率续播（`/resume`，失败才回退 `cancel` 重启），每次约 13–15 秒；码率按像素比 0.8 次方缩放、HEVC 再乘 0.7，钳 15–80 Mbps；调整期间状态 JSON 带 `resize`、界面显示「正在按窗口调整分辨率…」。主机需开启 `dd_configuration_option`。
+- Sunshine 黑屏提示与自动重连（2026-11-28）：画面持续全黑 3 秒经 `pictureBlack` 提示「主机控制台可能没有登录会话」；主机结束串流时，终止前画面不足 3 秒则按 2/4/8 秒退避自动重连最多 3 次，已稳定出画则停在断开并显示「连接已断开：主机结束了串流」。重连走 HTTPS 快路径并缓存应用 ID。
+- Sunshine 光标开关（2026-11-28）：「远端光标」（默认开，主机把光标画进画面）与「本地光标」（默认关，实验性）两个独立开关；切换远端光标时总是向主机发送一次 Ctrl+Alt+Shift+N，连接时按记录自动对齐，记录错位时点一次开关即可（`setRemoteCursorHidden(force)`）。
+- Sunshine 手柄（2026-11-28）：有线与蓝牙 Xbox Series 手柄透传，主机侧表现为虚拟 Xbox 360 手柄（ViGEm）；支持按键、双摇杆（12% 径向死区）、模拟扳机、十字键与 View / Menu / Xbox 键，会话窗失焦或断开时声明移除。未实现震动。
+- Sunshine 延迟度量（2026-11-28）：`perf` 追加 5 秒窗口的 `rttMsAvg` / `rttMsMin`、输入入队延迟与抓屏到上屏延迟（`captureToSwap` / `receiveToSwap`）；「低延迟呈现」（不等垂直同步）实测无收益，默认关。
+- Sunshine 气泡径向菜单改为两级（2026-11-28）：主环最小化 / 全屏 / 光标▸ / 断开，二级为本地光标 / 远端光标；图标改用系统 Symbol 字形，像素级居中复测 ≤1 px；VNC / RDP 菜单不变。
+
+### 变更
+
+- NAPI 变更：新增 `logLine`、`setRemoteCursorHidden(force)`、`sendGamepadState`、`releaseGamepad`；状态 JSON 增加 `pictureBlack`、`resize`、`remoteCursorHidden` 与 `perf` 的延迟字段（`rttMsAvg` / `rttMsMin` / `captureToSwapMsAvg` / `captureToSwapMsP95` / `latencySource` 等），详见 `docs/napi-contract.md`。
 
 ### 构建
 

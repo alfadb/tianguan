@@ -333,7 +333,7 @@ PC 上的会话窗口可以进入 / 退出全屏，画面里还悬浮一个可�
 - **贴边**：吸附后气泡贴在该边缘上，中心向画面内侧缩进约 10 vp（外圈约 12 vp 被窗口裁掉，露出约 32/44，视觉上是大半个圆），透明度约 0.3。窗口最外侧若干像素是系统的窗口缩放边框，从气泡鼓出部分（距窗口边约 10 px 及更内侧）拖动会由气泡接管，可以再拖出来并重新吸附；不要从系统边框区起手。
 - **展开方向**：按钮沿半径约 76 vp 的圆弧分布在气泡四周，按钮为直径约 44 vp 的圆形。扇形中心优先朝向画面中心；若某个按钮圆会越过画面边缘，就收窄扇形并在 0–360° 内旋转，直到所有按钮完整落在画面内（四个边与四个角都覆盖）。画面窄到连最窄扇形都放不下时，按钮位置还会逐点钳制在画面内。
 - **按钮与摆放**：PC（`2in1`）为「最小化」「全屏 / 退出全屏」「断开」三个；手机为「主列表」「断开」两个；平板（非 2in1）为「主列表」「全屏 / 退出全屏」「断开」三个。手机 / 平板的「主列表」用本页 host context `startAbility({ bundleName, abilityName: 'EntryAbility' })` 把主列表窗口带到前台，**不调用** `minimize()`：手机上的会话窗口是全屏的，`minimize()` 是应用级退后台（会直接回桌面）；「主列表」要保持会话连接、会话窗口留在后面，从主列表点「打开」走现有的重开窗口路径恢复画面；`startAbility` 失败只记日志并保持现状，不回退 `minimize()`。「断开」用红色底 + 红描边，放在扇形 + 端（与另一端的首按钮相隔整段弧，是扇形里离它最远的按钮）；菜单只在点击气泡后出现，所有按钮离点击点 76 vp，开启菜单的那一下不可能直接落到按钮上。其它按钮里「最小化」/「主列表」在 − 端、全屏居中。动作实现：PC 最小化复用 `minimizeThisWindow()`；手机 / 平板「主列表」走 `returnToMainList()`（`startAbility` 拉起 EntryAbility，不结束会话）；全屏 / 断开复用 `toggleFullscreen()` / `disconnectThisSession()`。「断开」走与系统关闭窗口相同的路径（`terminateSelf()` → `onDestroy` → `closeSessionById()`），不另起一套断开逻辑。
-- **图标与文字提示**：图标全部自绘，按物理像素统一换算（ArkUI 的 Shape / Path 的 commands 坐标单位是 px，不会随 vp 容器缩放）。绘图区 = `vp2px(16)`（PC 密度约 1.525 时约 24.4 px，手机密度 3.5 时 56 px）；Path 的 commands 坐标 = 16 单位设计坐标 × 像素尺寸 / 16，线宽 = 2 × 像素尺寸 / 16（PC 约 3.05 px，手机 7 px）；绘图区用这个像素尺寸作为宽高，在 44 vp 圆钮内居中。菜单图标共用同一套换算：PC 的「最小化」一条横线；手机 / 平板的「主列表」三条不等长横线（顶部一条横向 14/16，长中短向下收）；全屏四角外扩、退出全屏四角内收（臂展均为 14/16）；断开一个叉。最小化 / 全屏 / 退出全屏 / 断开的墨迹外接约 14/16 个绘图区，列表图标的横向也是 14/16、纵向按列表形状缩短；线宽与视觉中心规则一致。圆钮中心为 (22,22)，16 vp 绘图区的左上角为 (14,14)，图标在绘图区内关于 (8,8) 对称，因此圆心与图标中心重合。没有使用 `SymbolGlyph`：本机 SDK 里 `sys.symbol` 只出现在类型声明中，没有可核对的符号资源清单，无法确认资源名在本机可用。文字提示改为一枚自绘小标签（不再用 `bindTips`，实测它在触屏长按下不出现）：PC 鼠标悬停按钮时显示，触屏长按按钮时显示；PC 首按钮提示「最小化」，手机 / 平板首按钮提示「主列表」；长按只显示提示、松手不执行动作（约 800 ms 后标签消失），轻点才执行动作。
+- **图标与文字提示**：图标全部自绘，按物理像素统一换算（ArkUI 的 Shape / Path 的 commands 坐标单位是 px，不会随 vp 容器缩放）。绘图区 = `vp2px(16)`（PC 密度约 1.525 时约 24.4 px，手机密度 3.5 时 56 px）；Path 的 commands 坐标 = 16 单位设计坐标 × 像素尺寸 / 16，线宽 = 2 × 像素尺寸 / 16（PC 约 3.05 px，手机 7 px）；绘图区用这个像素尺寸作为宽高，在 44 vp 圆钮内居中。菜单图标共用同一套换算：PC 的「最小化」一条横线；手机 / 平板的「主列表」三条不等长横线（顶部一条横向 14/16，长中短向下收）；全屏四角外扩、退出全屏四角内收（臂展均为 14/16）；断开一个叉。最小化 / 全屏 / 退出全屏 / 断开的墨迹外接约 14/16 个绘图区，列表图标的横向也是 14/16、纵向按列表形状缩短；线宽与视觉中心规则一致。圆钮中心为 (22,22)，16 vp 绘图区的左上角为 (14,14)，图标在绘图区内关于 (8,8) 对称，因此圆心与图标中心重合。没有使用 `SymbolGlyph`：本机 SDK 里 `sys.symbol` 只出现在类型声明中，没有可核对的符号资源清单，无法确认资源名在本机可用（2026-11-28 起图标已改用系统 Symbol 字形、菜单改为两级，见「Sunshine 接入（2026-11-27）」的「光标」；上面这段自绘换算只描述当时的图标实现）。文字提示改为一枚自绘小标签（不再用 `bindTips`，实测它在触屏长按下不出现）：PC 鼠标悬停按钮时显示，触屏长按按钮时显示；PC 首按钮提示「最小化」，手机 / 平板首按钮提示「主列表」；长按只显示提示、松手不执行动作（约 800 ms 后标签消失），轻点才执行动作。
 - **动画**：菜单展开时按钮从气泡中心沿自己的半径弹出（位移 + 缩放），耗时约 200 ms；收起时反向缩回气泡中心。
 - **收起时机**：再次点击气泡；点击 / 触摸画面其它位置；PC 上鼠标离开气泡与菜单区域约 1 秒；执行任一按钮动作后；菜单展开时按 Esc 收起菜单，这次 Esc（按下与抬起）都不转发给远端，菜单未展开时 Esc 仍按原规则转发远端。菜单展开时，画面上第一次按下只用于收起菜单：这一次按下及其后续移动、抬起都不发给远端（触屏与鼠标两条路径都如此），被吞掉的按下 / 移动也不会更新本地绘制的远端光标位置；菜单未展开时画面点击行为不变。若这次抬起事件丢失（窗口重排、远端弹窗等），约 2 秒没有该序列的后续事件后自动取消吞事件；窗口失焦、页面隐藏、窗口重新显示、菜单开合时也会清除吞状态。菜单开合时还会补发一次旧按键释放：新的鼠标按下若发现上一次抬起丢失（本地仍记着按键按下），先释放旧按键再处理本次按下，避免第一次点击被静默丢弃。进入 / 退出全屏后直接收起菜单（布局重排后系统可能不再派发悬停离开事件）。
 - **事件隔离与焦点**：气泡和菜单按钮都是画面区（`remote_area`）的兄弟节点，落在它们上的鼠标 / 触摸事件不会进入远端输入；指针进入气泡 / 菜单时，客户端本地绘制的远端光标也会隐藏，不会留下幽灵光标。气泡与菜单按钮均 `.focusable(false)`：页面 / 窗口重新获焦时系统不会在它们上画焦点框，点击也不会把键盘焦点从画面（`remote_area`）或页面根（`page_root`）上抢走。
@@ -400,7 +400,7 @@ GL 模式下远程画面支持双指手势：两指捏合缩放、两指拖动�
 
 - **`app/native/sunshine/`**：控制面公共层，`identity`（客户端自签证书、私钥、uniqueid 的生成与落盘）、`xml_util`（够用的极简 XML）、`nv_http`（六个 nvhttp 端点）、`pairing`（`/pair` 五阶段与 TOFU 指纹固定），命名空间 `tg::sunshine`。由 `experiments/sunshine-core/src/common` 迁入，为 API 26 的 C++11 目标做了少量适配（去掉 `<filesystem>` / `std::make_unique`，状态目录改为必填）。
 - **`app/native/sunshine_backend.cxx`**：一次连接尝试的主流程（identity → `/serverinfo` → 配对 → `/applist` → `/launch` → `LiStartConnection` → 等待终止/停止/换代 → `/cancel` → 退避），以及输入翻译（会话的 keysym / 指针队列 → Win32 VK、绝对坐标、按键与滚轮，10 ms 节拍）和启动阶段的看门狗（`stop` 时只调 `LiInterruptConnection()` 打断阻塞握手，`LiStopConnection()` 始终由持流线程调用）。
-- **`app/native/sunshine_video.cxx`**：OHOS AVCodec 硬解（`OH_VideoDecoder` Buffer 模式，`video/avc` / `video/hevc`），输出 NV12/NV21 经 libswscale 转 BGRA，再走与 RDP 相同的 `resizeFrame` / `commitFrame`，复用既有帧镜像、EGL 渲染、缩放与坐标换算。
+- **`app/native/sunshine_video.cxx`**：OHOS AVCodec 硬解（`video/avc` / `video/hevc`）。2026-11-28 起渲染器已 attach 时优先走零拷贝 Surface 模式：`OH_VideoDecoder_SetSurface` 把帧写进 `OH_NativeImage` 的外部纹理，渲染线程按 OES 纹理采样上屏，没有 NV12/NV21→BGRA 的 CPU 转换与镜像拷贝；渲染表面未就绪（最多等 10 秒）、窗口隐藏或 `SetSurface` / `Configure` / `Prepare` 失败时回退原来的 Buffer 模式（Buffer 模式 → NV12/NV21 经 libswscale 转 BGRA → `resizeFrame` / `commitFrame`，复用既有帧镜像、EGL 渲染、缩放与坐标换算）。两种模式的细节与统计口径见 [docs/napi-contract.md](../docs/napi-contract.md) 的「零拷贝（Surface 模式）视频路径」。
 - **`app/native/sunshine_audio.cxx`**：libopus 多流解码 → 交织 S16 PCM → 环形缓冲（约 0.5 秒，满时丢最旧）→ `OH_AudioRenderer` 拉模式写回调；约 80 ms 预缓冲，欠载后退回预缓冲，解码失败只计数限频记日志。
 - **依赖与脚本**：`scripts/fetch-moonlight.sh` 按固定提交拉 moonlight-common-c 并校验 enet / nanors 子模块；`scripts/build-sunshine-deps.sh ohos` 用固定 OHOS SDK 交叉编译成 AArch64 静态 PIC 归档，装到 `.work/sunshine-deps/ohos/prefix`。`app/native/CMakeLists.txt` 的 OHOS 目标定义 `TIANGUAN_WITH_SUNSHINE=1` 并静态链接 `libmoonlight-common-c.a` / `libenet.a` / `libopus.a` 与 AVCodec 系统库（`native_media_vdec` / `native_media_core` / `native_media_codecbase` / `native_buffer`）；前缀缺失时编译或链接直接失败，不会静默回退到 VNC 循环。host 目标不编译 Sunshine，`protocol=sunshine` 在 host 上明确失败。
 
@@ -421,16 +421,51 @@ GL 模式下远程画面支持双指手势：两指捏合缩放、两指拖动�
 - **卡片与失败原因**：卡片协议标签 `Sunshine`；`pairing-required` 显示「需要配对」（warning 色，不算失败）；`pair-failed` 的短原因「配对失败」、长原因「配对失败：PIN 不正确或已过期，请重试」。
 - **单测覆盖点**（`app/tests/arkts/connection_codec.test.mjs`）：只有精确的 `'sunshine'` 才归一为该协议（大小写变体仍为 VNC）、`sunshineApp` 只对 Sunshine 生效、Sunshine 记录序列化往返、四档数字与缺省档位回退、`sunshineFormatsFor` 映射、`defaultPortFor`（RDP 3389 / Sunshine 47989 / VNC 5901），以及 Sunshine 与 VNC/RDP 在同一 `host:port` 上不共用 pin / 密码别名。
 
-### 验证边界（2026-11-27，鸿蒙 PC SLM-W32 + Windows 主机 Sunshine）
+### 跟随窗口分辨率（2026-11-28）
 
-- **已验证**：配对一次成功；默认均衡档协商到 HEVC 1920×1080@60，首帧约 2 秒；H.264 与 HEVC 均出画；键盘可解锁 Windows 锁屏、鼠标可用（用户实测）；音频可听，20 Mbps 时为高音质档（约 200 包/秒、每声道 256 kbps）；强杀应用后重连自动接管残留会话（约 4 秒出画）；档位切换生效；VNC 卡片回归正常。
-- **未实现**：剪贴板（Moonlight 协议没有剪贴板通道，common-c 也没有对应收发接口）、手柄、相对鼠标、UTF-8 文本直接输入（common-c 有 `LiSendUtf8TextEvent`，未接）、AV1、HDR / 10-bit（P010 被显式跳过）、应用列表选择（只能按标题匹配，表单不列出 `/applist`）。
-- **未验证**：手机 / 平板、长稳、多会话（进程级单例本身限制同时只有一路）、断线重连、5.1 / 7.1 声道。
+- 默认开启，连接表单可关；关闭后分辨率仍由画质档位决定、画面等比缩放。主机侧需 Sunshine 打开 `dd_configuration_option`，否则主机不切分辨率，客户端只能把画面缩放到窗口大小。
+- 内置 74 条主机模式表（16:9 / 16:10 / 3:2 / 4:3 / 21:9 / 32:9 / 竖屏 / 手机 / 平板 / 折叠屏），按「黑边面积最小 + 缩放最接近 1:1」为目标窗口选档，目标尺寸不一定等于窗口像素；拖动、最大化、全屏后停稳 700 ms 触发一次，防抖期间只保留最后一个目标。
+- 调整过程：会话进入 `state=reconnecting` 且状态 JSON 出现 `resize: {width, height}`，界面显示「正在按窗口调整分辨率…」；原生停流后直接 `/resume` 以新尺寸续播（实测停流 → 首帧约 11.4 秒），`/resume` 失败才退回 `/cancel` → 等空闲 → `/launch`。一次调整约 13–15 秒，其中约 9 秒是主机切换显示配置的固有耗时；整次调整计入本会话，不计入「主机结束且无画面」的自动重连次数。
+- 码率随像素比缩放：`base × (像素比)^0.8 × (HEVC ? 0.7 : 1)`，四舍五入到 1000 kbps 后钳在 15–80 Mbps，帧率与编码不变。
+
+### 光标（2026-11-28）
+
+- 两个独立开关：「远端光标」默认开，主机把光标画进视频（延迟等于视频链路）；「本地光标」默认关、实验性——显示本地箭头、更跟手，但形状固定。
+- 切换远端光标的方式是向主机发一次 Sunshine 快捷键 Ctrl+Alt+Shift+N（真实按下 / 抬起修饰键）：界面点开关时调 `setRemoteCursorHidden(sessionId, hidden, force=true)`，总是发送一次；连接时用 `force=false` 按记录自动对齐。记录与主机实际状态错位（远端光标仍在、或完全看不到光标）时，点一次开关即可校正。
+- 该状态是主机进程级、跨会话、客户端无法查询：原生只记录（状态 JSON `remoteCursorHidden`），ArkTS 持久化到连接条目并通过 `sunshineHostCursorHidden` 传回；Sunshine 重启后主机回到「显示」，记录需重置为 `false`。指针只在画面矩形内隐藏，落在黑边上保持可见。
+- 两级径向菜单：主环最小化 / 全屏 / 光标▸ / 断开，二级为本地光标 / 远端光标；图标改用系统 Symbol 字形，像素级居中复测 ≤1 px；VNC / RDP 菜单不变。
+
+### 手柄（2026-11-28）
+
+- 有线与蓝牙 Xbox Series 手柄在鸿蒙 PC 上透传到主机，主机侧表现为虚拟 Xbox 360 手柄（ViGEm）：按键、双摇杆（12% 径向死区）、模拟扳机、十字键与 View / Menu / Xbox 键。
+- ArkTS 把鸿蒙键码（实测 2301/2302/2304/2305/2307/2308/2311/2312/2313/2314/2315 与 2012–2015）与轴值（ABS_X/Y、ABS_Z/RZ、ABS_BRAKE/GAS）映射成 Moonlight 按钮位与轴，经 `sendGamepadState` 交给原生；首次收到先发 arrival，与上次完全相同的状态不重发。
+- 会话窗失焦或断开时调 `releaseGamepad` 声明移除；会话停止 / 断开 / 换代时若已到达也会自动补发一次移除。
+- 未实现震动：主机下发的 `rumble` 回调只打 W 级限频日志，能力位仍声明 `LI_CCAP_RUMBLE` 以免游戏禁用相关特性。手机 / 平板未接入。
+
+### 黑屏提示与重连（2026-11-28）
+
+- 画面持续全黑 3 秒（或本次尝试 3 秒没有帧达到非黑）时状态 JSON 的 `pictureBlack=true`，窗口提示「主机控制台可能没有登录会话」；出现任一非黑帧立即变 `false`。
+- 主机结束串流（`connectionTerminated(0/-1)`）按「终止前正常画面的持续时长」分流：不足 3 秒（含从未有画面）视为瞬时黑屏，进 `reconnecting`，按 2/4/8 秒退避自动重连最多 3 次，仍失败则 `failed/network` 并提示确认主机控制台已登录；≥3 秒视为用户已正常观看，停在 `disconnected` 并显示「连接已断开：主机结束了串流」，由用户手动重连。
+- 重连快路径：在任何 HTTP 之前先置 `reconnecting`，不再发 `/cancel`；复用已学到的 HTTPS 端口与已固定证书，只走 HTTPS `/serverinfo`（单次 5 秒超时、1 秒退避、总预算 60 秒），并缓存 `/applist` 的应用 ID，不再重新拉列表。
+
+### 延迟度量（2026-11-28）
+
+- `perf` 在同一个对象里追加 5 秒窗口的延迟字段：`rttMsAvg` / `rttMsMin`（ENet 估计 RTT）、输入入队延迟（`inputLag`：入队 → `LiSend*` 返回，并入 5 秒 `sunshine perf:` W 级行）与抓屏到上屏延迟（`captureToSwapMsAvg` / `captureToSwapMsP95`，PTS 不可用时退化为 `receiveToSwapMsAvg`，`latencySource` 标明时间源）。
+- 实测结论：输入侧约 1 ms；网络 RTT 受 Wi-Fi 抖动影响；画面段的瓶颈在主机抓屏编码与 GPU 余量。
+- 「低延迟呈现」开关（`sunshineVsync=false`，不等垂直同步）实测无收益，默认关。
+
+### 验证边界（2026-11-27 / 11-28，鸿蒙 PC SLM-W32 + Windows 主机 Sunshine）
+
+- **已验证**：配对一次成功；默认均衡档协商到 HEVC 1920×1080@60，首帧约 2 秒；H.264 与 HEVC 均出画；键盘可解锁 Windows 锁屏、鼠标可用（用户实测）；音频可听，20 Mbps 时为高音质档（约 200 包/秒、每声道 256 kbps）；强杀应用后重连自动接管残留会话（约 4 秒出画）；档位切换生效；VNC 卡片回归正常。2026-11-28 追加（同机同主机）：零拷贝 3000×2000 全屏 CPU 转换 25.6 ms→0、送解码到出帧 P95 82–94 ms→4–5 ms；跟随窗口分辨率拖动 / 最大化 / 全屏三步，远端与目标一致、无黑边，每次 13–15 秒；有线与蓝牙 Xbox Series 手柄，《暗黑破坏神 2》内按键、双摇杆、扳机与十字键可用；全黑 3 秒提示与最多 3 次自动重连；两级菜单 Symbol 图标居中 ≤1 px；延迟度量（输入侧约 1 ms）。
+- **未实现**：剪贴板（Moonlight 协议没有剪贴板通道，common-c 也没有对应收发接口）、手柄震动（鸿蒙没有震动输出通道，`rumble` 回调只记日志）、手机 / 平板上的手柄、相对鼠标、UTF-8 文本直接输入（common-c 有 `LiSendUtf8TextEvent`，未接）、AV1、HDR / 10-bit（P010 被显式跳过）、应用列表选择（只能按标题匹配，表单不列出 `/applist`）。
+- **未验证**：手机 / 平板、长稳、多会话（进程级单例本身限制同时只有一路）、网络中断类的退避重连（主机结束类已验，纯网络中断未单测）、5.1 / 7.1 声道、蓝牙手柄在其它系统版本上的映射完整性、有线手柄的震动。
 
 ### 已知限制与排查提示
 
 - **主机重装后配对失效**：服务端证书变了会让会话停在 `state=failed` + `errorCode=fingerprint-mismatch`，界面没有应用内重置入口。处理办法是删除应用沙箱 `files/sunshine/` 下该主机的 `server-<host>-<httpsPort>.pem` 与 `.sha256`（`httpsPort` 通常是 47984），再重新走一次配对；`identity.crt` / `identity.key` / `uniqueid` 是客户端身份，不要删。
 - **「控制通道通、视频/音频不通」**：先看服务端日志与端口占用。若主机是 Windows 虚拟机，先排除 VirtIO 网卡与 USO 的老问题（批量 UDP 被合并成 0 长度头的大帧后丢弃，控制通道的小包不受影响），详见 [`experiments/sunshine-core/README.md`](../experiments/sunshine-core/README.md) 的「已知环境陷阱」。
+- **手柄不工作先换有线**：本镜像不含 GameControllerKit 库，手柄按键与轴只能从 `onKeyEvent` / `onAxisEvent` 取到，不经 GameControllerKit。蓝牙模式在不同系统版本上可能映射不全，若出现「有线正常、蓝牙异常」，先换有线连接再判断是否为客户端问题。Xbox 手柄实测映射：按键 2301/2302/2304/2305/2307/2308/2311/2312/2313/2314/2315 与 2012–2015，轴 ABS_X/Y、ABS_Z/RZ、ABS_BRAKE/GAS；Moonlight 的摇杆 Y 轴向上为正，接入时需取反。
+- **界面日志与诊断**：非调试版应用上 ArkTS 的 `hilog` 输出不可见，而原生 `OH_LOG_Print` 正常，因此界面的诊断日志统一经 `logLine(tag, message)` 以 W 级输出（`tag` ≤ 256、`message` ≤ 1024 字节）。抓不到日志时，用 `hdc shell uitest dumpLayout` 取界面树核对按钮、状态文字与开关位置，再决定看哪一路日志。
 - **其他**：只有一路 Sunshine 串流；PIN 只进内存、不进日志与状态 JSON；`forgetTrustedFingerprint` 只作用于 VNC/RDP，对 Sunshine 无效；`/pair` 只支持 Gen 7+ 的 SHA-256 流程。
 
 ## 系统托盘（2026-10-21）
