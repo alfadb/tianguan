@@ -176,6 +176,18 @@ struct SunshineHost {
                      unsigned* appliedRelease) = nullptr;
 };
 
+// 手柄透传（Sunshine/Moonlight）。NAPI 线程直接调用（common-c 输入 API 线程安全、
+// 内部排队）；未连接（流未建立）时返回 false 且不排队。buttons 是 Moonlight 按钮
+// 位图（A_FLAG/B_FLAG/...）；扳机 0..255、摇杆 -32768..32767（越界钳位）。首次
+// 调用会先发 arrival（controller 0，mask 0x0001，LI_CTYPE_XBOX）；与上次完全相同的
+// 状态不重复发送。
+bool sunshineSendGamepad(uint32_t buttons, uint8_t leftTrigger,
+                         uint8_t rightTrigger, int leftStickX, int leftStickY,
+                         int rightStickX, int rightStickY);
+// 移除手柄（窗口失焦/关闭前）：发 mask=0 的空 MC 事件并清「已到达」；没 arrival
+// 过时是 no-op。返回 false 表示当前没有可用的输入流。
+bool sunshineReleaseGamepad();
+
 // 阻塞直到宿主要求停止。内部按 generation 执行
 // 「serverinfo -> 必要时配对 -> 选应用 -> launch -> 串流 -> 断线退避重试」循环。
 void runSunshineSession(const SunshineHost& host, const SunshineOptions& options);

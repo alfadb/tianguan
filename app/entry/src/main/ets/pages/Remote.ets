@@ -82,7 +82,7 @@ import {
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, submitPin,
   takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
-  syncRemoteLockState, setRemoteCursorHidden,
+  syncRemoteLockState, setRemoteCursorHidden, logLine, releaseGamepad, sendGamepadState,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
   SESSION_STATE_PAIRING_REQUIRED, SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_ERROR_PAIR_FAILED
 } from '../diag/SessionApi';
@@ -107,9 +107,23 @@ import { bubbleMenuAnglesFor, bubbleMenuSpanFor, cursorSubmenuEntries,
   fanButtonX, fanButtonY, mainBubbleMenuEntries, menuSymbolName,
   submenuLabelRects } from '../model/BubbleMenu';
 import type { BubbleMenuEntry, MenuRect } from '../model/BubbleMenu';
+import { isGamepadKeyCode, isGamepadProbeKey } from '../model/GamepadKeys';
+import { applyGamepadAxis, applyGamepadKey, emptyGamepadRaw, gamepadOutOf,
+  sameGamepadOut } from '../model/Gamepad';
+import type { GamepadOut, GamepadRaw } from '../model/Gamepad';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
+// Raw gamepad-event probe. This round it is always on for Sunshine sessions; a
+// later round can turn it into a user setting without touching the handlers.
+const GAMEPAD_PROBE_ENABLED: boolean = true;
+const GAMEPAD_PROBE_TAG: string = 'TianguanGamepad';
+/** 1 s rate-limit window of one (prefix, code, type) probe line group. */
+interface ProbeWindow {
+  startMs: number;
+  lines: number;
+  suppressed: number;
+}
 // Presentation switch: true = XComponent(SURFACE) + native EGL renderer (the
 // default), false = the previous Canvas + per-frame drawImage path (kept for
 // comparison and rollback; it leaks one RenderService texture per frame on
@@ -1122,6 +1136,28 @@ struct Remote {
   // remote pointer event is sent.
   private multiTouchBlocked: boolean = false;
 
+  // --- Raw gamepad probe (Sunshine sessions, always on this round) ----------
+  // Device ids already identified as gamepads: every later key from them is
+  // logged and consumed even if its key code is outside the controller ranges.
+  private gamepadDeviceIds: number[] = [];
+  // Last value per AxisModel, for the per-axis "unchanged value" dedupe.
+  private axisLastValues: Map<number, number> = new Map<number, number>();
+  // Current 1-second window for the 60-lines/s cap plus the suppressed count.
+  private axisWindowStartMs: number = 0;
+  private axisWindowLines: number = 0;
+  private axisWindowSuppressed: number = 0;
+  // (prefix, code, type) -> 1 s window for the "log each until the same line
+  // repeats more than 10 times per second, then count and summarize" rule.
+  private probeWindows: Map<string, ProbeWindow> = new Map<string, ProbeWindow>();
+  // One-time "probe armed" self-check line when a Sunshine session connects.
+  private probeArmedLogged: boolean = false;
+  // --- Gamepad passthrough (Sunshine only) ----------------------------------
+  // Raw controller state as the events arrive; a 16 ms ticker sends the derived
+  // snapshot only when it differs from the last one sent.
+  private gamepadRaw: GamepadRaw = emptyGamepadRaw();
+  private gamepadLastSent: GamepadOut | undefined = undefined;
+  private gamepadSendTimer: number = -1;
+
   aboutToAppear(): void {
     this.glController.onSurfaceReady = (surfaceId: string): void => {
       this.attachRendererSurface(surfaceId);
@@ -1136,6 +1172,9 @@ struct Remote {
 
   onPageShow(): void {
     this.setPageVisible(true);
+    // Re-shown window: put keyboard focus back on the session container so the
+    // key probe and onKeyPreIme keep receiving events.
+    this.requestViewFocus();
   }
 
   onPageHide(): void {
@@ -1502,6 +1541,9 @@ struct Remote {
         hilog.info(DOMAIN, TAG,
           'remote fullscreen synced session=%{public}s entered', this.sessionId);
       }
+      // The window change can move focus; re-assert it on the session container
+      // so the gamepad probe keeps receiving key / axis events.
+      this.requestViewFocus();
       return;
     }
     if (status === window.WindowStatusType.MINIMIZE ||
@@ -1515,6 +1557,7 @@ struct Remote {
         'remote fullscreen synced session=%{public}s exited status=%{public}d',
         this.sessionId, status);
     }
+    this.requestViewFocus();
   }
 
   /** Enters full screen; safe to call when already full screen. */
@@ -3328,6 +3371,10 @@ struct Remote {
   // -------------------------------------------------------------------------
 
   private releaseAllInputs(reason: string): void {
+    // The controller is part of "all inputs": stop its ticker, clear the local
+    // state and tell the host to release every button (the next gamepad event
+    // re-establishes the state after focus / reconnect).
+    this.releaseGamepadInputs(reason);
     // A touch that has not pressed yet must not press after the release.
     this.cancelLongPress('release-inputs');
     // A menu-dismiss press owns no remote event; drop its swallow state with
@@ -3864,6 +3911,15 @@ struct Remote {
     // stream size and re-evaluates once right here, so the stream gets back to
     // the right mode without the user resizing the window again.
     if (this.sunshineProtocol && status.state === SESSION_STATE_CONNECTED && !wasConnected) {
+      // A fresh connection starts with a clean controller state; the first
+      // connected transition also emits the probe-armed self-check line.
+      this.gamepadRaw = emptyGamepadRaw();
+      this.gamepadLastSent = undefined;
+      if (!this.probeArmedLogged) {
+        this.probeArmedLogged = true;
+        logLine(GAMEPAD_PROBE_TAG,
+          `probe armed session=${this.sessionId} proto=sunshine`);
+      }
       if (!this.sunshineFirstConnectionDone) {
         this.sunshineFirstConnectionDone = true;
         const connectArea = this.pictureAreaPx();
@@ -5277,17 +5333,277 @@ struct Remote {
     }
   }
 
+  // --- Raw gamepad probe ----------------------------------------------------
+  // Registered on the page root container (the focused node: the real-device
+  // dump shows focus sits on page_root, not on the XComponent Stack). The probe
+  // only logs and consumes controller keys; it never forwards anything, so it
+  // is not a second keyboard forwarding path.
+
+  /** The probe only runs for a connected Sunshine session, as this round's spec. */
+  private gamepadProbeActive(): boolean {
+    return GAMEPAD_PROBE_ENABLED && this.sunshineProtocol &&
+      this.lastState === SESSION_STATE_CONNECTED;
+  }
+
+  /**
+   * Rate limiter for probe lines: one (prefix, code, type) group logs at most 10
+   * lines per second; further repetitions are counted and reported as one
+   * summary line when the next second starts. Returns true when this line may be
+   * logged now.
+   */
+  private probeAllow(prefix: string, code: number, type: number): boolean {
+    const key = prefix + '|' + code + '|' + type;
+    const now = Date.now();
+    let window = this.probeWindows.get(key);
+    if (window === undefined) {
+      const created: ProbeWindow = { startMs: now, lines: 0, suppressed: 0 };
+      this.probeWindows.set(key, created);
+      window = created;
+    }
+    if (now - window.startMs >= 1000) {
+      if (window.suppressed > 0) {
+        logLine(GAMEPAD_PROBE_TAG,
+          `${prefix} summary code=${code} type=${type} suppressed=${window.suppressed}`);
+      }
+      window.startMs = now;
+      window.lines = 0;
+      window.suppressed = 0;
+    }
+    window.lines += 1;
+    if (window.lines <= 10) {
+      return true;
+    }
+    window.suppressed += 1;
+    return false;
+  }
+
+  /** Applies one gamepad key event to the raw state (10167 maps to nothing). */
+  private applyGamepadKeyEvent(event: KeyEvent): void {
+    const next = applyGamepadKey(this.gamepadRaw, event.keyCode,
+      event.type === KeyType.Down);
+    if (next === this.gamepadRaw) {
+      return;
+    }
+    this.gamepadRaw = next;
+    this.ensureGamepadSendTimer();
+  }
+
+  /** Applies every axis of one FocusAxisEvent to the raw state. */
+  private applyGamepadAxisEvent(event: FocusAxisEvent): void {
+    event.axisMap.forEach((value: number, axis: AxisModel): void => {
+      this.gamepadRaw = applyGamepadAxis(this.gamepadRaw, Number(axis), value);
+    });
+    this.ensureGamepadSendTimer();
+  }
+
+  /**
+   * 16 ms coalescing ticker: events only update the raw state; each tick sends
+   * the derived snapshot when it differs from the last one sent (dedupe).
+   */
+  private ensureGamepadSendTimer(): void {
+    if (this.gamepadSendTimer >= 0) {
+      return;
+    }
+    this.gamepadSendTimer = setInterval((): void => {
+      if (!this.gamepadProbeActive()) {
+        this.releaseGamepadInputs('not-active');
+        return;
+      }
+      const out = gamepadOutOf(this.gamepadRaw);
+      if (this.gamepadLastSent !== undefined && sameGamepadOut(out, this.gamepadLastSent)) {
+        return;
+      }
+      if (sendGamepadState(this.sessionId, out.buttons, out.lt, out.rt,
+        out.lx, out.ly, out.rx, out.ry)) {
+        this.gamepadLastSent = out;
+      }
+    }, 16);
+  }
+
+  /**
+   * Stops the ticker, clears the local controller state and tells the host to
+   * release every button (focus loss / hide / disconnect / teardown). The next
+   * gamepad event re-establishes the state automatically.
+   */
+  private releaseGamepadInputs(reason: string): void {
+    if (this.gamepadSendTimer >= 0) {
+      clearInterval(this.gamepadSendTimer);
+      this.gamepadSendTimer = -1;
+    }
+    this.gamepadRaw = emptyGamepadRaw();
+    this.gamepadLastSent = undefined;
+    if (this.sessionId.length > 0) {
+      releaseGamepad(this.sessionId);
+      hilog.info(DOMAIN, TAG, 'gamepad released session=%{public}s reason=%{public}s',
+        this.sessionId, reason);
+    }
+  }
+
+  /**
+   * Unconditional preIme entry record: no session / connection gate, so the very
+   * first line of the key callback always leaves a line when the callback runs.
+   * The other probes stay gated to Sunshine + connected.
+   */
+  private logGamepadPreImeEntry(event: KeyEvent): void {
+    if (!this.probeAllow('preIme', event.keyCode, event.type)) {
+      return;
+    }
+    // KeyEvent has no BaseEvent.source; keySource (Unknown/Keyboard) is its
+    // equivalent and intentionCode covers the rest.
+    logLine(GAMEPAD_PROBE_TAG,
+      `preIme code=${event.keyCode} text=${event.keyText} type=${event.type} ` +
+      `dev=${event.deviceId} keySrc=${event.keySource} intent=${event.intentionCode}`);
+  }
+
+  /** Full key record for the onKeyEvent path. */
+  private logGamepadKey(event: KeyEvent, prefix: string): void {
+    if (!this.gamepadProbeActive()) {
+      return;
+    }
+    if (!this.probeAllow(prefix, event.keyCode, event.type)) {
+      return;
+    }
+    // KeyEvent has no BaseEvent.source; keySource (Unknown/Keyboard) is its
+    // equivalent and intentionCode covers the rest.
+    logLine(GAMEPAD_PROBE_TAG,
+      `${prefix} code=${event.keyCode} text=${event.keyText} type=${event.type} ` +
+      `dev=${event.deviceId} keySrc=${event.keySource} intent=${event.intentionCode}`);
+  }
+
+  /** Mouse press / release only; moves are deliberately not logged. */
+  private logGamepadMouse(event: MouseEvent): void {
+    if (!this.gamepadProbeActive()) {
+      return;
+    }
+    if (event.action !== MouseAction.Press && event.action !== MouseAction.Release) {
+      return;
+    }
+    if (!this.probeAllow('mouse', event.button, event.action)) {
+      return;
+    }
+    logLine(GAMEPAD_PROBE_TAG,
+      `mouse button=${event.button} action=${event.action} dev=${event.deviceId} ` +
+      `src=${event.source}`);
+  }
+
+  /** Touch press / release and touch hover enter / exit; moves are not logged. */
+  private logGamepadTouch(event: TouchEvent): void {
+    if (!this.gamepadProbeActive()) {
+      return;
+    }
+    if (event.type !== TouchType.Down && event.type !== TouchType.Up &&
+        event.type !== TouchType.Cancel && event.type !== TouchType.HOVER_ENTER &&
+        event.type !== TouchType.HOVER_EXIT) {
+      return;
+    }
+    if (!this.probeAllow('hover', event.type, 0)) {
+      return;
+    }
+    logLine(GAMEPAD_PROBE_TAG,
+      `hover touch type=${event.type} dev=${event.deviceId} src=${event.source}`);
+  }
+
+  /** Hover enter / leave from the onHover path (no hover move is logged). */
+  private logGamepadHover(isHover: boolean, event: HoverEvent): void {
+    if (!this.gamepadProbeActive() || event === undefined) {
+      return;
+    }
+    if (!this.probeAllow('hover', isHover ? 1 : 0, 0)) {
+      return;
+    }
+    logLine(GAMEPAD_PROBE_TAG,
+      `hover enter=${isHover ? 1 : 0} dev=${event.deviceId} src=${event.source}`);
+  }
+
+  /**
+   * onKeyEvent probe: logs keyCode / keyText / Down-Up / deviceId / intention and
+   * consumes every non-keyboard key (controller key code or a key from a device
+   * already identified as a gamepad). Keyboard keys return false and keep the
+   * existing key path.
+   */
+  private handleGamepadProbeKey(event: KeyEvent): boolean {
+    if (!this.gamepadProbeActive()) {
+      return false;
+    }
+    // Full record first (prefix onKey), then the gamepad passthrough.
+    this.logGamepadKey(event, 'onKey');
+    const fromKnownGamepad = this.gamepadDeviceIds.indexOf(event.deviceId) >= 0;
+    const padKey = isGamepadKeyCode(event.keyCode);
+    if (padKey && !fromKnownGamepad) {
+      this.gamepadDeviceIds.push(event.deviceId);
+    }
+    if (padKey || fromKnownGamepad) {
+      // 2301..2315, 2012..2015 and 10167 are consumed: never forwarded as a
+      // keyboard key and never allowed to move the UI focus.
+      this.applyGamepadKeyEvent(event);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * onFocusAxisEvent probe: logs each axis value, skipping a value unchanged since
+   * the previous event for that axis. At most 60 lines per second; further lines
+   * are counted and reported as one summary line when the next second starts.
+   */
+  private handleGamepadAxisProbe(event: FocusAxisEvent): void {
+    if (!this.gamepadProbeActive()) {
+      return;
+    }
+    // Feed the passthrough state first, then consume the event so it cannot
+    // also drive focus / scrolling, and keep the rate-limited raw log.
+    this.applyGamepadAxisEvent(event);
+    event.stopPropagation();
+    const now = Date.now();
+    if (this.axisWindowStartMs === 0 || now - this.axisWindowStartMs >= 1000) {
+      if (this.axisWindowSuppressed > 0) {
+        logLine(GAMEPAD_PROBE_TAG,
+          `axis summary: ${this.axisWindowSuppressed} lines suppressed in the previous second`);
+      }
+      this.axisWindowStartMs = now;
+      this.axisWindowLines = 0;
+      this.axisWindowSuppressed = 0;
+    }
+    event.axisMap.forEach((value: number, axis: AxisModel): void => {
+      const previous = this.axisLastValues.get(Number(axis));
+      if (previous !== undefined && previous === value) {
+        return;
+      }
+      this.axisLastValues.set(Number(axis), value);
+      if (this.axisWindowLines < 60) {
+        this.axisWindowLines += 1;
+        logLine(GAMEPAD_PROBE_TAG,
+          `axis=${axis} value=${value} dev=${event.deviceId}`);
+      } else {
+        this.axisWindowSuppressed += 1;
+      }
+    });
+  }
+
   // The single keyboard entry point: bound on the page root's onKeyPreIme, so
   // it runs before the input method sees the key. Returning true declares the
   // key handled: no local default action, no IME handling and no second
   // onKeyEvent pass (there must be exactly one forwarding path).
   private handleKeyPreIme(event: KeyEvent): boolean {
+    // Unconditional first line of the callback: it runs before every early
+    // return and condition, so a silent log proves the callback never fired
+    // rather than the probe log being filtered. It does not change the handling
+    // below.
+    this.logGamepadPreImeEntry(event);
     // System navigation / power keys and device-control keys stay with the
     // platform: never swallow them, never forward them. Back must keep driving
     // onBackPress (ending the session); home/power/recents and volume/brightness/
     // media/camera keys keep their system behaviour.
     if (SYSTEM_NAV_KEYS.has(event.keyCode) ||
         DEVICE_CONTROL_KEYS.has(event.keyCode)) {
+      return false;
+    }
+    // Raw gamepad probe: a controller key must reach the probe's onKeyEvent
+    // (which logs it and consumes it, so the D-pad cannot move the UI focus).
+    // Letting it through here — without forwarding a keysym — is what makes the
+    // probe see it; a keyboard key keeps the existing forwarding path below.
+    if (GAMEPAD_PROBE_ENABLED && this.gamepadProbeActive() &&
+        isGamepadProbeKey(event.keyCode, event.deviceId, this.gamepadDeviceIds)) {
       return false;
     }
     // Esc closes an open radial menu and is NOT forwarded: it is the local
@@ -6157,6 +6473,8 @@ struct Remote {
             this.forwardWheel(event);
           })
           .onHover((isHover: boolean, event: HoverEvent) => {
+            // Raw gamepad probe: hover enter / leave (prefix hover).
+            this.logGamepadHover(isHover, event);
             // The system pointer is shown outside the picture; the locally
             // drawn remote cursor must not stay behind as a ghost when the
             // pointer moves up into the bubble or its radial menu. Entering the
@@ -6174,6 +6492,9 @@ struct Remote {
             this.refreshCursorVisibility(true);
           })
           .onTouch((event: TouchEvent) => {
+            // Raw gamepad probe: touch press / release and hover enter / exit
+            // (prefix hover); moves are not logged.
+            this.logGamepadTouch(event);
             // On PC one physical mouse action also produces a synthetic
             // TouchEvent. The mouse path keeps that action; only this single
             // touch is dropped (isMouseDuplicateTouch) so handling both can no
@@ -6329,6 +6650,8 @@ struct Remote {
             }
           })
           .onMouse((event: MouseEvent) => {
+            // Raw gamepad probe: mouse press / release only (prefix mouse).
+            this.logGamepadMouse(event);
             if (!this.hasMouse) {
               this.hasMouse = true;
               hilog.debug(DOMAIN, TAG,
@@ -6696,11 +7019,18 @@ struct Remote {
       // The page root is the only keyboard entry point. onKeyPreIme runs
       // before the input method and before onKeyEvent; returning true from it
       // consumes the key there, so there must be no second (onKeyEvent)
-      // forwarding path or every key would be sent twice.
+      // forwarding path or every key would be sent twice. The onKeyEvent below
+      // is the raw gamepad probe: it only logs and consumes controller keys and
+      // never forwards a key, so it cannot double-send anything.
       .id('page_root')
       .key('page_root')
       .focusable(true)
       .defaultFocus(true)
+      // One focus group for the session page; arrow keys must not step focus out
+      // of it (belt and braces: the probe also consumes every controller key).
+      .focusScopeId('session', true, false)
+      .onKeyEvent((event: KeyEvent): boolean => this.handleGamepadProbeKey(event))
+      .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxisProbe(event))
       .onKeyPreIme((event: KeyEvent): boolean => this.handleKeyPreIme(event))
   }
 }

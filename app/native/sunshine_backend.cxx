@@ -377,6 +377,54 @@ struct InputWindowStats {
   unsigned long long sendFail;
 };
 
+// ---------------------------------------------------------------------------
+// 手柄透传（单只手柄，controller number 0 / mask 0x0001）
+//
+// 输入 API（LiSend*）是线程安全的、内部排队，所以 NAPI 线程直接调用即可；这里
+// 只用一把锁保护「是否已 arrival / 上次状态 / 5 秒窗口计数」。状态按串流尝试
+// 复位：会话停止/断开/换代时若已 arrival，会话线程补一条 mask=0 的空事件移除。
+// ---------------------------------------------------------------------------
+struct GamepadState {
+  std::mutex mutex;
+  bool arrived = false;
+  bool hasLast = false;
+  uint32_t lastButtons = 0;
+  uint8_t lastLeftTrigger = 0;
+  uint8_t lastRightTrigger = 0;
+  int lastLeftX = 0;
+  int lastLeftY = 0;
+  int lastRightX = 0;
+  int lastRightY = 0;
+  unsigned long long updates = 0;  // 5 秒窗口内的状态更新次数
+};
+GamepadState g_gamepad;
+
+// arrival 声明的按键与能力：A/B/X/Y、方向、LB/RB、Play/Back、LS/RS 按下、Special。
+const uint32_t kGamepadArrivalButtons =
+    A_FLAG | B_FLAG | X_FLAG | Y_FLAG | UP_FLAG | DOWN_FLAG | LEFT_FLAG |
+    RIGHT_FLAG | LB_FLAG | RB_FLAG | PLAY_FLAG | BACK_FLAG | LS_CLK_FLAG |
+    RS_CLK_FLAG | SPECIAL_FLAG;
+const uint16_t kGamepadArrivalCapabilities =
+    static_cast<uint16_t>(LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE);
+
+// 震动回调日志限频（鸿蒙没有传给手柄的震动通道，只记录）：最多每 2 秒一行。
+std::atomic<unsigned long long> g_lastRumbleLogMs(0);
+std::atomic<unsigned long long> g_rumbleDropped(0);
+
+void logRumbleThrottled(const std::string& line) {
+  const unsigned long long now = monotonicMillis();
+  const unsigned long long last = g_lastRumbleLogMs.load();
+  if (last != 0 && now - last < 2000) {
+    g_rumbleDropped.fetch_add(1);
+    return;
+  }
+  g_lastRumbleLogMs.store(now);
+  const unsigned long long dropped = g_rumbleDropped.exchange(0);
+  logWarn(dropped > 0 ? formatText("%s (+%llu similar suppressed)", line.c_str(),
+                                   dropped)
+                      : line);
+}
+
 // 鼠标按键窗口统计（5 秒）：按下/抬起/合成抬起/纯移动事件的次数。只读日志用，
 // 不参与任何输入逻辑。
 struct MouseWindowStats {
@@ -761,6 +809,30 @@ void stageFailedCallback(int stage, int errorCode) {
   logWarn(formatText("sunshine stage failed: %s (stage %d), error %d%s%s",
                      LiGetStageName(stage), stage, errorCode,
                      ports[0] != '\0' ? ", likely ports: " : "", ports));
+}
+
+void rumbleCallback(unsigned short controllerNumber, unsigned short lowFreqMotor,
+                    unsigned short highFreqMotor) {
+  if (!g_media.active.load()) return;
+  // 鸿蒙没有把手柄震动的通道（Vibrator NDK 不接收 Moonlight 的 rumble 语义），
+  // 这里只记录限频日志；能力位仍声明 LI_CCAP_RUMBLE，让主机以为手柄支持震动，
+  // 以免某些游戏禁用相关特性。
+  logRumbleThrottled(formatText(
+      "sunshine gamepad: host rumble controller=%u low=%u high=%u "
+      "(no haptic channel on this device; ignored)",
+      static_cast<unsigned>(controllerNumber), static_cast<unsigned>(lowFreqMotor),
+      static_cast<unsigned>(highFreqMotor)));
+}
+
+void rumbleTriggersCallback(uint16_t controllerNumber, uint16_t leftTriggerMotor,
+                            uint16_t rightTriggerMotor) {
+  if (!g_media.active.load()) return;
+  logRumbleThrottled(formatText(
+      "sunshine gamepad: host trigger rumble controller=%u left=%u right=%u "
+      "(no haptic channel on this device; ignored)",
+      static_cast<unsigned>(controllerNumber),
+      static_cast<unsigned>(leftTriggerMotor),
+      static_cast<unsigned>(rightTriggerMotor)));
 }
 
 void connectionStartedCallback(void) {
@@ -1233,6 +1305,13 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   media.rttAvgMs.store(0);
   media.rttMinMs.store(0);
   media.rttValid.store(false);
+  {
+    std::lock_guard<std::mutex> lock(g_gamepad.mutex);
+    g_gamepad.arrived = false;
+    g_gamepad.hasLast = false;
+    g_gamepad.updates = 0;
+    g_gamepad.lastButtons = 0;
+  }
   media.input.reset();
   {
     std::lock_guard<std::mutex> lock(media.textMutex);
@@ -1340,6 +1419,8 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   connectionCallbacks.connectionTerminated = connectionTerminatedCallback;
   connectionCallbacks.logMessage = logMessageCallback;
   connectionCallbacks.setHdrMode = setHdrModeCallback;
+  connectionCallbacks.rumble = rumbleCallback;
+  connectionCallbacks.rumbleTriggers = rumbleTriggersCallback;
 
   logWarn(formatText(
       "sunshine connecting: host=%s, mode=%dx%dx%d, %d kbps, formats=%s, "
@@ -1608,6 +1689,18 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
               rttOk ? "" : ", rtt unavailable (ENet stats not ready yet)"));
           // 鼠标按键窗口汇总：真实按下/抬起、releaseEpoch/失焦合成的抬起、纯移动
           // 事件次数。只做日志，用来排查「按住移动时锁定丢失」这类多余按键问题。
+          // 手柄窗口汇总：本次窗口内的状态更新次数与最后一次按钮位图。NAPI 线程
+          // 直接写（同一把锁），这里取走并清零。
+          unsigned long long padUpdates = 0;
+          uint32_t padButtons = 0;
+          {
+            std::lock_guard<std::mutex> lock(g_gamepad.mutex);
+            padUpdates = g_gamepad.updates;
+            padButtons = g_gamepad.lastButtons;
+            g_gamepad.updates = 0;
+          }
+          logWarn(formatText("sunshine gamepad: updates=%llu lastButtons=0x%08X",
+                             padUpdates, padButtons));
           const MouseWindowStats mouseStats = media.input.takeMouseStats();
           logWarn(formatText(
               "sunshine mouse: press=%llu release=%llu releaseSynth=%llu "
@@ -1663,6 +1756,10 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
+  // 停止/断开/换代：若本次已把手柄「插上」主机，补一条 mask=0 的空事件移除，
+  // 避免主机端留下一个一直按住的虚拟手柄。
+  if (g_media.started.load()) sunshineReleaseGamepad();
+
   inputDone.store(true);
   if (inputThread.joinable()) inputThread.join();
 
@@ -1694,6 +1791,67 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
 void sunshineNoteInputQueueLag(unsigned long long lagUs) {
   if (!g_media.active.load()) return;
   g_media.input.noteLag(lagUs);
+}
+
+// 手柄透传：NAPI 线程直接调用。见 sunshine_backend.h 的说明。
+bool sunshineSendGamepad(uint32_t buttons, uint8_t leftTrigger,
+                         uint8_t rightTrigger, int leftStickX, int leftStickY,
+                         int rightStickX, int rightStickY) {
+  if (!g_media.active.load() || !g_media.started.load()) return false;
+  const short lx = static_cast<short>(std::max(-32768, std::min(32767, leftStickX)));
+  const short ly = static_cast<short>(std::max(-32768, std::min(32767, leftStickY)));
+  const short rx = static_cast<short>(std::max(-32768, std::min(32767, rightStickX)));
+  const short ry = static_cast<short>(std::max(-32768, std::min(32767, rightStickY)));
+  std::lock_guard<std::mutex> lock(g_gamepad.mutex);
+  if (!g_gamepad.arrived) {
+    const int result = LiSendControllerArrivalEvent(
+        0, 0x0001, LI_CTYPE_XBOX, kGamepadArrivalButtons,
+        kGamepadArrivalCapabilities);
+    if (result != 0) {
+      logWarn(formatText("sunshine gamepad: arrival failed (%d); will retry", result));
+      return false;
+    }
+    g_gamepad.arrived = true;
+    logWarn("sunshine gamepad: arrival (controller 0, Xbox, analog triggers + rumble)");
+  }
+  if (g_gamepad.hasLast && buttons == g_gamepad.lastButtons &&
+      leftTrigger == g_gamepad.lastLeftTrigger &&
+      rightTrigger == g_gamepad.lastRightTrigger && lx == g_gamepad.lastLeftX &&
+      ly == g_gamepad.lastLeftY && rx == g_gamepad.lastRightX &&
+      ry == g_gamepad.lastRightY)
+    return true;  // 与上次完全相同的状态：不重复发送
+  const int result = LiSendMultiControllerEvent(
+      0, 0x0001, static_cast<int>(buttons), leftTrigger, rightTrigger, lx, ly, rx,
+      ry);
+  if (result != 0) {
+    logWarn(formatText("sunshine gamepad: state send failed (%d)", result));
+    return false;
+  }
+  g_gamepad.hasLast = true;
+  g_gamepad.lastButtons = buttons;
+  g_gamepad.lastLeftTrigger = leftTrigger;
+  g_gamepad.lastRightTrigger = rightTrigger;
+  g_gamepad.lastLeftX = lx;
+  g_gamepad.lastLeftY = ly;
+  g_gamepad.lastRightX = rx;
+  g_gamepad.lastRightY = ry;
+  ++g_gamepad.updates;
+  return true;
+}
+
+bool sunshineReleaseGamepad() {
+  if (!g_media.active.load() || !g_media.started.load()) return false;
+  std::lock_guard<std::mutex> lock(g_gamepad.mutex);
+  if (!g_gamepad.arrived) return true;
+  const int result = LiSendMultiControllerEvent(0, 0x0000, 0, 0, 0, 0, 0, 0, 0);
+  g_gamepad.arrived = false;
+  g_gamepad.hasLast = false;
+  if (result == 0) {
+    logWarn("sunshine gamepad: removed (controller 0)");
+  } else {
+    logWarn(formatText("sunshine gamepad: removal failed (%d)", result));
+  }
+  return result == 0;
 }
 
 // 当前串流最近一次采到的网络 RTT（毫秒）与本串流观察到的最小估计；还没采到

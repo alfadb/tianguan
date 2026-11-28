@@ -137,6 +137,60 @@ bool GetDoubleArg(napi_env env, napi_value value, double& out) {
   if (napi_get_value_double(env, value, &out) != napi_ok) return false;
   return true;
 }
+// logLine(tag, message): ArkTS-side W-level diagnostics through OH_LOG_Print.
+// ArkTS hilog.* is invisible on non-debug device builds. Validation/truncation is
+// done in tianguan::logLine(); anything invalid is silently ignored (void).
+napi_value LogLine(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  std::string tag;
+  std::string message;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok &&
+      argc >= 2 && GetStringArg(env, argv[0], 64 * 1024, tag) &&
+      GetStringArg(env, argv[1], 64 * 1024, message)) {
+    tianguan::logLine(tag, message);
+  }
+  return nullptr;
+}
+// sendGamepadState(sessionId, buttons, leftTrigger, rightTrigger, leftStickX,
+// leftStickY, rightStickX, rightStickY): Sunshine only, Moonlight button bitmap as
+// an unsigned 32-bit value (ArkTS passes number | 0). False for an unknown /
+// non-Sunshine / not-connected session.
+napi_value SendGamepadState(napi_env env, napi_callback_info info) {
+  size_t argc = 8;
+  napi_value argv[8];
+  std::string id;
+  uint32_t buttons = 0;
+  int leftTrigger = 0, rightTrigger = 0;
+  int leftStickX = 0, leftStickY = 0, rightStickX = 0, rightStickY = 0;
+  bool accepted = false;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok &&
+      argc >= 8 && GetStringArg(env, argv[0], 256, id) &&
+      napi_get_value_uint32(env, argv[1], &buttons) == napi_ok &&
+      GetIntArg(env, argv[2], leftTrigger) && GetIntArg(env, argv[3], rightTrigger) &&
+      GetIntArg(env, argv[4], leftStickX) && GetIntArg(env, argv[5], leftStickY) &&
+      GetIntArg(env, argv[6], rightStickX) && GetIntArg(env, argv[7], rightStickY))
+    accepted = tianguan::sendGamepadState(id, buttons, leftTrigger, rightTrigger,
+                                          leftStickX, leftStickY, rightStickX,
+                                          rightStickY);
+  napi_value result = nullptr;
+  if (napi_get_boolean(env, accepted, &result) != napi_ok) return nullptr;
+  return result;
+}
+// releaseGamepad(sessionId): Sunshine only, empty MC event with mask 0 (window
+// blur / before close).
+napi_value ReleaseGamepad(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  std::string id;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1 || !GetStringArg(env, argv[0], 256, id))
+    return MakeString(env, "INVALID_SESSION");
+  napi_value result = nullptr;
+  if (napi_get_boolean(env, tianguan::releaseGamepad(id), &result) != napi_ok)
+    return nullptr;
+  return result;
+}
 napi_value StartSession(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -519,6 +573,9 @@ napi_value Init(napi_env env, napi_value exports) {
     {"forgetTrustedFingerprint", nullptr, ForgetTrustedFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"submitPin", nullptr, SubmitPin, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setRemoteCursorHidden", nullptr, SetRemoteCursorHidden, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"logLine", nullptr, LogLine, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"sendGamepadState", nullptr, SendGamepadState, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"releaseGamepad", nullptr, ReleaseGamepad, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"syncRemoteLockState", nullptr, SyncRemoteLockState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -530,7 +587,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 30, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 33, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

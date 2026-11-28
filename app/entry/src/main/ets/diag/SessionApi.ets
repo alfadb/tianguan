@@ -672,3 +672,49 @@ export function suspendRenderSurface(sessionId: string, suspended: boolean): voi
     warn('suspendRenderSurface', error);
   }
 }
+
+/**
+ * Diagnostic log line through the native W-level OH_LOG_Print bridge. ArkTS
+ * hilog is invisible for a non-debug build on the test PC while the native log
+ * is not, so the gamepad probe emits every line through this one. tag and
+ * message are passed through unchanged (the native side prepends them as-is).
+ * A runtime without the symbol is a silent no-op: logging must never crash the
+ * page.
+ */
+export function logLine(tag: string, message: string): void {
+  try {
+    diag.logLine(tag, message);
+  } catch (error) {
+    warn('logLine', error);
+  }
+}
+
+/**
+ * Sunshine only: the full controller state. `buttons` is Moonlight's 16-bit
+ * mask, triggers are 0..255, sticks are +-32767. Returns true when the backend
+ * accepted the state (a session that is not connected returns false and the
+ * caller simply tries again on the next tick).
+ */
+export function sendGamepadState(sessionId: string, buttons: number, lt: number,
+  rt: number, lx: number, ly: number, rx: number, ry: number): boolean {
+  try {
+    return diag.sendGamepadState(sessionId, buttons, lt, rt, lx, ly, rx, ry) === true;
+  } catch (error) {
+    warn('sendGamepadState', error);
+    return false;
+  }
+}
+
+/**
+ * Sunshine only: releases every controller button on the host (empty state,
+ * mask 0). Used on focus loss / hide / disconnect / teardown so the host never
+ * keeps a button stuck; the next gamepad event re-establishes the state.
+ */
+export function releaseGamepad(sessionId: string): boolean {
+  try {
+    return diag.releaseGamepad(sessionId) === true;
+  } catch (error) {
+    warn('releaseGamepad', error);
+    return false;
+  }
+}

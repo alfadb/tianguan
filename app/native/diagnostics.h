@@ -4,6 +4,11 @@
 #include <cstddef>
 namespace tianguan {
 std::string runDiagnostics();
+// ArkTS-side diagnostic logging (ArkTS `hilog.*` is invisible on non-debug device
+// builds while native OH_LOG_Print is not). Writes tag + message at W level;
+// tag <= 256 and message <= 1024 bytes, NUL cuts short, empty input is ignored.
+// Never throws.
+void logLine(const std::string& tag, const std::string& message);
 std::string runNetworkTest(const std::string& dataDir);
 
 // Multi-session API (docs/napi-contract.md). Every runtime call takes the
@@ -123,6 +128,17 @@ inline bool keepQueuedInputOnRelease(int kind) {
   return kind == 2;
 }
 std::string setClipboard(const std::string& sessionId, const std::string& text);
+// Sunshine only: gamepad passthrough. `buttons` is the Moonlight button bitmap
+// (A_FLAG/B_FLAG/...), triggers 0..255, sticks -32768..32767 (clamped). Returns
+// false for an unknown / non-Sunshine / not-connected session (nothing is queued).
+// The first state of a stream sends a controller arrival event; identical repeated
+// states are not sent again. Safe to call from the NAPI thread.
+bool sendGamepadState(const std::string& sessionId, uint32_t buttons,
+                      int leftTrigger, int rightTrigger, int leftStickX,
+                      int leftStickY, int rightStickX, int rightStickY);
+// Sunshine only: remove the gamepad before losing focus / closing (empty MC event
+// with mask 0). Returns false when there is no connected Sunshine session.
+bool releaseGamepad(const std::string& sessionId);
 std::string takeClipboard(const std::string& sessionId);
 std::string requestFullFrame(const std::string& sessionId);
 // VNC and RDP: queues a client-initiated resize request asking the server to

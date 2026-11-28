@@ -5,6 +5,7 @@
 //   - app/entry/src/main/ets/model/SunshineResolutions.ets (Sunshine mode picker)
 //   - app/entry/src/main/ets/model/PictureGeometry.ets   (contain fit / pointer rule)
 //   - app/entry/src/main/ets/model/BubbleMenu.ets        (radial menu structure / fan)
+//   - app/entry/src/main/ets/model/GamepadKeys.ets       (raw gamepad probe rules)
 //
 // Runs under plain Node (no device, no network, no oh_modules):
 //   1. copies the .ets sources byte for byte into a temp dir as .ts,
@@ -32,6 +33,10 @@ const PICTURE_SOURCE =
   path.join(REPO_ROOT, 'app/entry/src/main/ets/model/PictureGeometry.ets');
 const BUBBLE_MENU_SOURCE =
   path.join(REPO_ROOT, 'app/entry/src/main/ets/model/BubbleMenu.ets');
+const GAMEPAD_SOURCE =
+  path.join(REPO_ROOT, 'app/entry/src/main/ets/model/GamepadKeys.ets');
+const GAMEPAD_STATE_SOURCE =
+  path.join(REPO_ROOT, 'app/entry/src/main/ets/model/Gamepad.ets');
 const SDK_ROOT = process.env.TIANGUAN_SDK_ROOT ||
   '/home/worker/harmonyos/command-line-tools/26.0.0.821';
 const TSC = process.env.TIANGUAN_TSC ||
@@ -58,12 +63,22 @@ if (!fs.existsSync(BUBBLE_MENU_SOURCE)) {
   console.error(`FAIL: source not found: ${BUBBLE_MENU_SOURCE}`);
   process.exit(1);
 }
+if (!fs.existsSync(GAMEPAD_SOURCE)) {
+  console.error(`FAIL: source not found: ${GAMEPAD_SOURCE}`);
+  process.exit(1);
+}
+if (!fs.existsSync(GAMEPAD_STATE_SOURCE)) {
+  console.error(`FAIL: source not found: ${GAMEPAD_STATE_SOURCE}`);
+  process.exit(1);
+}
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tianguan-codec-test-'));
 let codec;
 let resolutions;
 let picture;
 let bubbleMenu;
+let gamepad;
+let gamepadState;
 
 try {
   // Stage the real production sources as .ts (tsc does not accept .ets) without
@@ -76,6 +91,10 @@ try {
   fs.copyFileSync(PICTURE_SOURCE, stagedPicture);
   const stagedBubbleMenu = path.join(tempDir, 'BubbleMenu.ts');
   fs.copyFileSync(BUBBLE_MENU_SOURCE, stagedBubbleMenu);
+  const stagedGamepad = path.join(tempDir, 'GamepadKeys.ts');
+  fs.copyFileSync(GAMEPAD_SOURCE, stagedGamepad);
+  const stagedGamepadState = path.join(tempDir, 'Gamepad.ts');
+  fs.copyFileSync(GAMEPAD_STATE_SOURCE, stagedGamepadState);
   const outDir = path.join(tempDir, 'out');
   fs.mkdirSync(outDir);
 
@@ -88,7 +107,9 @@ try {
     staged,
     stagedResolutions,
     stagedPicture,
-    stagedBubbleMenu
+    stagedBubbleMenu,
+    stagedGamepad,
+    stagedGamepadState
   ], { stdio: 'inherit' });
 
   // Give the emitted files an .mjs extension so Node loads them as ES modules
@@ -101,10 +122,16 @@ try {
   fs.renameSync(path.join(outDir, 'PictureGeometry.js'), pictureModulePath);
   const bubbleMenuModulePath = path.join(outDir, 'BubbleMenu.mjs');
   fs.renameSync(path.join(outDir, 'BubbleMenu.js'), bubbleMenuModulePath);
+  const gamepadModulePath = path.join(outDir, 'GamepadKeys.mjs');
+  fs.renameSync(path.join(outDir, 'GamepadKeys.js'), gamepadModulePath);
+  const gamepadStateModulePath = path.join(outDir, 'Gamepad.mjs');
+  fs.renameSync(path.join(outDir, 'Gamepad.js'), gamepadStateModulePath);
   codec = await import(pathToFileURL(modulePath).href);
   resolutions = await import(pathToFileURL(resolutionModulePath).href);
   picture = await import(pathToFileURL(pictureModulePath).href);
   bubbleMenu = await import(pathToFileURL(bubbleMenuModulePath).href);
+  gamepad = await import(pathToFileURL(gamepadModulePath).href);
+  gamepadState = await import(pathToFileURL(gamepadStateModulePath).href);
 } catch (error) {
   console.error(`FAIL: could not compile/load the pure ArkTS sources: ${error && error.message}`);
   fs.rmSync(tempDir, { recursive: true, force: true });
@@ -881,6 +908,113 @@ test('menu symbols map to existing sys.symbol names', () => {
     menuSymbolName('remote-cursor', false));
   // An unknown action still returns a valid symbol (the page's fallback).
   assert.ok(names.has(menuSymbolName('unknown-action', false)));
+});
+
+test('gamepad key codes are the D-pad and controller button ranges', () => {
+  const { isGamepadKeyCode } = gamepad;
+  // D-pad 2012..2015, controller buttons 2301..2315 and the trigger artefact
+  // 10167 (KEYCODE_INVALID) are all intercepted.
+  for (const code of [2012, 2013, 2014, 2015, 2301, 2307, 2312, 2315, 10167]) {
+    assert.equal(isGamepadKeyCode(code), true, `code ${code}`);
+  }
+  // Neighbouring, keyboard and unrelated codes are not gamepad keys.
+  for (const code of [0, 2000, 2011, 2016, 2017, 2300, 2316, 2320, 2400]) {
+    assert.equal(isGamepadKeyCode(code), false, `code ${code}`);
+  }
+});
+
+test('a key from an already-known gamepad device is probed as a gamepad key', () => {
+  const { isGamepadDeviceKey, isGamepadProbeKey } = gamepad;
+  const known = [42, 77];
+  assert.equal(isGamepadDeviceKey(42, known), true);
+  assert.equal(isGamepadDeviceKey(99, known), false);
+  // Any key from the known device is intercepted, even outside the ranges.
+  assert.equal(isGamepadProbeKey(2017, 42, known), true);
+  // A range key is intercepted on the first sighting of its device.
+  assert.equal(isGamepadProbeKey(2301, 7, known), true);
+  // A keyboard key from an unknown device keeps its normal path.
+  assert.equal(isGamepadProbeKey(2017, 7, known), false);
+});
+
+test('gamepad key codes map to Moonlight button bits', () => {
+  const { gamepadButtonMask } = gamepadState;
+  assert.equal(gamepadButtonMask(2301), 0x1000); // A
+  assert.equal(gamepadButtonMask(2302), 0x2000); // B
+  assert.equal(gamepadButtonMask(2304), 0x4000); // X
+  assert.equal(gamepadButtonMask(2305), 0x8000); // Y
+  assert.equal(gamepadButtonMask(2307), 0x0100); // LB
+  assert.equal(gamepadButtonMask(2308), 0x0200); // RB
+  assert.equal(gamepadButtonMask(2311), 0x0020); // BACK
+  assert.equal(gamepadButtonMask(2312), 0x0010); // PLAY
+  assert.equal(gamepadButtonMask(2313), 0x0400); // SPECIAL
+  assert.equal(gamepadButtonMask(2314), 0x0040); // LS
+  assert.equal(gamepadButtonMask(2315), 0x0080); // RS
+  assert.equal(gamepadButtonMask(2012), 0x0001); // UP
+  assert.equal(gamepadButtonMask(2013), 0x0002); // DOWN
+  assert.equal(gamepadButtonMask(2014), 0x0004); // LEFT
+  assert.equal(gamepadButtonMask(2015), 0x0008); // RIGHT
+  // The trigger artefact is intercepted but maps to no button.
+  assert.equal(gamepadButtonMask(10167), 0);
+  assert.equal(gamepadButtonMask(2016), 0);
+});
+
+test('gamepad stick deadzone is radial 12% and rescales to full scale', () => {
+  const { stickToInt16 } = gamepadState;
+  assert.deepEqual(stickToInt16(0, 0), { x: 0, y: 0 });
+  // magnitude ~0.0707 is inside the deadzone; exactly 0.12 is still zero.
+  assert.deepEqual(stickToInt16(0.05, 0.05), { x: 0, y: 0 });
+  assert.deepEqual(stickToInt16(0.12, 0), { x: 0, y: 0 });
+  // (0.5, 0) -> (0.5 - 0.12) / 0.88 = 0.4318 of full scale.
+  const half = stickToInt16(0.5, 0);
+  assert.equal(half.y, 0);
+  assert.ok(half.x > 14100 && half.x < 14200, `x=${half.x}`);
+  assert.deepEqual(stickToInt16(1, 0), { x: 32767, y: 0 });
+  assert.deepEqual(stickToInt16(0, 1), { x: 0, y: 32767 });
+  assert.deepEqual(stickToInt16(0.6, 0.8), { x: 19660, y: 26214 });
+});
+
+test('gamepad triggers map 0..1 to 0..255 and clamp', () => {
+  const { triggerTo255 } = gamepadState;
+  assert.equal(triggerTo255(0), 0);
+  assert.equal(triggerTo255(0.5), 128);
+  assert.equal(triggerTo255(1), 255);
+  assert.equal(triggerTo255(1.7), 255);
+  assert.equal(triggerTo255(-0.3), 0);
+});
+
+test('gamepad snapshot dedupe: identical states are not resent', () => {
+  const { emptyGamepadRaw, applyGamepadKey, applyGamepadAxis, gamepadOutOf,
+    sameGamepadOut } = gamepadState;
+  const raw = applyGamepadKey(emptyGamepadRaw(), 2301, true);
+  const out = gamepadOutOf(raw);
+  assert.equal(out.buttons, 0x1000);
+  assert.equal(sameGamepadOut(out, gamepadOutOf(raw)), true);
+  // Another button or a moved stick changes the snapshot.
+  assert.equal(sameGamepadOut(out, gamepadOutOf(applyGamepadKey(raw, 2302, true))), false);
+  const moved = applyGamepadAxis(raw, 0, 0.9);
+  assert.equal(sameGamepadOut(out, gamepadOutOf(moved)), false);
+  // Releasing the key returns to the original snapshot.
+  const released = applyGamepadKey(raw, 2301, false);
+  assert.equal(sameGamepadOut(gamepadOutOf(released), gamepadOutOf(emptyGamepadRaw())), true);
+});
+
+test('gamepad Y inversion: upper-left stick gives lx<0 and ly>0', () => {
+  const { emptyGamepadRaw, applyGamepadAxis, gamepadOutOf, stickToInt16 } = gamepadState;
+  // HarmonyOS reports "up" as negative Y (measured: upper-left = -0.78).
+  let raw = applyGamepadAxis(emptyGamepadRaw(), 0, -0.6);  // ABS_X
+  raw = applyGamepadAxis(raw, 1, -0.6);                    // ABS_Y
+  const out = gamepadOutOf(raw);
+  assert.ok(out.lx < 0, `lx=${out.lx}`);
+  assert.ok(out.ly > 0, `ly=${out.ly}`);
+  // Right stick: ABS_Z/ABS_RZ, same inversion.
+  let raw2 = applyGamepadAxis(emptyGamepadRaw(), 2, -0.6); // ABS_Z
+  raw2 = applyGamepadAxis(raw2, 3, -0.6);                  // ABS_RZ
+  const out2 = gamepadOutOf(raw2);
+  assert.ok(out2.rx < 0, `rx=${out2.rx}`);
+  assert.ok(out2.ry > 0, `ry=${out2.ry}`);
+  // The raw converter itself stays sign-preserving (only the gamepad path flips).
+  assert.ok(stickToInt16(-0.6, -0.6).y < 0);
+  assert.ok(stickToInt16(-0.6, -0.6, 0.12, true).y > 0);
 });
 
 // ---------------------------------------------------------------------------

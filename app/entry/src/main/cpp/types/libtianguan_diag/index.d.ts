@@ -1,5 +1,24 @@
 export const runDiagnostics: () => Promise<string>;
 export const runNetworkTest: (filesDir: string) => Promise<string>;
+// ArkTS-side diagnostic logging: ArkTS `hilog.*` output is invisible on non-debug
+// device builds, so route it through native OH_LOG_Print instead. Writes `message`
+// at W level under `tag`; tag <= 256 bytes, message <= 1024 bytes (NUL cuts short,
+// empty input is ignored). Never throws; returns nothing.
+export const logLine: (tag: string, message: string) => void;
+// Sunshine/Moonlight only: gamepad passthrough. `buttons` is the Moonlight button
+// bitmap as an unsigned 32-bit value (A=0x1000, B=0x2000, X=0x4000, Y=0x8000,
+// UP/DOWN/LEFT/RIGHT=0x1/0x2/0x4/0x8, LB=0x100, RB=0x200, PLAY=0x10, BACK=0x20,
+// LS=0x40, RS=0x80, SPECIAL=0x400); triggers 0..255; sticks -32768..32767
+// (clamped natively). False for an unknown / non-Sunshine / not-connected session
+// (nothing is queued). The first state of a stream sends a controller arrival
+// event; an identical repeated state is not sent again. Call it directly from the
+// NAPI thread; common-c queues and coalesces internally.
+export const sendGamepadState: (sessionId: string, buttons: number,
+  leftTrigger: number, rightTrigger: number, leftStickX: number,
+  leftStickY: number, rightStickX: number, rightStickY: number) => boolean;
+// Sunshine/Moonlight only: remove the gamepad (empty multi-controller event with
+// mask 0) before the window loses focus / the session closes.
+export const releaseGamepad: (sessionId: string) => boolean;
 
 // Multi-session API (docs/napi-contract.md).
 // createSession() accepts protocol="vnc" (default) | "rdp" | "sunshine".

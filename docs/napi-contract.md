@@ -2,6 +2,10 @@
 
 本文件定义 `libtianguan_diag` 在下一阶段对外暴露的接口。原生与 ArkTS 两侧都以此为准；改动必须先改本文件。
 
+| 接口 | 说明 |
+|---|---|
+| `logLine(tag: string, message: string): void` | **诊断日志出口**：非调试版设备上 ArkTS 的 `hilog.*` 输出不可见，而原生 `OH_LOG_Print` 正常；ArkTS 侧的诊断日志统一经此以 W 级输出（`tag` ≤ 256、`message` ≤ 1024 字节，遇 NUL 截断，空串忽略）。不抛异常、无返回值、不影响会话。 |
+
 ## 设计原则
 
 - **每个运行期会话有独立 id**：所有运行期接口第一个参数都是 `sessionId`（字符串，由 `createSession` 返回）。
@@ -264,6 +268,23 @@ syncRemoteLockState(sessionId: string, capsLock: boolean, numLock: boolean): str
 - RDP：把 `capsLock` / `numLock` 作为**绝对状态**，由会话线程通过 FreeRDP 的 Client Synchronize Event（`freerdp_input_send_synchronize_event`，toggleFlags 含 `KBD_SYNC_CAPS_LOCK` / `KBD_SYNC_NUM_LOCK`）发给远端。调用方在 NAPI 线程只登记新值，不写 socket；新值覆盖尚未发送的旧值；若当前未连接，最新值保留到下一次连接进入事件循环后发送。本调用不改变本机状态，也不等待远端确认。
 - RDP 上 CapsLock（`0xFFE5`）与 NumLock（`0xFF7F`）的键事件不再转发（静默忽略：不产生扫描码、不计入未映射丢键数、不打丢弃日志）；远端锁定状态只由本接口设置。ScrollLock 仍按原样转发。
 - VNC：不做任何事，返回 `OK`（RFB 直接发送 keysym，没有锁定状态 PDU）。
+
+## 手柄（Sunshine）
+
+```
+sendGamepadState(sessionId: string, buttons: number, leftTrigger: number,
+                 rightTrigger: number, leftStickX: number, leftStickY: number,
+                 rightStickX: number, rightStickY: number): boolean
+releaseGamepad(sessionId: string): boolean
+```
+
+- **Sunshine/Moonlight 专用**。`buttons` 是 Moonlight 按钮位图，按 **32 位无符号**读取（ArkTS 用 `number | 0` 传）；扳机 `0–255`、摇杆 `-32768…32767`（原生钳位）。非 Sunshine / 未连接返回 `false`，不排队。
+- `LiSend*` 输入 API 线程安全、内部排队，所以 NAPI 线程**直接调用**即可，无需另起线程；同一节拍内多次调用自然只保留最新一条。
+- 首次收到某手柄的状态时先发 **arrival**：`controllerNumber=0`、`activeGamepadMask=0x0001`、`LI_CTYPE_XBOX`、支持键 `A|B|X|Y|UP|DOWN|LEFT|RIGHT|LB|RB|PLAY|BACK|LS|RS|SPECIAL`、能力 `LI_CCAP_ANALOG_TRIGGERS|LI_CCAP_RUMBLE`；随后用 `LiSendMultiControllerEvent(0, 0x0001, buttons, lt, rt, lx, ly, rx, ry)` 发送状态。**与上次完全相同的状态不重复发送**。
+- `releaseGamepad`：发送 mask=0 的空 MC 事件并清「已到达」标记（窗口失焦/关闭前调用）；会话停止/断开/换代时若已到达也会自动补发一次移除。
+- 按钮位图：`A=0x1000 B=0x2000 X=0x4000 Y=0x8000`、`UP=0x1 DOWN=0x2 LEFT=0x4 RIGHT=0x8`、`LB=0x100 RB=0x200`、`PLAY=0x10 BACK=0x20`、`LS=0x40 RS=0x80`、`SPECIAL=0x400`。ArkTS 侧负责把鸿蒙键码（实测 USB Xbox Series：2301/2302/2304/2305/2307/2308/2311/2312/2313/2314/2315、2012–2015）映射成这些位，摇杆用 X/Y/Z/RZ（±1）、扳机用 BRAKE/GAS（0–1）换算到上述范围。
+- **无震动输出**：主机下发的 `rumble` / `rumbleTriggers` 回调只打 W 级限频日志（鸿蒙侧没有把 Moonlight 震动语义传给手柄的通道），不会实际震动；能力位仍声明 `LI_CCAP_RUMBLE` 以免游戏禁用相关特性。
+- 日志：arrival/removal 各一行 W 级；每 5 秒汇总 `sunshine gamepad: updates=N lastButtons=0x…`。
 
 ## 剪贴板
 

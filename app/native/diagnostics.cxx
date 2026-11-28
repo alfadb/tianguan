@@ -4131,6 +4131,33 @@ void reapClosedSession(std::shared_ptr<SessionState> state) {
 // ---------------------------------------------------------------------------
 // Multi-session API
 // ---------------------------------------------------------------------------
+// ArkTS-side diagnostic logging. On non-debug device builds ArkTS `hilog.*`
+// output is not visible while native OH_LOG_Print is, so ArkTS routes its
+// diagnostics through this export. Limits: tag <= 256, message <= 1024 bytes;
+// a NUL cuts the string short; empty input is ignored. Logging must never throw
+// into ArkTS, so everything unexpected is swallowed.
+void tianguan::logLine(const std::string& tag, const std::string& message) {
+  try {
+    std::string safeTag = tag.substr(0, 256);
+    std::string safeMessage = message.substr(0, 1024);
+    const size_t tagNul = safeTag.find('\0');
+    if (tagNul != std::string::npos) safeTag.resize(tagNul);
+    const size_t messageNul = safeMessage.find('\0');
+    if (messageNul != std::string::npos) safeMessage.resize(messageNul);
+    if (safeTag.empty() || safeMessage.empty()) return;
+#if defined(__MUSL__)
+    OH_LOG_Print(LOG_APP, LOG_WARN, 0, safeTag.c_str(), "%{public}s",
+                 safeMessage.c_str());
+#else
+    // Host build: no hilog, keep the same W-level line on stderr.
+    std::fprintf(stderr, "W %s %s\n", safeTag.c_str(), safeMessage.c_str());
+    std::fflush(stderr);
+#endif
+  } catch (...) {
+    // Never propagate anything into ArkTS.
+  }
+}
+
 std::string tianguan::createSession(const std::string& optionsJson) {
   SessionOptions options;
   std::string error;
@@ -4347,6 +4374,37 @@ bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden,
                          : "no send");
   emitDiagWarn(line);
   return connected;
+}
+
+// Gamepad passthrough (Sunshine only). The NAPI thread calls common-c's input API
+// directly (it is thread-safe and internally queued); the backend does the arrival
+// bookkeeping and dedupes identical states. Values are clamped here: triggers
+// 0..255, sticks -32768..32767.
+bool tianguan::sendGamepadState(const std::string& sessionId, uint32_t buttons,
+                                int leftTrigger, int rightTrigger, int leftStickX,
+                                int leftStickY, int rightStickX, int rightStickY) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  if (state->protocol != "sunshine") return false;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    if (!state->connected) return false;
+  }
+  const uint8_t lt = static_cast<uint8_t>(std::max(0, std::min(255, leftTrigger)));
+  const uint8_t rt = static_cast<uint8_t>(std::max(0, std::min(255, rightTrigger)));
+  return tianguan::sunshineSendGamepad(buttons, lt, rt, leftStickX, leftStickY,
+                                       rightStickX, rightStickY);
+}
+
+bool tianguan::releaseGamepad(const std::string& sessionId) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  if (state->protocol != "sunshine") return false;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    if (!state->connected) return false;
+  }
+  return tianguan::sunshineReleaseGamepad();
 }
 
 // Times one takeFrame() call (including calls that return NONE). Declared
