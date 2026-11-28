@@ -794,15 +794,15 @@ test('4-item main fan: 118 deg, evenly spaced, narrow sub-fan', () => {
 test('cursor submenu list and the main entry that owns it', () => {
   const { cursorSubmenuEntries, mainBubbleMenuEntries } = bubbleMenu;
   const sub = cursorSubmenuEntries();
-  // 返回 sits in the MIDDLE: the two switches are at the ends of the 90 deg arc.
-  assert.deepEqual(sub.map((entry) => entry.id), ['local-cursor', 'back', 'remote-cursor']);
-  assert.deepEqual(sub.map((entry) => entry.label), ['本地光标', '返回', '远端光标']);
+  // Two switches only (no 返回): the bubble/outside tap closes the whole menu.
+  assert.deepEqual(sub.map((entry) => entry.id), ['local-cursor', 'remote-cursor']);
+  assert.deepEqual(sub.map((entry) => entry.label), ['本地光标', '远端光标']);
   // Sunshine PC main fan: [最小化, 全屏, 光标 ▸, 断开]; 断开 stays at the +end.
   const pcSun = mainBubbleMenuEntries(true, false, true);
   assert.deepEqual(pcSun.map((entry) => entry.id),
     ['minimize', 'fullscreen', 'cursor', 'disconnect']);
   assert.ok(pcSun[2].children !== undefined);
-  assert.equal(pcSun[2].children.length, 3);
+  assert.equal(pcSun[2].children.length, 2);
   // VNC/RDP keep the historical sets: no cursor entry, no children.
   assert.deepEqual(mainBubbleMenuEntries(true, false, false).map((entry) => entry.id),
     ['minimize', 'fullscreen', 'disconnect']);
@@ -824,7 +824,7 @@ test('submenu labels never overlap a fan button (same geometry as the page)', ()
   ];
   for (const c of cases) {
     for (const center of [c.center - 20, c.center, c.center + 20]) {
-      const angles = bubbleMenuAnglesFor(3, center, 90);
+      const angles = bubbleMenuAnglesFor(2, center, 90);
       assert.equal(labelsClearOfButtons(c.ax, c.ay, 112, angles, 50, 27, 64, 20, c.w, c.h),
         true, `overlap: anchor=${c.ax},${c.ay} center=${center}`);
     }

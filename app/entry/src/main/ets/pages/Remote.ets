@@ -2035,33 +2035,6 @@ struct Remote {
     this.bubbleMenuAngles = angles;
   }
 
-  /** 返回 / an outside press while the sub-fan is shown: back to the main ring. */
-  private backToMainBubbleMenu(): void {
-    if (this.bubbleMenuSubmenu === '') {
-      return;
-    }
-    this.bubbleMenuSubmenu = '';
-    this.resetBubbleMenuHint();
-    const angles = this.computeBubbleMenuAngles();
-    if (angles.length === 0) {
-      this.closeBubbleMenu('menu-no-fit');
-      return;
-    }
-    this.bubbleMenuAngles = angles;
-  }
-
-  /** An outside press: the sub-fan collapses to the main ring, the main ring closes. */
-  private dismissBubbleMenuOutside(reason: string): void {
-    if (!this.bubbleMenuVisible) {
-      return;
-    }
-    if (this.bubbleMenuSubmenu !== '') {
-      this.backToMainBubbleMenu();
-      return;
-    }
-    this.closeBubbleMenu(reason);
-  }
-
   private closeBubbleMenu(reason: string): void {
     this.cancelBubbleMenuHide();
     // Every close clears any leftover dismissal swallow state and any stale
@@ -2144,7 +2117,8 @@ struct Remote {
    *   - main fan: [主列表/最小化, 全屏?, 光标?, 断开]; the Sunshine session adds
    *     「光标」 whose children are the two cursor switches (no extra buttons in
    *     the main ring);
-   *   - 光标 sub-fan: [本地光标, 远端光标, 返回].
+   *   - 光标 sub-fan: [本地光标, 远端光标] (no 返回 item; tapping the bubble or
+   *     outside the menu closes the whole menu).
    * VNC/RDP have no children and keep the historical set and geometry.
    */
   private bubbleMenuEntries(): BubbleMenuEntry[] {
@@ -2295,14 +2269,13 @@ struct Remote {
         l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
     }
     if (action === 'remote-cursor') {
-      // Remote cursor: an arrow on a monitor outline (16-unit grid).
-      return m(1, 3) + l(10, 3) + l(10, 12) + l(1, 12) + l(1, 3) +
-        m(6.4, 6.2) + l(6.4, 13.4) + l(8.3, 10.6) + l(9.7, 14) +
-        l(11.1, 13.3) + l(9.7, 9.9) + l(12.2, 9.4) + l(6.4, 6.2);
-    }
-    if (action === 'back') {
-      // Left arrow: back to the main fan.
-      return m(14, 8) + l(2, 8) + m(2, 8) + l(7, 3) + m(2, 8) + l(7, 13);
+      // Remote cursor: a screen with a pointer, drawn on the same 16-unit grid
+      // and filling the same 14/16 ink extent as the other main-ring glyphs, so
+      // the sub-fan icon matches the main ring in size and centring.
+      return m(1, 2.2) + l(13, 2.2) + l(13, 10.6) + l(1, 10.6) + l(1, 2.2) +
+        m(4.8, 14.4) + l(9.2, 14.4) + m(7, 10.6) + l(7, 14.4) +
+        m(8.4, 6.4) + l(8.4, 14.8) + l(10.2, 11.8) + l(11.5, 15) + l(12.9, 14.3) +
+        l(11.6, 11.1) + l(14, 10.4) + l(8.4, 6.4);
     }
     return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
@@ -2396,8 +2369,8 @@ struct Remote {
       }
       if (submenu) {
         // Never shrink the sub-fan: its 90 deg keeps the two cursor switches
-        // 90 deg apart (返回 sits between them). Near an edge the shared
-        // per-button clamp keeps every circle inside the picture instead.
+        // 90 deg apart. Near an edge the shared per-button clamp keeps every
+        // circle inside the picture instead.
         return bubbleMenuAnglesFor(count, inward, maxSpan);
       }
     }
@@ -2405,8 +2378,8 @@ struct Remote {
   }
 
   /**
-   * Runs one menu action. Actions that change the fan (光标 ▸ / 返回) or a cursor
-   * switch stay inside the menu; every other action closes it first.
+   * Runs one menu action. 光标 ▸ swaps the fan in place; every other action
+   * (including a cursor switch) closes the menu first.
    */
   private runBubbleMenuAction(index: number): void {
     const action = this.bubbleMenuAction(index);
@@ -2417,16 +2390,16 @@ struct Remote {
       this.openCursorSubmenu();
       return;
     }
-    if (action === 'back') {
-      this.backToMainBubbleMenu();
-      return;
-    }
+    // The cursor switches collapse the menu after the tap (the switch state is
+    // saved by the toggle; there is no 返回 item and no open sub-fan state).
     if (action === 'local-cursor') {
       this.toggleSunshineLocalCursor();
+      this.closeBubbleMenu('action-local-cursor');
       return;
     }
     if (action === 'remote-cursor') {
       this.toggleSunshineRemoteCursor();
+      this.closeBubbleMenu('action-remote-cursor');
       return;
     }
     this.closeBubbleMenu('action-' + action);
@@ -5852,8 +5825,7 @@ struct Remote {
    *  - 主列表 (phone/tablet): three bars of different lengths
    *  - 全屏 / 退出全屏: outward / inward corner brackets
    *  - 光标 / 本地光标: an arrow pointer (光标 opens the sub-fan)
-   *  - 远端光标: an arrow on a monitor outline
-   *  - 返回: a left arrow
+   *  - 远端光标: a screen with a pointer, same 14/16 ink extent as the others
    *  - 断开: a cross
    */
   @Builder
@@ -5887,12 +5859,13 @@ struct Remote {
     .width(this.bubbleMenuButtonSize())
     .height(this.bubbleMenuButtonSize())
     .borderRadius(this.bubbleMenuButtonRadius())
-    .backgroundColor(this.bubbleMenuDanger(index) ? '#CC7F1D1D' :
-      (this.bubbleMenuChecked(index) ? $r('app.color.brand') : '#CC202124'))
+    .backgroundColor(this.bubbleMenuDanger(index) ? '#CC7F1D1D' : '#CC202124')
+    // The ON state of a cursor switch is a brand-coloured ring: the button keeps
+    // the main ring's fill/size, so it does not look larger than the main items.
     .border({
-      width: 1,
+      width: this.bubbleMenuChecked(index) ? 2 : 1,
       color: this.bubbleMenuDanger(index) ? '#66FF8A80' :
-        (this.bubbleMenuChecked(index) ? '#FFFFFFFF' : '#40FFFFFF')
+        (this.bubbleMenuChecked(index) ? $r('app.color.brand') : '#40FFFFFF')
     })
     .shadow({ radius: 6, color: '#66000000', offsetY: 2 })
     // The fan point is the final position; the appear / disappear transition
@@ -5951,7 +5924,7 @@ struct Remote {
   }
 
   /**
-   * Permanent label under a sub-fan button (本地光标 / 远端光标 / 返回). The main
+   * Permanent label under a sub-fan button (本地光标 / 远端光标). The main
    * ring has no permanent labels (its hint appears on hover / long press).
    * Hit-test transparent so the label never steals the button tap.
    */
@@ -6345,8 +6318,7 @@ struct Remote {
                   '菜单收起吞掉触摸 type=%{public}s fingers=%{public}d',
                   Remote.touchTypeName(event.type), fingers);
                 if (this.bubbleMenuVisible) {
-                  // Sub-fan -> main ring; main ring -> close.
-                  this.dismissBubbleMenuOutside('picture-touch');
+                  this.closeBubbleMenu('picture-touch');
                 }
                 // A touch on remote_area: let the position rule decide whether
                 // the local cursor belongs here (black bars keep it hidden).
@@ -6386,7 +6358,7 @@ struct Remote {
               // event is added or removed by it.
               this.pointerOverPicture = true;
               this.refreshCursorVisibility();
-              this.dismissBubbleMenuOutside('picture-touch');
+              this.closeBubbleMenu('picture-touch');
               this.requestViewFocus();
               // Do not press yet: this touch may still become a pinch, a tap
               // or a long press. The mask-0 move keeps the remote pointer (and
@@ -6466,7 +6438,7 @@ struct Remote {
               hilog.debug(DOMAIN, TAG,
                 '菜单收起吞掉鼠标按下 x=%{public}d y=%{public}d',
                 Math.round(event.x), Math.round(event.y));
-              this.dismissBubbleMenuOutside('picture-press');
+              this.closeBubbleMenu('picture-press');
               this.bubbleMenuDismissSwallowMouse = true;
               this.armBubbleMenuDismissTimeout();
               // Focus normally follows touch, not mouse clicks, so grab it here;

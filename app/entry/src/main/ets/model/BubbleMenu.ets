@@ -20,19 +20,15 @@ export interface BubbleMenuEntry {
 }
 
 /**
- * The two cursor switches and 返回. 本地光标 is the client's own pointer; 远端光标
- * is the cursor the HOST draws into the video. Labels are static; the page shows
- * the on/off state by highlighting the button.
- */
-/**
- * The two cursor switches and 返回, arranged so 返回 sits in the MIDDLE of the
- * sub-fan and the two switches sit at its ends: with a 90 deg fan they are then
- * 90 deg apart, and every button's label (placed beside it) has clear space.
+ * The two cursor switches. 本地光标 is the client's own pointer; 远端光标 is the
+ * cursor the HOST draws into the video. There is no 返回 item: tapping the
+ * bubble (always back to the main fan) or outside the menu closes the menu. The
+ * two items sit at the ends of a 90 deg arc, i.e. 90 deg apart, and the page
+ * shows the on/off state by highlighting the button; labels are static.
  */
 export function cursorSubmenuEntries(): BubbleMenuEntry[] {
   return [
     { id: 'local-cursor', label: '本地光标' },
-    { id: 'back', label: '返回' },
     { id: 'remote-cursor', label: '远端光标' }
   ];
 }
@@ -83,9 +79,8 @@ export function bubbleMenuAnglesFor(count: number, centerDeg: number,
 
 /**
  * Preferred fan span. VNC/RDP keep the historical 110°; a four-item main fan
- * widens to 118° so the larger buttons keep their spacing, and the three-item
- * cursor sub-fan uses 90° (with 返回 in the middle, the two switches are 90°
- * apart).
+ * widens to 118° so the larger buttons keep their spacing, and the two-item
+ * cursor sub-fan uses 90° so its two switches sit 90° apart (±45°).
  */
 export function bubbleMenuSpanFor(count: number, submenu: boolean): number {
   if (submenu) {
