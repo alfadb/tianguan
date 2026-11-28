@@ -458,8 +458,10 @@ struct Index {
   /** Form-facing bitrate unit is Mbps; connect() converts it to native kbps. */
   @State private formSunshineBitrate: string = '20';
   @State private formSunshineCodec: string = SUNSHINE_CODEC_AUTO;
-  /** Experimental local cursor: OFF by default (the remote cursor is shown). */
+  /** Experimental local cursor (client pointer): OFF by default. */
   @State private formSunshineLocalCursor: boolean = false;
+  /** Remote (host) cursor shown; the entry stores the inverse (hidden). */
+  @State private formSunshineRemoteCursor: boolean = true;
   /** Follow the window size by restarting the stream at the best host mode. */
   @State private formSunshineFollowWindow: boolean = true;
   /** true waits for vsync; the form checkbox is the inverse (low latency). */
@@ -852,6 +854,7 @@ struct Index {
     this.formDomain = '';
     this.formSunshineApp = '';
     this.formSunshineLocalCursor = false;
+    this.formSunshineRemoteCursor = true;
     this.formSunshineFollowWindow = true;
     this.formSunshineVsync = true;
     this.resetSunshineQuality(SUNSHINE_PRESET_BALANCED, SUNSHINE_CODEC_AUTO);
@@ -891,6 +894,7 @@ struct Index {
     this.formSunshineCodec = typeof entry.sunshineCodec === 'string' &&
       isSunshineCodec(entry.sunshineCodec) ? entry.sunshineCodec : SUNSHINE_CODEC_AUTO;
     this.formSunshineLocalCursor = entry.sunshineLocalCursor === true;
+    this.formSunshineRemoteCursor = entry.sunshineHostCursorHidden !== true;
     this.formSunshineFollowWindow = entry.sunshineFollowWindow !== false;
     this.formSunshineVsync = entry.sunshineVsync !== false;
     this.formPort = entry.port;
@@ -1062,10 +1066,10 @@ struct Index {
       sunshineBitrate: sunshineBitrate,
       sunshineCodec: sunshineCodec,
       sunshineLocalCursor: sunshine ? this.formSunshineLocalCursor : false,
-      // The host cursor state is not edited in the form: keep whatever the
-      // session page last recorded, so editing a connection cannot reset it.
-      sunshineHostCursorHidden: previous === undefined ? false :
-        previous.sunshineHostCursorHidden === true,
+      // Remote cursor switch = the desired host cursor state (hidden is the
+      // inverse). For non-Sunshine records the previous value is preserved.
+      sunshineHostCursorHidden: sunshine ? !this.formSunshineRemoteCursor :
+        (previous === undefined ? false : previous.sunshineHostCursorHidden === true),
       sunshineFollowWindow: sunshine ? this.formSunshineFollowWindow : true,
       sunshineVsync: sunshine ? this.formSunshineVsync : true
     };
@@ -2079,17 +2083,25 @@ struct Index {
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
-        // Experimental local cursor: hides the remote cursor and shows the local
-        // system pointer (lower latency, fixed arrow shape). OFF by default.
+        // Two INDEPENDENT cursor switches: the client pointer and the cursor the
+        // host draws into the video. The user decides each end separately.
         Row({ space: 8 }) {
           Checkbox()
             .select(this.formSunshineLocalCursor)
             .onChange((checked: boolean) => { this.formSunshineLocalCursor = checked; })
-          Text('本地光标（实验性：隐藏远端光标，改显示本地箭头，更跟手但光标形状固定）')
+          Text('本地光标（实验性：显示本地箭头，更跟手但光标形状固定）')
             .fontSize(14)
             .layoutWeight(1)
         }
-        Text('主机光标状态是主机级的，会保留到下次会话；Sunshine 重启后恢复显示')
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(this.formSunshineRemoteCursor)
+            .onChange((checked: boolean) => { this.formSunshineRemoteCursor = checked; })
+          Text('远端光标（主机把光标画进画面，跟随视频延迟）')
+            .fontSize(14)
+            .layoutWeight(1)
+        }
+        Text('两端可分别开关；同时开启会看到两个光标。主机光标状态是主机级的，会保留到下次会话；Sunshine 重启后恢复显示')
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')

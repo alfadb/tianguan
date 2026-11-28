@@ -90,10 +90,10 @@ export interface ConnectionEntry {
    */
   sunshineLocalCursor?: boolean;
   /**
-   * Sunshine only: whether the HOST cursor is currently hidden. The host state
-   * is host-wide and survives this app, so it is recorded here to avoid needless
-   * toggles on the next connection; the session status's remoteCursorHidden is
-   * authoritative and overwrites it whenever it changes.
+   * Sunshine only: whether the HOST cursor is hidden. The 远端光标 switch stores
+   * its inverse (hidden = off). The host state is host-wide and survives this app,
+   * so it is recorded here to restore it on the next connection; the session
+   * status's remoteCursorHidden is authoritative and overwrites it on change.
    */
   sunshineHostCursorHidden?: boolean;
   /**

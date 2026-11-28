@@ -419,27 +419,19 @@ export function submitPin(sessionId: string, pin: string): boolean {
  * non-Sunshine / not-connected session (a not-connected session still records
  * the desired state and sends it once connected). The host state is host-wide
  * and outlives the session.
+ *
+ * force=true sends the chord once even when the locally recorded state already
+ * matches `hidden`. The runtime 远端光标 switch uses it (an inverted record must
+ * not swallow the user's tap); the connect-time auto-align passes false, so it
+ * keeps the "already in that state → no-op" behaviour.
  */
-export function setRemoteCursorHidden(sessionId: string, hidden: boolean): boolean {
+export function setRemoteCursorHidden(sessionId: string, hidden: boolean,
+  force: boolean = false): boolean {
   try {
-    return diag.setRemoteCursorHidden(sessionId, hidden) === true;
+    return force ? diag.setRemoteCursorHidden(sessionId, hidden, true) === true :
+      diag.setRemoteCursorHidden(sessionId, hidden) === true;
   } catch (error) {
     warn('setRemoteCursorHidden', error);
-    return false;
-  }
-}
-
-/**
- * Sunshine only: re-aligns the backend's host-cursor record with reality (it can
- * be inverted). The backend flips its record and re-applies the current desired
- * state; the authoritative value then arrives via status.remoteCursorHidden.
- * Returns false only for an unknown / non-Sunshine session.
- */
-export function resyncRemoteCursor(sessionId: string): boolean {
-  try {
-    return diag.resyncRemoteCursor(sessionId) === true;
-  } catch (error) {
-    warn('resyncRemoteCursor', error);
     return false;
   }
 }

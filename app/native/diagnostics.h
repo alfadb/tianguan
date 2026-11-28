@@ -47,16 +47,14 @@ bool submitPin(const std::string& sessionId, const std::string& pin);
 // the request is satisfied or accepted; false for an unknown / non-Sunshine /
 // not-connected session (in the not-connected case the desired state is still
 // recorded and sent once the connection is established).
-bool setRemoteCursorHidden(const std::string& sessionId, bool hidden);
-// Sunshine only: re-align the locally recorded host-cursor state. Flips the record
-// without sending anything, then applies the current desired state (the last
-// setRemoteCursorHidden target, or the inverse of sunshineHostCursorHidden when
-// none was set): if the flipped record differs it queues the corrected
-// Ctrl+Alt+Shift+N chord (sent by the input thread, once connected). Returns false
-// only for an unknown / non-Sunshine session. Use it when "local cursor on" still
-// shows the remote cursor, or "local cursor off" shows none, and after a Sunshine
-// restart (the host goes back to showing its cursor).
-bool resyncRemoteCursor(const std::string& sessionId);
+// force == true (the user flipped the UI switch): skip the recorded-state
+// comparison and always send one toggle, recording `hidden` once it is sent — the
+// record may be inverted, so comparing would leave the switch stuck. force ==
+// false (default, automatic alignment on connect): only send when the record
+// differs. Returns false for an unknown / non-Sunshine / not-connected session.
+bool setRemoteCursorHidden(const std::string& sessionId, bool hidden,
+                           bool force = false);
+
 // Writes the pending region or a full BGRA_8888 frame into dst. Returns JSON
 // metadata, "NONE" when there is nothing newer than afterVersion, or
 // "ERROR:BUFFER_TOO_SMALL" without touching dst.

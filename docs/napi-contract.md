@@ -243,21 +243,14 @@ releaseSessionInput(sessionId: string): string   // 释放按键/按钮并清指
 ### 主机光标（本地光标模式）
 
 ```
-setRemoteCursorHidden(sessionId: string, hidden: boolean): boolean
+setRemoteCursorHidden(sessionId: string, hidden: boolean, force?: boolean): boolean
 ```
 
 - **Sunshine/Moonlight 专用**。Sunshine 的光标编在视频里，跟随延迟等于视频链路；隐藏主机光标后由客户端显示本地系统光标。切换方式是发送 Sunshine 快捷键 **Ctrl+Alt+Shift+N**（`src/input.cpp` 的 `apply_shortcut` 翻转主机全局 `display_cursor`，且该组合键不传给桌面）。注意必须**真实按下/抬起修饰键**（`Ctrl↓ Alt↓ Shift↓ N↓ N↑ Shift↑ Alt↑ Ctrl↑`，每步 `LiSendKeyboardEvent`）：Sunshine 的 `shortcutFlags` 由修饰键本身的按下/抬起事件维护，只发一个带修饰位标记的 N 键不会触发快捷键、N 还会被传给桌面。
-- **同步**返回。会话已是目标状态 → `true`（不发送；同时取消尚未发出的反向请求）；请求被受理 → `true`（组合键由后端输入线程在 ~2 ms 内发出，发送成功后 `remoteCursorHidden` 才更新）；会话不存在 / 非 Sunshine / 未连接 → `false`（未连接时仍记录「期望状态」，连接建立后补发一次）。
-- 状态是**主机进程级、跨会话保持**的，客户端无法查询：原生只记录，ArkTS 负责持久化到连接条目并通过 `sunshineHostCursorHidden` 传回。**Sunshine 重启后会回到「显示」**，界面若怀疑主机重启过，应把记录重置为 `false` 再做切换。
+- `force` 可选，默认 `false`：**界面开关点击时传 `true`**——不与本地记录比较，**总是**发送一次切换序列（记录可能已与主机状态相反，比较会让开关永远对不上），发送成功后把记录设为目标值；缺省/`false` 是自动对齐语义（连接时用）：记录与目标相同就不发，不同才发。
+- **同步**返回。会话已是目标状态（仅 `force=false`）→ `true`（不发送；同时取消尚未发出的反向请求）；请求被受理 → `true`（组合键由后端输入线程在 ~2 ms 内发出，发送成功后 `remoteCursorHidden` 才更新）；会话不存在 / 非 Sunshine / 未连接 → `false`（未连接时仍记录「期望状态」，连接建立后补发一次）。
+- 状态是**主机进程级、跨会话保持**的，客户端无法查询：原生只记录，ArkTS 负责持久化到连接条目并通过 `sunshineHostCursorHidden` 传回。**Sunshine 重启后会回到「显示」**；记录与真实状态不一致时（例如「开本地光标时远端光标仍在」「关本地光标时看不到任何光标」），用 `force=true` 点一次远端光标开关即可对齐（先按该开关的期望值调用，记录会被校正）。
 - 发送与前后状态均打 W 级日志；不涉及 PIN/密钥。
-
-```
-resyncRemoteCursor(sessionId: string): boolean
-```
-
-- **Sunshine/Moonlight 专用**。用于本地记录与主机真实状态不一致时重新对齐（例如修正组合键之前那些「无效发送被记成成功」留下的反向记录）：**先把本地记录翻转**（不发送任何按键），再按「当前期望状态」走一遍上面的逻辑——期望值取本会话最近一次 `setRemoteCursorHidden()` 的目标；从未设置过则取会话选项 `sunshineHostCursorHidden` 的反义（即默认期望「显示」）。翻转后的记录若与期望不同，就排队发送修正后的 `Ctrl↓ Alt↓ Shift↓ N↓ N↑ Shift↑ Alt↑ Ctrl↑`；相同则不发。
-- 返回 `false` 仅表示会话不存在或不是 Sunshine；其余情况返回 `true`（未连接时会排队，连接建立后由输入线程补发）。翻转前后、期望值与是否发送均打 W 级日志。
-- **使用场景**：发现「开本地光标时远端光标仍在」或「关本地光标时看不到任何光标」时点一次即可对齐；**Sunshine 重启后主机光标会恢复显示**，也需要对齐一次（此时界面可先按当前开关调一次 `setRemoteCursorHidden`，再调本接口）。
 
 - **Sunshine 输入低延迟**：输入线程每 **2 ms** 轮询一次共享队列（条件唤醒尚未接入，2 ms 即兜底上限），`drainInput` 内逐条同步调用 `LiSend*`，返回后立刻处理下一条，不做攒批或额外 sleep。绝对坐标用 `LiSendMousePositionEvent(x, y, 流宽, 流高)`，参考尺寸取**当前流**的最新值（分辨率调整后随视频 setup 更新）。同 mask 且非 boundary 的尾部移动才会合并（保留最新位置与时间戳），按下/抬起/滚轮等 boundary 事件永不合并或丢弃。该平均/P95 以 `inputLag=` 与 `sendCalls=`/`sendFail=` 的形式并入上面的 `sunshine perf:` 5 秒行（不再单独打 `sunshine input:` 行）：`inputLag` 是「入队 → `LiSend*` 返回」的间隔（`QueuedInput` 带 `steady_clock` 入队时刻），`sendFail` 单独统计 `LiSend*` 返回非 0（如 -2 输入流未就绪）的次数。
 

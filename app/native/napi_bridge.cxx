@@ -309,33 +309,21 @@ napi_value SubmitPin(napi_env env, napi_callback_info info) {
 // for an unknown / non-Sunshine / not-connected session (the desired state is
 // still recorded and sent after the next connection).
 napi_value SetRemoteCursorHidden(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2];
+  size_t argc = 3;
+  napi_value argv[3];
   std::string id;
   bool hidden = false;
+  bool force = false;
   bool accepted = false;
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok &&
       argc >= 2 && GetStringArg(env, argv[0], 256, id) &&
-      napi_get_value_bool(env, argv[1], &hidden) == napi_ok)
-    accepted = tianguan::setRemoteCursorHidden(id, hidden);
+      napi_get_value_bool(env, argv[1], &hidden) == napi_ok) {
+    if (argc >= 3 && napi_get_value_bool(env, argv[2], &force) != napi_ok)
+      force = false;
+    accepted = tianguan::setRemoteCursorHidden(id, hidden, force);
+  }
   napi_value result = nullptr;
   if (napi_get_boolean(env, accepted, &result) != napi_ok) return nullptr;
-  return result;
-}
-// resyncRemoteCursor(sessionId): Sunshine only. Re-aligns the locally recorded
-// host-cursor state (flips the record, then applies the desired state; sends the
-// corrected chord only when the flipped record still differs). False for an
-// unknown / non-Sunshine session.
-napi_value ResyncRemoteCursor(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1];
-  std::string id;
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
-      argc < 1 || !GetStringArg(env, argv[0], 256, id))
-    return MakeString(env, "INVALID_SESSION");
-  napi_value result = nullptr;
-  if (napi_get_boolean(env, tianguan::resyncRemoteCursor(id), &result) != napi_ok)
-    return nullptr;
   return result;
 }
 // syncRemoteLockState(sessionId, capsLock, numLock): absolute RDP lock-state
@@ -531,7 +519,6 @@ napi_value Init(napi_env env, napi_value exports) {
     {"forgetTrustedFingerprint", nullptr, ForgetTrustedFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"submitPin", nullptr, SubmitPin, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setRemoteCursorHidden", nullptr, SetRemoteCursorHidden, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"resyncRemoteCursor", nullptr, ResyncRemoteCursor, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"syncRemoteLockState", nullptr, SyncRemoteLockState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseSessionInput", nullptr, ReleaseSessionInput, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -543,7 +530,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"setViewTransform", nullptr, SetViewTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"suspendRenderSurface", nullptr, SuspendRenderSurface, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
-  if (napi_define_properties(env, exports, 31, properties) != napi_ok) return nullptr;
+  if (napi_define_properties(env, exports, 30, properties) != napi_ok) return nullptr;
   return exports;
 }
 napi_module module = {1, 0, nullptr, Init, "tianguan_diag", nullptr, {0}};

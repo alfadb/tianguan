@@ -1297,12 +1297,6 @@ struct SessionState {
   bool cursorHidden = false;        // input
   bool cursorPending = false;       // input
   bool cursorDesiredHidden = false;  // input
-  // Whether setRemoteCursorHidden() has set a target in this session; resync falls
-  // back to the inverse of the session option (default desire: "shown").
-  bool cursorDesiredSet = false;    // input
-  // Session option copy (immutable after launch): the caller's record of the host
-  // cursor state at connect time.
-  bool sunshineHostCursorHidden = false;  // set before the thread starts
 
   std::deque<QueuedInput> inputs;  // input
   // syncRemoteLockState(): newest absolute CapsLock/NumLock state for RDP.
@@ -3785,7 +3779,6 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   state->sunshineEncryption = options.sunshineEncryption;
   state->sunshineVsync = options.sunshineVsync;
   state->cursorHidden = options.sunshineHostCursorHidden;
-  state->sunshineHostCursorHidden = options.sunshineHostCursorHidden;
   // Start the thread before publishing the session so closeSession() can never
   // find a session whose thread is still not joinable.
   try {
@@ -4318,7 +4311,8 @@ bool tianguan::submitPin(const std::string& sessionId, const std::string& pin) {
 //     is updated once the send succeeds;
 //   * unknown session / not Sunshine / not connected -> false, but the desired
 //     state is still recorded and sent after the next connection is established.
-bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden) {
+bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden,
+                                    bool force) {
   const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
   if (!state) return false;
   if (state->protocol != "sunshine") return false;
@@ -4327,60 +4321,32 @@ bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden) 
     std::lock_guard<std::mutex> lock(state->meta);
     connected = state->connected;
   }
+  bool previous = false;
+  bool willSend = false;
   {
     std::lock_guard<std::mutex> lock(state->input);
-    if (state->cursorHidden == hidden) {
+    previous = state->cursorHidden;
+    if (!force && state->cursorHidden == hidden) {
       // The recorded host state already matches: drop a not-yet-sent request for
       // the opposite value (the host was never toggled).
       state->cursorPending = false;
       return true;
     }
+    // force=true (user flipped the UI switch): the record may be inverted, so do
+    // not compare — always send one toggle; the record becomes `hidden` once the
+    // chord goes out (noteCursorHidden()).
     state->cursorDesiredHidden = hidden;
-    state->cursorDesiredSet = true;
     state->cursorPending = true;
-  }
-  return connected;
-}
-
-// Sunshine only: re-align the locally recorded host-cursor state with reality.
-// The record can be inverted (earlier broken chord sends were recorded as success),
-// so this flips the record without sending anything and then applies the current
-// desired state: the last setRemoteCursorHidden() target, or — when none was set
-// in this session — the inverse of sunshineHostCursorHidden (i.e. "shown" for the
-// usual corrupted-record case). If the flipped record already equals the desired
-// state nothing is sent; otherwise the chord is queued for the input thread (sent
-// once connected). Returns false only for an unknown / non-Sunshine session.
-bool tianguan::resyncRemoteCursor(const std::string& sessionId) {
-  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
-  if (!state) return false;
-  if (state->protocol != "sunshine") return false;
-  bool previous = false;
-  bool flipped = false;
-  bool desired = false;
-  bool willSend = false;
-  {
-    std::lock_guard<std::mutex> lock(state->input);
-    previous = state->cursorHidden;
-    state->cursorHidden = !previous;  // flip the record only, no key events
-    flipped = state->cursorHidden;
-    desired = state->cursorDesiredSet
-                  ? state->cursorDesiredHidden
-                  : !state->sunshineHostCursorHidden;
-    if (state->cursorHidden != desired) {
-      state->cursorDesiredHidden = desired;
-      state->cursorPending = true;
-      willSend = true;
-    } else {
-      state->cursorPending = false;
-    }
+    willSend = true;
   }
   char line[192];
   std::snprintf(line, sizeof(line),
-                "sunshine: resync host cursor: recorded %d -> %d, desired %d, %s",
-                previous ? 1 : 0, flipped ? 1 : 0, desired ? 1 : 0,
-                willSend ? "chord queued" : "no send");
+                "sunshine: set host cursor hidden=%d force=%d (record %d, %s)",
+                hidden ? 1 : 0, force ? 1 : 0, previous ? 1 : 0,
+                willSend ? (connected ? "chord queued" : "queued until connected")
+                         : "no send");
   emitDiagWarn(line);
-  return true;
+  return connected;
 }
 
 // Times one takeFrame() call (including calls that return NONE). Declared

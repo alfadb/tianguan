@@ -93,8 +93,9 @@ export function remotePointInPicture(x: number, y: number,
 
 /**
  * System-pointer visibility rule of the remote page:
- *   - local-cursor mode (Sunshine): the host hides its cursor and the system
- *     pointer IS the cursor, so it must stay visible everywhere;
+ *   - local-cursor mode (Sunshine, 本地光标 switch): this client shows its own
+ *     system pointer as the cursor, so it must stay visible everywhere — the
+ *     remote-cursor switch independently decides whether the host draws one;
  *   - otherwise hide the system pointer only while it is on the picture, so the
  *     black bars keep the normal pointer.
  */

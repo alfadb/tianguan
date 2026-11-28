@@ -82,7 +82,7 @@ import {
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, submitPin,
   takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
-  syncRemoteLockState, setRemoteCursorHidden, resyncRemoteCursor,
+  syncRemoteLockState, setRemoteCursorHidden,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
   SESSION_STATE_PAIRING_REQUIRED, SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_ERROR_PAIR_FAILED
 } from '../diag/SessionApi';
@@ -483,7 +483,7 @@ const BUBBLE_MENU_SAFE_VP: number =
   BUBBLE_MENU_BUTTON_RADIUS_VP + BUBBLE_MENU_EDGE_GAP_VP;
 // A 110 deg fan separates three / four buttons; it shrinks towards the inside of
 // the picture (down to 30 deg) when an edge would clip a button. A Sunshine
-// session with the local cursor adds a fifth button (本地光标 + 重新同步), which
+// session adds two cursor switches (本地光标 + 远端光标) for a fifth button, which
 // needs a wider fan so the 44 vp circles stay apart.
 const BUBBLE_MENU_MAX_SPAN_DEG: number = 110;
 const BUBBLE_MENU_WIDE_MAX_SPAN_DEG: number = 145;
@@ -942,8 +942,6 @@ struct Remote {
    */
   private sunshineFollowWindow: boolean = true;
   private sunshineFollowTimer: number = -1;
-  /** One-shot status pull 1 s after a cursor resync (see resyncSunshineCursor). */
-  private sunshineCursorResyncTimer: number = -1;
   /** Last size sent to requestDesktopSize() / reported as the stream size. */
   private sunshineStreamW: number = 0;
   private sunshineStreamH: number = 0;
@@ -1241,10 +1239,6 @@ struct Remote {
     if (this.resizeTimeoutTimer >= 0) {
       clearTimeout(this.resizeTimeoutTimer);
       this.resizeTimeoutTimer = -1;
-    }
-    if (this.sunshineCursorResyncTimer >= 0) {
-      clearTimeout(this.sunshineCursorResyncTimer);
-      this.sunshineCursorResyncTimer = -1;
     }
     // Drop pending view-transform work before the surface goes away: the
     // timers would otherwise fire against a detached renderer.
@@ -2087,21 +2081,14 @@ struct Remote {
 
   /**
    * PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps 3 (fullscreen), but
-   * its first button is "主列表" like the phone. A Sunshine session adds the
-   * 本地光标 toggle just before 断开, and — while the local cursor is ON (the
-   * host cursor is hidden and its recorded state can be inverted) — a
-   * 重新同步远端光标 item next to it. The first button is always at the -end of
+   * its first button is "主列表" like the phone. A Sunshine session adds TWO
+   * independent cursor switches just before 断开: 本地光标 (the client's own
+   * pointer) and 远端光标 (the cursor the host draws into the video), so the two
+   * ends are controlled separately. The first button is always at the -end of
    * the fan and 断开 at the +end.
    */
   private bubbleMenuCount(): number {
-    let count = this.phoneUi ? 2 : 3;
-    if (this.sunshineProtocol) {
-      count += 1;
-      if (this.sunshineLocalCursor) {
-        count += 1;
-      }
-    }
-    return count;
+    return (this.phoneUi ? 2 : 3) + (this.sunshineProtocol ? 2 : 0);
   }
 
   private bubbleMenuAction(index: number): string {
@@ -2109,10 +2096,10 @@ struct Remote {
     if (index === count - 1) {
       return 'disconnect';
     }
-    if (this.sunshineProtocol && this.sunshineLocalCursor && index === count - 2) {
-      return 'resync-cursor';
+    if (this.sunshineProtocol && index === count - 2) {
+      return 'remote-cursor';
     }
-    if (this.sunshineProtocol && index === count - (this.sunshineLocalCursor ? 3 : 2)) {
+    if (this.sunshineProtocol && index === count - 3) {
       return 'local-cursor';
     }
     if (index === 0) {
@@ -2128,8 +2115,8 @@ struct Remote {
     if (action === 'local-cursor') {
       return '本地光标（' + (this.sunshineLocalCursor ? '开' : '关') + '）';
     }
-    if (action === 'resync-cursor') {
-      return '重新同步远端光标';
+    if (action === 'remote-cursor') {
+      return '远端光标（' + (this.remoteCursorHidden ? '关' : '开') + '）';
     }
     if (action === 'minimize') {
       return '最小化';
@@ -2213,13 +2200,11 @@ struct Remote {
       return m(3, 1.5) + l(3, 13) + l(6.2, 10) + l(8.4, 14.5) +
         l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
     }
-    if (action === 'resync-cursor') {
-      // Clockwise refresh arrow: an octagon approximates the circle, with a
-      // small arrow head at the top (16-unit grid, ink 1.4..13.6).
-      return m(6.8, 1.8) + l(10.6, 2.6) + l(13.2, 5.6) + l(13.6, 9.4) +
-        l(11.6, 12.6) + l(8.2, 14.2) + l(4.4, 13.4) + l(1.8, 10.4) +
-        l(1.6, 6.6) + l(3.6, 3.4) + l(6.8, 1.8) +
-        m(7.4, 0.6) + l(10.6, 2.4) + l(7.2, 3.8);
+    if (action === 'remote-cursor') {
+      // Remote cursor: an arrow on a monitor outline (16-unit grid).
+      return m(1, 3) + l(10, 3) + l(10, 12) + l(1, 12) + l(1, 3) +
+        m(6.4, 6.2) + l(6.4, 13.4) + l(8.3, 10.6) + l(9.7, 14) +
+        l(11.1, 13.3) + l(9.7, 9.9) + l(12.2, 9.4) + l(6.4, 6.2);
     }
     return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
@@ -2353,8 +2338,8 @@ struct Remote {
       this.toggleFullscreen();
     } else if (action === 'local-cursor') {
       this.toggleSunshineLocalCursor();
-    } else if (action === 'resync-cursor') {
-      this.resyncSunshineCursor();
+    } else if (action === 'remote-cursor') {
+      this.toggleSunshineRemoteCursor();
     } else if (action === 'disconnect') {
       this.disconnectThisSession();
     }
@@ -2673,29 +2658,25 @@ struct Remote {
       this.sessionId, area[0], area[1], target.width, target.height);
   }
 
-  // --- Sunshine local cursor -------------------------------------------------
+  // --- Sunshine cursor switches ---------------------------------------------
   //
-  // Moonlight-style: the HOST hides its own cursor and this client shows the
-  // system pointer, which follows the hand with no network latency (at the cost
-  // of a fixed arrow shape). The host state is host-wide and outlives this app,
-  // so it is recorded on the connection and only toggled when needed.
-
-  /** Recorded host cursor state of this session's saved connection. */
-  private recordedHostCursorHidden(): boolean {
-    const entry = this.connectionEntry();
-    return entry !== undefined && entry.sunshineHostCursorHidden === true;
-  }
+  // Two INDEPENDENT switches: 本地光标 (this client's own pointer) and 远端光标
+  // (the cursor the HOST draws into the video). Turning the host cursor off is
+  // what makes the local arrow feel instant; the user decides each end. The host
+  // state is host-wide and outlives this app, so it is recorded on the connection.
 
   /**
    * Asks the backend to hide (true) / show (false) the host cursor and records
    * the result. Returns false when the backend refused / the interface is not
-   * available yet.
+   * available yet. `force` makes the backend send the chord once even when its
+   * recorded state already matches (the runtime switch needs that), while the
+   * connect-time auto-align keeps the idempotent no-force call.
    */
-  private applySunshineHostCursorHidden(hidden: boolean): boolean {
+  private applySunshineHostCursorHidden(hidden: boolean, force: boolean = false): boolean {
     if (!this.sunshineProtocol || this.sessionId.length === 0) {
       return false;
     }
-    const accepted = setRemoteCursorHidden(this.sessionId, hidden);
+    const accepted = setRemoteCursorHidden(this.sessionId, hidden, force);
     if (!accepted) {
       // A not-connected session still RECORDS the desired state in the backend
       // and sends it once connected (see the NAPI contract), so the preference
@@ -2703,17 +2684,17 @@ struct Remote {
       // failure.
       if (this.lastState === SESSION_STATE_CONNECTED) {
         hilog.warn(DOMAIN, TAG,
-          'sunshine 本地光标切换未被受理 session=%{public}s hidden=%{public}s',
+          'sunshine 远端光标切换未被受理 session=%{public}s hidden=%{public}s',
           this.sessionId, String(hidden));
         return false;
       }
       hilog.info(DOMAIN, TAG,
-        'sunshine 本地光标期望状态已记录（未连接）session=%{public}s hidden=%{public}s',
+        'sunshine 远端光标期望状态已记录（未连接）session=%{public}s hidden=%{public}s',
         this.sessionId, String(hidden));
     }
     this.remoteCursorHidden = hidden;
     this.persistSunshineCursorState(this.sunshineLocalCursor, hidden);
-    // The local-cursor mode decides whether the system pointer may be hidden.
+    // The local cursor switch decides whether the system pointer may be hidden.
     this.refreshCursorVisibility(true);
     return true;
   }
@@ -2737,58 +2718,32 @@ struct Remote {
     upsertConnection(entry);
   }
 
-  /** 本地光标 radial-menu action (Sunshine only): flips the host cursor state. */
+  /**
+   * 本地光标 radial-menu action: client-side only. It decides whether the system
+   * pointer is shown as the cursor; the host cursor is owned by the independent
+   * 远端光标 switch.
+   */
   private toggleSunshineLocalCursor(): void {
     if (!this.sunshineProtocol || this.sessionId.length === 0) {
       return;
     }
-    const next = !this.sunshineLocalCursor;
-    this.sunshineLocalCursor = next;
-    if (!this.applySunshineHostCursorHidden(next)) {
-      // The host refused (or the native interface is missing): keep the old
-      // preference so the menu label and the record stay truthful.
-      this.sunshineLocalCursor = !next;
-      this.refreshCursorVisibility(true);
-    }
+    this.sunshineLocalCursor = !this.sunshineLocalCursor;
+    this.persistSunshineCursorState(this.sunshineLocalCursor, this.remoteCursorHidden);
+    this.refreshCursorVisibility(true);
   }
 
   /**
-   * 重新同步远端光标: the backend's host-cursor record can be inverted (a chord
-   * that never reached the host was recorded as applied). resyncRemoteCursor()
-   * flips the record and re-applies the current desired state; the new
-   * authoritative value arrives via status.remoteCursorHidden, and this method
-   * also pulls the status once after 1 s so the saved connection is refreshed
-   * even when that poll is slow.
+   * 远端光标 radial-menu action: flips the HOST cursor. "On" shows the host cursor
+   * (remoteCursorHidden=false), "off" hides it. The user's tap always sends the
+   * chord (force=true) — a stale/inverted backend record must not swallow it —
+   * and the status confirms the new state; the saved connection is written back
+   * through the usual status sync.
    */
-  private resyncSunshineCursor(): void {
+  private toggleSunshineRemoteCursor(): void {
     if (!this.sunshineProtocol || this.sessionId.length === 0) {
       return;
     }
-    const accepted = resyncRemoteCursor(this.sessionId);
-    if (!accepted) {
-      hilog.warn(DOMAIN, TAG, 'sunshine 重新同步远端光标未被受理 session=%{public}s',
-        this.sessionId);
-      return;
-    }
-    if (this.sunshineCursorResyncTimer >= 0) {
-      clearTimeout(this.sunshineCursorResyncTimer);
-    }
-    this.sunshineCursorResyncTimer = setTimeout((): void => {
-      this.sunshineCursorResyncTimer = -1;
-      if (this.disposed || this.sessionId.length === 0) {
-        return;
-      }
-      const latest = sessionStatus(this.sessionId);
-      if (latest === undefined || typeof latest.remoteCursorHidden !== 'boolean') {
-        return;
-      }
-      if (this.remoteCursorHidden !== latest.remoteCursorHidden) {
-        this.remoteCursorHidden = latest.remoteCursorHidden;
-      }
-      // The status value is authoritative for the host cursor state.
-      this.persistSunshineCursorState(this.sunshineLocalCursor, latest.remoteCursorHidden);
-      this.refreshCursorVisibility(true);
-    }, 1000);
+    this.applySunshineHostCursorHidden(!this.remoteCursorHidden, true);
   }
 
   /** (Re)starts the debounce; only a real area size change calls this. */
@@ -3938,15 +3893,11 @@ struct Remote {
         // lastState is already "connected", so this can send (throttled) now.
         this.maybeRequestSunshineSize();
       }
-      // Local cursor: re-assert the host cursor mode on every connection. ON
-      // hides the host cursor (the system pointer becomes the cursor); OFF only
-      // undoes a state this app recorded as its own — the host state is
-      // host-wide, so it is never toggled blindly.
-      if (this.sunshineLocalCursor) {
-        this.applySunshineHostCursorHidden(true);
-      } else if (this.remoteCursorHidden || this.recordedHostCursorHidden()) {
-        this.applySunshineHostCursorHidden(false);
-      }
+      // Remote cursor: the switch state is the recorded host cursor state
+      // (status-authoritative). Re-assert it once per connection; the backend
+      // treats "already in that state" as a no-op. The local cursor switch never
+      // touches the host — the two ends are independent.
+      this.applySunshineHostCursorHidden(this.remoteCursorHidden);
     }
     // Clipboard edge: one take per version bump.
     const clip = status.clipboard;
@@ -5264,9 +5215,9 @@ struct Remote {
     const onPicture = this.canvasShown && geometry !== undefined &&
       this.pointerOverPicture && this.viewPointerX >= 0 && this.viewPointerY >= 0 &&
       pointInPicture(this.viewPointerX, this.viewPointerY, geometry);
-    // Local-cursor mode (Sunshine): the host cursor is hidden, so the system
-    // pointer IS the cursor and must stay visible over the picture too. In the
-    // normal mode it is hidden only over the picture.
+    // 本地光标 switch (Sunshine): this client shows its own pointer as the
+    // cursor, so the system pointer stays visible over the picture too. The
+    // 远端光标 switch is independent and only affects what the host draws.
     const localCursorMode = this.sunshineProtocol && this.sunshineLocalCursor;
     const hideSystemPointer = hidesSystemPointer(onPicture, localCursorMode);
     // The locally drawn remote cursor is the opposite of the system pointer: it
@@ -6648,9 +6599,8 @@ struct Remote {
             // The fan is computed so every button circle stays fully inside the
             // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
             // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone. A
-            // Sunshine session inserts 本地光标 just before 断开, and (while the
-            // local cursor is on) 重新同步远端光标 between them:
-            // [最小化/主列表, 全屏, 本地光标, 重新同步, 断开].
+            // Sunshine session inserts two independent cursor switches just
+            // before 断开: [最小化/主列表, 全屏, 本地光标, 远端光标, 断开].
             this.bubbleMenuButton(0)
             if (this.bubbleMenuAngles.length > 1) {
               this.bubbleMenuButton(1)

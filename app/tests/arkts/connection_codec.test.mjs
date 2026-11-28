@@ -755,8 +755,9 @@ test('local-cursor mode keeps the system pointer visible even on the picture', (
   // Normal mode: hidden on the picture, visible on the black bars.
   assert.equal(hidesSystemPointer(true, false), true);
   assert.equal(hidesSystemPointer(false, false), false);
-  // Local-cursor mode (Sunshine): the host cursor is hidden, so the system
-  // pointer IS the cursor and must stay visible everywhere.
+  // Local-cursor mode (Sunshine 本地光标): this client shows its own pointer as
+  // the cursor, so it must stay visible everywhere. The host cursor is a
+  // separate (远端光标) switch and does not change this rule.
   assert.equal(hidesSystemPointer(true, true), false);
   assert.equal(hidesSystemPointer(false, true), false);
 });
