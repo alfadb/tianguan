@@ -104,7 +104,8 @@ import { selectSunshineMode } from '../model/SunshineResolutions';
 import { containGeometry, pointInPicture, remotePointInPicture, hidesSystemPointer } from '../model/PictureGeometry';
 import type { PictureGeometry } from '../model/PictureGeometry';
 import { bubbleMenuAnglesFor, bubbleMenuSpanFor, cursorSubmenuEntries,
-  fanButtonX, fanButtonY, mainBubbleMenuEntries, submenuLabelRects } from '../model/BubbleMenu';
+  fanButtonX, fanButtonY, mainBubbleMenuEntries, menuSymbolName,
+  submenuLabelRects } from '../model/BubbleMenu';
 import type { BubbleMenuEntry, MenuRect } from '../model/BubbleMenu';
 
 const DOMAIN: number = 0x0000;
@@ -844,9 +845,6 @@ struct Remote {
   @State private remoteCursorHidden: boolean = false;
   private bubbleMenuHideTimer: number = -1;
   private bubbleMenuHintHideTimer: number = -1;
-  // Cached vp2px(16) for the menu icon drawing area (px). commands and stroke
-  // are px in ArkUI Shape / Path, so they are generated from this.
-  private bubbleMenuIconPxCache: number = 0;
   // Which bubble / menu element currently owns the pointer. Crossing the gap
   // between them delivers leave then enter, and that must not arm the timer.
   private bubbleHoverOwner: string = '';
@@ -2199,85 +2197,6 @@ struct Remote {
 
   private bubbleMenuIconVp(): number {
     return this.sunshineProtocol ? BUBBLE_MENU_ICON_LARGE_VP : BUBBLE_MENU_ICON_VP;
-  }
-
-  /** Icon drawing area in PHYSICAL px (vp2px(iconVp)); cached after first use. */
-  private bubbleMenuIconPx(): number {
-    if (this.bubbleMenuIconPxCache > 0) {
-      return this.bubbleMenuIconPxCache;
-    }
-    try {
-      this.bubbleMenuIconPxCache = this.getUIContext().vp2px(this.bubbleMenuIconVp());
-    } catch (error) {
-      hilog.warn(DOMAIN, TAG, '读取图标像素尺寸失败：%{public}s', String(error));
-    }
-    if (!(this.bubbleMenuIconPxCache > 0)) {
-      this.bubbleMenuIconPxCache = this.bubbleMenuIconVp() * this.deviceDensity();
-    }
-    return this.bubbleMenuIconPxCache;
-  }
-
-  /** The icon drawing area expressed in px, for Path width / height / layout. */
-  private bubbleMenuIconSize(): string {
-    return this.bubbleMenuIconPx().toFixed(2) + 'px';
-  }
-
-  /** 2 design units of stroke scaled to the pixel drawing area. */
-  private bubbleMenuIconStroke(): string {
-    return (this.bubbleMenuIconPx() * 2 / this.bubbleMenuIconVp()).toFixed(2) + 'px';
-  }
-
-  /**
-   * Path commands are in PX (ArkUI Shape / Path does not scale them with the
-   * component). All menu glyphs are designed on a 16-unit grid symmetric about
-   * (8,8) and every coordinate is multiplied by px/16, so the ink fills the
-   * square pixel drawing area and its centre stays at the area centre.
-   */
-  private bubbleMenuIconCommands(action: string): string {
-    const scale = this.bubbleMenuIconPx() / this.bubbleMenuIconVp();
-    const px = (value: number): string => (value * scale).toFixed(2);
-    const m = (x: number, y: number): string => 'M' + px(x) + ' ' + px(y);
-    const l = (x: number, y: number): string => 'L' + px(x) + ' ' + px(y);
-    if (action === 'minimize') {
-      return m(1, 8) + l(15, 8);
-    }
-    if (action === 'main-list') {
-      // Phone/tablet "主列表" is a list glyph: three bars of different lengths,
-      // symmetric about (8,8); the top bar spans the same 1..15 horizontal ink
-      // extent as the other 14/16 icons.
-      return m(1, 4) + l(15, 4) + m(3, 8) + l(13, 8) + m(5, 12) + l(11, 12);
-    }
-    if (action === 'fullscreen') {
-      if (this.fullscreen) {
-        // Inward corners with the arms extended to the same 1..15 ink extents
-        // as the outward icon, so both full-screen icons measure 14/16 of the
-        // drawing area instead of the previous 12/16 (18 px vs 21 px on PC).
-        return m(6, 1) + l(6, 6) + l(1, 6) +
-          m(10, 1) + l(10, 6) + l(15, 6) +
-          m(15, 10) + l(10, 10) + l(10, 15) +
-          m(1, 10) + l(6, 10) + l(6, 15);
-      }
-      return m(2, 6) + l(2, 2) + l(6, 2) +
-        m(10, 2) + l(14, 2) + l(14, 6) +
-        m(14, 10) + l(14, 14) + l(10, 14) +
-        m(6, 14) + l(2, 14) + l(2, 10);
-    }
-    if (action === 'local-cursor' || action === 'cursor') {
-      // Arrow pointer outline (16-unit grid): the "cursor" mark. The main fan's
-      // 光标 entry opens the sub-fan; 本地光标 is the same pointer on the client.
-      return m(3, 1.5) + l(3, 13) + l(6.2, 10) + l(8.4, 14.5) +
-        l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
-    }
-    if (action === 'remote-cursor') {
-      // Remote cursor: a screen with a pointer, drawn on the same 16-unit grid
-      // and filling the same 14/16 ink extent as the other main-ring glyphs, so
-      // the sub-fan icon matches the main ring in size and centring.
-      return m(1, 2.2) + l(13, 2.2) + l(13, 10.6) + l(1, 10.6) + l(1, 2.2) +
-        m(4.8, 14.4) + l(9.2, 14.4) + m(7, 10.6) + l(7, 14.4) +
-        m(8.4, 6.4) + l(8.4, 14.8) + l(10.2, 11.8) + l(11.5, 15) + l(12.9, 14.3) +
-        l(11.6, 11.1) + l(14, 10.4) + l(8.4, 6.4);
-    }
-    return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
 
   private bubbleMenuButtonX(index: number): number {
@@ -5817,38 +5736,45 @@ struct Remote {
   }
 
   /**
-   * Menu button glyph, self-drawn with Row / Path. The local SDK has no reliable
-   * system-symbol catalogue (sys.symbol appears only in type declarations, with
-   * no bundled symbol resource index), so SymbolGlyph names cannot be verified
-   * here; simple shapes avoid a resource that might be missing on the device.
-   *  - 最小化 (PC only): one horizontal bar
-   *  - 主列表 (phone/tablet): three bars of different lengths
-   *  - 全屏 / 退出全屏: outward / inward corner brackets
-   *  - 光标 / 本地光标: an arrow pointer (光标 opens the sub-fan)
-   *  - 远端光标: a screen with a pointer, same 14/16 ink extent as the others
-   *  - 断开: a cross
+   * Menu button icon: the HarmonyOS system symbol font, not a hand-drawn path.
+   * Every literal $r('sys.symbol.<name>') is validated by the ArkTS build; the
+   * action -> name mapping lives in model/BubbleMenu.ets (MENU_SYMBOL_NAMES) and
+   * the unit test re-checks each name against the SDK's sysResource symbol table.
+   * SymbolGlyph centres itself inside the button's Stack and is sized by fontSize
+   * only, so no manual offset compensation is needed.
    */
   @Builder
   private bubbleMenuGlyph(index: number) {
-    // ArkUI Shape / Path commands are in PX and do not scale with the component,
-    // so the drawing area, every command coordinate and the stroke are generated
-    // from vp2px(icon vp). The fixed pixel-size Stack is centred in the button;
-    // the Path fills that box and the 16-unit design is symmetric about its
-    // centre, so the ink is centred on both PC and phone at any density.
-    Stack({ alignContent: Alignment.Center }) {
-      Path({
-        width: this.bubbleMenuIconSize(),
-        height: this.bubbleMenuIconSize(),
-        commands: this.bubbleMenuIconCommands(this.bubbleMenuAction(index))
-      })
-        .width(this.bubbleMenuIconSize())
-        .height(this.bubbleMenuIconSize())
-        .stroke('#FFF2F2F2')
-        .strokeWidth(this.bubbleMenuIconStroke())
-        .fill(Color.Transparent)
+    if (this.bubbleMenuSymbol(index) === 'minus') {
+      SymbolGlyph($r('sys.symbol.minus'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'list_bullet') {
+      SymbolGlyph($r('sys.symbol.list_bullet'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'fullscreen') {
+      SymbolGlyph($r('sys.symbol.fullscreen'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'exit_full_screen') {
+      SymbolGlyph($r('sys.symbol.exit_full_screen'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'mouse') {
+      SymbolGlyph($r('sys.symbol.mouse'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'arrow_up_left') {
+      SymbolGlyph($r('sys.symbol.arrow_up_left'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else if (this.bubbleMenuSymbol(index) === 'mouse_fill') {
+      SymbolGlyph($r('sys.symbol.mouse_fill'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
+    } else {
+      SymbolGlyph($r('sys.symbol.xmark'))
+        .fontSize(this.bubbleMenuIconVp()).fontColor(['#FFF2F2F2'])
     }
-    .width(this.bubbleMenuIconSize())
-    .height(this.bubbleMenuIconSize())
+  }
+
+  /** The mapped system symbol name of this button (see MENU_SYMBOL_NAMES). */
+  private bubbleMenuSymbol(index: number): string {
+    return menuSymbolName(this.bubbleMenuAction(index), this.fullscreen);
   }
 
   @Builder

@@ -19,6 +19,36 @@ export interface BubbleMenuEntry {
   children?: BubbleMenuEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// Icons
+//
+// The menu uses the HarmonyOS system symbol font instead of hand-drawn paths:
+// the page renders SymbolGlyph($r('sys.symbol.<name>')). The names below come
+// from the SDK's symbol table (ets/build-tools/ets-loader/sysResource.js); the
+// unit test re-checks every mapped name against that table and the ArkTS build
+// validates each literal $r at compile time.
+// ---------------------------------------------------------------------------
+
+/** Action -> system symbol name (without the sys.symbol. prefix). */
+export const MENU_SYMBOL_NAMES: Record<string, string> = {
+  'minimize': 'minus',
+  'main-list': 'list_bullet',
+  'cursor': 'mouse',              // 光标 ▸ (opens the two cursor switches)
+  'local-cursor': 'arrow_up_left', // the client's own pointer
+  'remote-cursor': 'mouse_fill',   // the cursor the host draws into the video
+  'disconnect': 'xmark'
+};
+
+/** Symbol name of a menu action; 全屏 toggles between the two fullscreen symbols. */
+export function menuSymbolName(action: string, fullscreen: boolean): string {
+  if (action === 'fullscreen') {
+    return fullscreen ? 'exit_full_screen' : 'fullscreen';
+  }
+  const name = MENU_SYMBOL_NAMES[action];
+  return name === undefined ? 'xmark' : name;
+}
+
+
 /**
  * The two cursor switches. 本地光标 is the client's own pointer; 远端光标 is the
  * cursor the HOST draws into the video. There is no 返回 item: tapping the

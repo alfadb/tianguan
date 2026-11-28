@@ -831,6 +831,60 @@ test('submenu labels never overlap a fan button (same geometry as the page)', ()
   }
 });
 
+test('menu symbols map to existing sys.symbol names', () => {
+  const { MENU_SYMBOL_NAMES, menuSymbolName } = bubbleMenu;
+  // The SDK's symbol table is the source of truth the resource compiler uses.
+  const resourcePath = path.join(SDK_ROOT,
+    'sdk/default/openharmony/ets/build-tools/ets-loader/sysResource.js');
+  const text = fs.readFileSync(resourcePath, 'utf8');
+  const start = text.indexOf('symbol: {');
+  assert.ok(start >= 0, 'symbol table not found in sysResource.js');
+  let depth = 0;
+  let end = -1;
+  for (let i = start + 'symbol: '.length; i < text.length; i++) {
+    if (text[i] === '{') {
+      depth += 1;
+    } else if (text[i] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  assert.ok(end > start, 'unterminated symbol table');
+  const names = new Set([...text.slice(start, end + 1)
+    .matchAll(/([A-Za-z0-9_]+)\s*:\s*\d+/g)].map((m) => m[1]));
+  assert.ok(names.size > 1000, `unexpected symbol table size ${names.size}`);
+
+  // The chosen mapping (semantic substitutions where the ideal name is absent).
+  const expected = {
+    'minimize': 'minus',
+    'main-list': 'list_bullet',
+    'cursor': 'mouse',
+    'local-cursor': 'arrow_up_left',
+    'remote-cursor': 'mouse_fill',
+    'disconnect': 'xmark'
+  };
+  for (const [action, name] of Object.entries(expected)) {
+    assert.equal(menuSymbolName(action, false), name, action);
+    assert.equal(MENU_SYMBOL_NAMES[action], name, action);
+    assert.ok(names.has(name), `sys.symbol.${name} missing from sysResource.js`);
+  }
+  // 全屏 toggles between the two fullscreen symbols.
+  assert.equal(menuSymbolName('fullscreen', false), 'fullscreen');
+  assert.equal(menuSymbolName('fullscreen', true), 'exit_full_screen');
+  assert.ok(names.has('fullscreen'), 'sys.symbol.fullscreen missing');
+  assert.ok(names.has('exit_full_screen'), 'sys.symbol.exit_full_screen missing');
+  // The two cursor switches must stay visually distinguishable.
+  assert.notEqual(menuSymbolName('local-cursor', false),
+    menuSymbolName('remote-cursor', false));
+  // An unknown action still returns a valid symbol (the page's fallback).
+  assert.ok(names.has(menuSymbolName('unknown-action', false)));
+});
+
+// ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 
 fs.rmSync(tempDir, { recursive: true, force: true });
