@@ -51,6 +51,29 @@ std::string detachRenderSurface(const std::string& sessionId);
 // contentTop/contentScale/contentScaleY/contentW/contentH/zoom/panX/panY/
 // maxZoom) ArkTS maps input from. "ERROR:NO_RENDERER" when not attached.
 std::string renderStats(const std::string& sessionId);
+
+// 渲染线程侧的分段耗时快照：最近一个有帧的 5 秒窗口，进程级只读（同一时刻只有
+// 一个会话在串流，多个渲染器时以最后发布的为准；没有渲染器时全 0）。
+//   outFps         实际上屏帧率（成功 eglSwapBuffers 的次数 / 窗口长度）；
+//   lagAvgMs/P95Ms 取到帧的时刻减镜像提交时间戳（FrameGrab::commitTimeUs，
+//                  steady_clock 微秒），即「画面提交后多久才被取走」；
+//   pickupToSwap   取到帧到 eglSwapBuffers 返回（含拷贝/上传/绘制）。
+struct RenderFramePerf {
+  RenderFramePerf()
+      : outFps(0.0),
+        lagAvgMs(0.0),
+        lagP95Ms(0.0),
+        pickupToSwapAvgMs(0.0),
+        pickupToSwapP95Ms(0.0),
+        windowMs(0) {}
+  double outFps;
+  double lagAvgMs;
+  double lagP95Ms;
+  double pickupToSwapAvgMs;
+  double pickupToSwapP95Ms;
+  unsigned long long windowMs;  // 0 = 还没有发布过
+};
+RenderFramePerf renderFramePerf();
 // Sets this session's view transform. zoom is clamped to [1, kMaxViewZoom];
 // panX/panY are surface-pixel offsets from the centred position and are
 // clamped against the live surface size while drawing. Returns "OK" or

@@ -16,6 +16,10 @@ export const runNetworkTest: (filesDir: string) => Promise<string>;
 //                     device has a hardware HEVC decoder.
 //   sunshineEncryption optional; "none" disables Moonlight stream encryption
 //                     (ENCFLG_NONE), anything else keeps ENCFLG_ALL.
+//   sunshineHostCursorHidden optional (default false): the last recorded host
+//                     cursor state for "local cursor" mode (the host state is
+//                     process-global, cannot be queried and resets to shown when
+//                     Sunshine restarts; ArkTS persists it per connection).
 export const createSession: (optionsJson: string) => string;
 // closeSession() is non-blocking: it detaches the session and returns CLOSED
 // while a background reaper joins the thread. pendingCloses() reports how many
@@ -40,6 +44,15 @@ export const forgetTrustedFingerprint: (sessionId: string) => string;
 // exactly 4 ASCII digits. The PIN is never logged and never appears in the
 // status JSON.
 export const submitPin: (sessionId: string, pin: string) => boolean;
+// Sunshine/Moonlight only: "local cursor" mode. The host draws its cursor inside
+// the video, so the client hides it (Ctrl+Alt+Shift+N shortcut) and shows the
+// local system cursor; the state is process-global on the host and recorded
+// client-side (sessionStatus().remoteCursorHidden). Synchronous boolean: true when
+// the session is already in that state or the request was accepted (the chord is
+// sent by the backend's input thread within ~2 ms); false for an unknown /
+// non-Sunshine / not-connected session — in the not-connected case the desired
+// state is still recorded and sent once the connection is established.
+export const setRemoteCursorHidden: (sessionId: string, hidden: boolean) => boolean;
 // RDP only: set the remote CapsLock/NumLock toggle state to the given absolute
 // values through the Client Synchronize Event (Sync PDU). The key events
 // themselves are not forwarded on RDP. VNC is a no-op. Returns "OK" or

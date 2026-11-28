@@ -458,6 +458,8 @@ struct Index {
   /** Form-facing bitrate unit is Mbps; connect() converts it to native kbps. */
   @State private formSunshineBitrate: string = '20';
   @State private formSunshineCodec: string = SUNSHINE_CODEC_AUTO;
+  /** Sunshine local cursor (Moonlight style): ON unless the user turns it off. */
+  @State private formSunshineLocalCursor: boolean = true;
   @State private formPort: string = DEFAULT_PORT;
   @State private formGroup: string = '';
   @State private formPassword: string = '';
@@ -845,6 +847,7 @@ struct Index {
     this.formUsername = '';
     this.formDomain = '';
     this.formSunshineApp = '';
+    this.formSunshineLocalCursor = true;
     this.resetSunshineQuality(SUNSHINE_PRESET_BALANCED, SUNSHINE_CODEC_AUTO);
     this.formPort = DEFAULT_PORT;
     this.formGroup = this.selectedGroup === '__all__' || this.selectedGroup === UNGROUPED
@@ -881,6 +884,7 @@ struct Index {
       ? entry.sunshineBitrate : tier.bitrateMbps);
     this.formSunshineCodec = typeof entry.sunshineCodec === 'string' &&
       isSunshineCodec(entry.sunshineCodec) ? entry.sunshineCodec : SUNSHINE_CODEC_AUTO;
+    this.formSunshineLocalCursor = entry.sunshineLocalCursor !== false;
     this.formPort = entry.port;
     this.formGroup = entry.group;
     this.formSavePassword = entry.savePassword;
@@ -1048,7 +1052,12 @@ struct Index {
       sunshineHeight: sunshineHeight,
       sunshineFps: sunshineFps,
       sunshineBitrate: sunshineBitrate,
-      sunshineCodec: sunshineCodec
+      sunshineCodec: sunshineCodec,
+      sunshineLocalCursor: sunshine ? this.formSunshineLocalCursor : true,
+      // The host cursor state is not edited in the form: keep whatever the
+      // session page last recorded, so editing a connection cannot reset it.
+      sunshineHostCursorHidden: previous === undefined ? false :
+        previous.sunshineHostCursorHidden === true
     };
     return entry;
   }
@@ -1099,7 +1108,9 @@ struct Index {
       sunshineHeight: entry.sunshineHeight,
       sunshineFps: entry.sunshineFps,
       sunshineBitrate: entry.sunshineBitrate,
-      sunshineCodec: entry.sunshineCodec
+      sunshineCodec: entry.sunshineCodec,
+      sunshineLocalCursor: entry.sunshineLocalCursor,
+      sunshineHostCursorHidden: entry.sunshineHostCursorHidden
     };
     upsertConnection(copy);
     this.connections = savedConnections();
@@ -1579,6 +1590,11 @@ struct Index {
         if (formats.length > 0) {
           options.sunshineFormats = formats;
         }
+        // Host cursor state recorded by the last session (host-wide, survives
+        // this app). The session page re-asserts it once connected.
+        if (entry.sunshineHostCursorHidden === true) {
+          options.sunshineHostCursorHidden = true;
+        }
       } else if (entry.protocol === 'rdp') {
         // RDP shares the session state machine; only the endpoint options
         // differ. security stays unset (RFB security types only), but
@@ -2044,6 +2060,18 @@ struct Index {
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
         Text('码率低于 15 Mbps 时音频会降为普通音质')
+          .fontSize(11)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+        // Moonlight-style local cursor: the host hides its cursor and this
+        // client shows the system pointer, so it follows the hand with no lag.
+        Row({ space: 8 }) {
+          Checkbox()
+            .select(this.formSunshineLocalCursor)
+            .onChange((checked: boolean) => { this.formSunshineLocalCursor = checked; })
+          Text('本地光标（更跟手，但光标形状固定为箭头）').fontSize(14)
+        }
+        Text('主机光标状态是主机级的，会保留到下次会话；Sunshine 重启后恢复显示')
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')

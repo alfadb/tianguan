@@ -31,6 +31,8 @@ interface StoredConnection {
   sunshineFps?: number;
   sunshineBitrate?: number;
   sunshineCodec?: string;
+  sunshineLocalCursor?: boolean;
+  sunshineHostCursorHidden?: boolean;
 }
 
 /**
@@ -77,6 +79,20 @@ export interface ConnectionEntry {
   sunshineBitrate?: number;
   /** Sunshine video codec: 'auto' (native picks) | 'h264' | 'hevc'. */
   sunshineCodec?: string;
+  /**
+   * Sunshine only: Moonlight-style local cursor. The host hides its own cursor
+   * and this client shows the system pointer, which follows the hand with zero
+   * latency. Default true (records written before this setting existed also get
+   * true).
+   */
+  sunshineLocalCursor?: boolean;
+  /**
+   * Sunshine only: whether the HOST cursor is currently hidden. The host state
+   * is host-wide and survives this app, so it is recorded here to avoid needless
+   * toggles on the next connection; the session status's remoteCursorHidden is
+   * authoritative and overwrites it whenever it changes.
+   */
+  sunshineHostCursorHidden?: boolean;
 }
 
 /**
@@ -291,6 +307,10 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
     // 均衡 and the numbers follow that tier, so nothing has to be migrated.
     const quality = normalizeSunshineQuality(item.sunshinePreset, item.sunshineWidth,
       item.sunshineHeight, item.sunshineFps, item.sunshineBitrate, item.sunshineCodec);
+    // Local cursor defaults to ON for every record (including old ones); only a
+    // literal false disables it. The recorded host state defaults to shown.
+    const sunshineLocalCursor = item.sunshineLocalCursor !== false;
+    const sunshineHostCursorHidden = item.sunshineHostCursorHidden === true;
     const entry: ConnectionEntry = {
       id: id,
       name: name,
@@ -309,7 +329,9 @@ export function parseConnectionRecords(text: string): ConnectionEntry[] {
       sunshineHeight: quality.height,
       sunshineFps: quality.fps,
       sunshineBitrate: quality.bitrateMbps,
-      sunshineCodec: quality.codec
+      sunshineCodec: quality.codec,
+      sunshineLocalCursor: sunshineLocalCursor,
+      sunshineHostCursorHidden: sunshineHostCursorHidden
     };
     result.push(entry);
   }

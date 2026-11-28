@@ -121,7 +121,9 @@ function sameConnection(a: ConnectionEntry, b: ConnectionEntry): boolean {
     a.sunshineApp === b.sunshineApp && a.sunshinePreset === b.sunshinePreset &&
     a.sunshineWidth === b.sunshineWidth && a.sunshineHeight === b.sunshineHeight &&
     a.sunshineFps === b.sunshineFps && a.sunshineBitrate === b.sunshineBitrate &&
-    a.sunshineCodec === b.sunshineCodec;
+    a.sunshineCodec === b.sunshineCodec &&
+    a.sunshineLocalCursor === b.sunshineLocalCursor &&
+    a.sunshineHostCursorHidden === b.sunshineHostCursorHidden;
 }
 
 function connectionsRoundTripEqual(expected: ConnectionEntry[],
@@ -185,6 +187,10 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
   // can never reach createSession as "invalid sunshine width".
   const quality = normalizeSunshineQuality(entry.sunshinePreset, entry.sunshineWidth,
     entry.sunshineHeight, entry.sunshineFps, entry.sunshineBitrate, entry.sunshineCodec);
+  // Local cursor defaults ON (including records written before the setting
+  // existed); the recorded host cursor state is true only when known hidden.
+  const sunshineLocalCursor = entry.sunshineLocalCursor !== false;
+  const sunshineHostCursorHidden = entry.sunshineHostCursorHidden === true;
   const normalized: ConnectionEntry = {
     id: id,
     name: entry.name.trim().length > 0 ? entry.name.trim() : host,
@@ -203,7 +209,9 @@ export function upsertConnection(entry: ConnectionEntry): ConnectionEntry {
     sunshineHeight: quality.height,
     sunshineFps: quality.fps,
     sunshineBitrate: quality.bitrateMbps,
-    sunshineCodec: quality.codec
+    sunshineCodec: quality.codec,
+    sunshineLocalCursor: sunshineLocalCursor,
+    sunshineHostCursorHidden: sunshineHostCursorHidden
   };
   const kept: ConnectionEntry[] = [];
   let replaced = false;

@@ -55,6 +55,60 @@ long long NowMs() {
       .count();
 }
 
+// ---------------------------------------------------------------------------
+// 帧延迟分段统计（5 秒窗口）
+//
+//   lag           取到帧的时刻 - 镜像提交时间戳（FrameGrab::commitTimeUs）：
+//                 画面在镜像里等了多久才被渲染线程取走；
+//   pickupToSwap  取到帧到 eglSwapBuffers 返回（拷贝 + 上传 + 绘制 + 提交给
+//                 合成器），即渲染线程自己这一段；
+//   outFps        窗口内真正上屏（swap 成功）的帧率。
+//
+// 每帧只做两次 steady_clock 读取和一次直方图自增；P95 用 1 ms 一桶的直方图求，
+// 不排序、不留无界样本。结果以进程级快照发布（render.h 的 RenderFramePerf），
+// 后端 5 秒汇总行和 statusJson.perf 在任意线程读。
+// ---------------------------------------------------------------------------
+const size_t kFramePerfBucketCount = 2001;  // 0..1999 ms + >=2000 ms 溢出桶
+
+struct FramePerfHistogram {
+  FramePerfHistogram() : count(0), sumUs(0) {
+    std::memset(buckets, 0, sizeof(buckets));
+  }
+  void add(long long us) {
+    if (us < 0) return;
+    ++count;
+    sumUs += us;
+    size_t bucket = static_cast<size_t>(us / 1000);
+    if (bucket >= kFramePerfBucketCount) bucket = kFramePerfBucketCount - 1;
+    if (buckets[bucket] != 0xffffffffu) ++buckets[bucket];
+  }
+  void reset() {
+    count = 0;
+    sumUs = 0;
+    std::memset(buckets, 0, sizeof(buckets));
+  }
+  double avgMs() const {
+    return count != 0 ? static_cast<double>(sumUs) / static_cast<double>(count) / 1000.0
+                      : 0.0;
+  }
+  double p95Ms() const {
+    if (count == 0) return 0.0;
+    const long long target = (count * 95 + 99) / 100;
+    long long running = 0;
+    for (size_t i = 0; i < kFramePerfBucketCount; ++i) {
+      running += buckets[i];
+      if (running >= target) return static_cast<double>(i);
+    }
+    return static_cast<double>(kFramePerfBucketCount - 1);
+  }
+  long long count;
+  long long sumUs;
+  uint32_t buckets[kFramePerfBucketCount];
+};
+
+std::mutex g_framePerfMutex;
+tianguan::RenderFramePerf g_framePerf;
+
 std::string JsonEscape(const std::string& text) {
   std::string out;
   out.reserve(text.size() + 8);
@@ -375,6 +429,13 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
   long long diagWindowFrames = 0;
   long long diagLastPresentUs = 0;
   long long diagMaxFlushGapUs = 0;
+  // --- Frame latency aggregation (5 s window, see kFramePerf*) -------------
+  // lag and pickupToSwap are only sampled on the delivered path; outFps counts
+  // successful swaps in the window (idle retries are included, they are rare).
+  long long framePerfWindowStartUs = NowUs();
+  FramePerfHistogram framePerfLag;
+  FramePerfHistogram framePerfPickupToSwap;
+  long long framePerfSwaps = 0;
 
   auto setFailure = [&](const std::string& error) {
     failure = error;
@@ -463,6 +524,7 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     }
     ++frames;
     ++diagWindowFrames;
+    ++framePerfSwaps;
     const long long presentedAtUs = NowUs();
     if (diagLastPresentUs != 0 && presentedAtUs - diagLastPresentUs > diagMaxFlushGapUs) {
       diagMaxFlushGapUs = presentedAtUs - diagLastPresentUs;
@@ -685,6 +747,8 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
         continue;
       }
       surfaceQueryFailures = 0;
+      // 本次轮询的取帧时刻（0 = 本轮没取到帧），pickupToSwap 的起点。
+      long long pickupUs = 0;
       tianguan::FrameGrab grab;
       tianguan::FrameGrabTiming grabTiming;
       const tianguan::FrameGrabStatus status = tianguan::takeFrameStruct(
@@ -697,6 +761,12 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
         diagCopySumUs += grabTiming.copyUs;
         diagCopyN += 1;
         if (grabTiming.copyUs > diagCopyMaxUs) diagCopyMaxUs = grabTiming.copyUs;
+        // 帧延迟 1：镜像提交时刻（producer 打的 commitTimeUs）到本次取到帧。
+        // 只有 Sunshine 提交路径会打这个时间戳，其它协议为 0，不计样本。
+        pickupUs = NowUs();
+        if (grab.commitTimeUs > 0 && pickupUs >= grab.commitTimeUs) {
+          framePerfLag.add(pickupUs - grab.commitTimeUs);
+        }
       }
       if (status == tianguan::FrameGrabInvalidSession) {
         // The session is gone (window closed / disconnect): stop cleanly.
@@ -788,6 +858,8 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
       presentPending = true;
       if (drawAndSwap()) {
         geometryDirty = false;
+        // 帧延迟 2：取到这一帧到 eglSwapBuffers 返回（拷贝/上传/绘制都在内）。
+        if (pickupUs != 0) framePerfPickupToSwap.add(NowUs() - pickupUs);
       } else if (swapFailures >= kMaxSwapFailures) {
         setFailure(EglErrorText("eglSwapBuffers (repeated)", lastEglError));
         break;
@@ -796,13 +868,39 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
       const long long nowMs = NowMs();
       if (nowMs - lastLogMs >= 5000) {
         lastLogMs = nowMs;
-        char line[384];
+        // 结算 5 秒帧延迟窗口并发布快照（render.h 的 RenderFramePerf）：
+        // 后端 5 秒汇总行与 statusJson.perf 都读这份快照。
+        const long long perfWindowUs = NowUs() - framePerfWindowStartUs;
+        tianguan::RenderFramePerf framePerf;
+        framePerf.windowMs =
+            perfWindowUs > 0 ? static_cast<unsigned long long>(perfWindowUs / 1000) : 0;
+        framePerf.outFps =
+            perfWindowUs > 0
+                ? static_cast<double>(framePerfSwaps) * 1000000.0 /
+                      static_cast<double>(perfWindowUs)
+                : 0.0;
+        framePerf.lagAvgMs = framePerfLag.avgMs();
+        framePerf.lagP95Ms = framePerfLag.p95Ms();
+        framePerf.pickupToSwapAvgMs = framePerfPickupToSwap.avgMs();
+        framePerf.pickupToSwapP95Ms = framePerfPickupToSwap.p95Ms();
+        {
+          std::lock_guard<std::mutex> lock(g_framePerfMutex);
+          g_framePerf = framePerf;
+        }
+        framePerfLag.reset();
+        framePerfPickupToSwap.reset();
+        framePerfSwaps = 0;
+        framePerfWindowStartUs = NowUs();
+        char line[640];
         std::snprintf(line, sizeof(line),
                       "session=%s frames=%lld fps=%.1f uploads=%lld full=%lld skips=%lld "
-                      "swapFail=%lld size=%dx%d tex=%dx%d ver=%d elapsed=%lldms",
+                      "swapFail=%lld size=%dx%d tex=%dx%d ver=%d elapsed=%lldms "
+                      "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms",
                       renderer->sessionId.c_str(), frames, fps, uploads, fullUploads, skips,
                       swapFailures, surfaceWidth, surfaceHeight, texWidth, texHeight,
-                      afterVersion, nowMs - startedAt);
+                      afterVersion, nowMs - startedAt, framePerf.lagAvgMs,
+                      framePerf.lagP95Ms, framePerf.pickupToSwapAvgMs,
+                      framePerf.pickupToSwapP95Ms);
         LogDebug(line);
       }
       publishStatsIfDue("running");
@@ -855,6 +953,13 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
 
 void* tianguan::SharedEGLDisplay() {
   return AcquireSharedDisplay();
+}
+
+// 最近一个有帧的 5 秒窗口的帧延迟快照（见 render.h）。读的是算好的值，锁只保护
+// 一个 40 字节的结构；没有渲染器时全 0（windowMs == 0）。
+tianguan::RenderFramePerf tianguan::renderFramePerf() {
+  std::lock_guard<std::mutex> lock(g_framePerfMutex);
+  return g_framePerf;
 }
 
 namespace tianguan {

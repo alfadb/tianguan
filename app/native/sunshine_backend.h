@@ -136,6 +136,26 @@ struct SunshineHost {
   void (*commitFrame)(void* user, int generation, const SunshineRect* rects,
                       size_t count, int width, int height) = nullptr;
 
+  // 客户端主动分辨率（NAPI requestDesktopSize）：会话线程在已连接期间每 200ms
+  // 取一次。返回 true 时填 width/height，并把请求槽标记为 in-flight；语义与
+  // RdpHost 的同名回调一致（一次只处理一个，处理期间到达的新请求只保留最后一个）。
+  bool (*takeDesktopSizeRequest)(void* user, int* width, int* height) = nullptr;
+  // 结束 in-flight 请求：applied=true 表示按新尺寸重启的串流已经建立（Sunshine
+  // 没有服务端应答，这就是正 ack）；false/终态表示失败或会话结束，只清 in-flight
+  // 与 resize 标记，不改 resizeSupport（保持 unknown）。
+  void (*finishDesktopSizeRequest)(void* user, int generation, int width,
+                                   int height, bool applied) = nullptr;
+
+  // 主机光标（本地光标模式）：Sunshine 的光标画在视频里，延迟等于视频链路，
+  // 所以用「Ctrl+Alt+Shift+N」切换主机全局 display_cursor（Sunshine input.cpp
+  // apply_shortcut），再由客户端显示本地系统光标。该状态是主机进程级、跨会话
+  // 保持的，客户端只能记录、无法查询。输入线程每 tick 取一次待发送目标：
+  // 返回 true 时 *hidden 是目标值（peek，不清除；发送成功后用 noteCursorHidden
+  // 确认，失败下一 tick 重试）。
+  bool (*takeCursorHiddenRequest)(void* user, bool* hidden) = nullptr;
+  // 组合键发送成功：更新本地记录并清掉待发标记。
+  void (*noteCursorHidden)(void* user, int generation, bool hidden) = nullptr;
+
   // 清掉上一次连接遗留的指针/按键输入，返回 releaseEpoch。
   unsigned (*prepareInput)(void* user) = nullptr;
   // 把队列整体换出后逐条喂给 sink；*appliedRelease 在真正释放后推进。

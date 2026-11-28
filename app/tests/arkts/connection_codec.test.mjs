@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Host-side unit test for the pure connection logic in
-// app/entry/src/main/ets/model/ConnectionCodec.ets.
+// Host-side unit test for the pure ArkTS logic that needs no device:
+//   - app/entry/src/main/ets/model/ConnectionCodec.ets   (connections.json codec)
+//   - app/entry/src/main/ets/model/SunshineResolutions.ets (Sunshine mode picker)
 //
 // Runs under plain Node (no device, no network, no oh_modules):
-//   1. copies the .ets source byte for byte into a temp dir as ConnectionCodec.ts,
-//   2. compiles it with the TypeScript bundled in the HarmonyOS SDK,
-//   3. imports the resulting .mjs and asserts the parse/migrate/serialize and
-//      fingerprint/password key behaviour.
+//   1. copies the .ets sources byte for byte into a temp dir as .ts,
+//   2. compiles them with the TypeScript bundled in the HarmonyOS SDK,
+//   3. imports the resulting .mjs and asserts the codec and mode-selection
+//      behaviour.
 //
-// The source file is never modified; ArkTS-only syntax is not used there
+// The source files are never modified; ArkTS-only syntax is not used there
 // exactly so this compile step stays trivial. Run directly with:
 //   node app/tests/arkts/connection_codec.test.mjs
 
@@ -23,6 +24,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '../../..');
 const SOURCE = path.join(REPO_ROOT, 'app/entry/src/main/ets/model/ConnectionCodec.ets');
+const RESOLUTION_SOURCE =
+  path.join(REPO_ROOT, 'app/entry/src/main/ets/model/SunshineResolutions.ets');
+const PICTURE_SOURCE =
+  path.join(REPO_ROOT, 'app/entry/src/main/ets/model/PictureGeometry.ets');
 const SDK_ROOT = process.env.TIANGUAN_SDK_ROOT ||
   '/home/worker/harmonyos/command-line-tools/26.0.0.821';
 const TSC = process.env.TIANGUAN_TSC ||
@@ -37,15 +42,29 @@ if (!fs.existsSync(SOURCE)) {
   console.error(`FAIL: source not found: ${SOURCE}`);
   process.exit(1);
 }
+if (!fs.existsSync(RESOLUTION_SOURCE)) {
+  console.error(`FAIL: source not found: ${RESOLUTION_SOURCE}`);
+  process.exit(1);
+}
+if (!fs.existsSync(PICTURE_SOURCE)) {
+  console.error(`FAIL: source not found: ${PICTURE_SOURCE}`);
+  process.exit(1);
+}
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tianguan-codec-test-'));
 let codec;
+let resolutions;
+let picture;
 
 try {
-  // Stage the real production source as .ts (tsc does not accept .ets) without
-  // editing a single byte of it.
+  // Stage the real production sources as .ts (tsc does not accept .ets) without
+  // editing a single byte of them.
   const staged = path.join(tempDir, 'ConnectionCodec.ts');
   fs.copyFileSync(SOURCE, staged);
+  const stagedResolutions = path.join(tempDir, 'SunshineResolutions.ts');
+  fs.copyFileSync(RESOLUTION_SOURCE, stagedResolutions);
+  const stagedPicture = path.join(tempDir, 'PictureGeometry.ts');
+  fs.copyFileSync(PICTURE_SOURCE, stagedPicture);
   const outDir = path.join(tempDir, 'out');
   fs.mkdirSync(outDir);
 
@@ -55,17 +74,24 @@ try {
     '--module', 'es2020',
     '--skipLibCheck',
     '--outDir', outDir,
-    staged
+    staged,
+    stagedResolutions,
+    stagedPicture
   ], { stdio: 'inherit' });
 
-  // Give the emitted file an .mjs extension so Node loads it as an ES module
+  // Give the emitted files an .mjs extension so Node loads them as ES modules
   // regardless of any package.json above the temp directory.
-  const emitted = path.join(outDir, 'ConnectionCodec.js');
   const modulePath = path.join(outDir, 'ConnectionCodec.mjs');
-  fs.renameSync(emitted, modulePath);
+  fs.renameSync(path.join(outDir, 'ConnectionCodec.js'), modulePath);
+  const resolutionModulePath = path.join(outDir, 'SunshineResolutions.mjs');
+  fs.renameSync(path.join(outDir, 'SunshineResolutions.js'), resolutionModulePath);
+  const pictureModulePath = path.join(outDir, 'PictureGeometry.mjs');
+  fs.renameSync(path.join(outDir, 'PictureGeometry.js'), pictureModulePath);
   codec = await import(pathToFileURL(modulePath).href);
+  resolutions = await import(pathToFileURL(resolutionModulePath).href);
+  picture = await import(pathToFileURL(pictureModulePath).href);
 } catch (error) {
-  console.error(`FAIL: could not compile/load ConnectionCodec.ets: ${error && error.message}`);
+  console.error(`FAIL: could not compile/load the pure ArkTS sources: ${error && error.message}`);
   fs.rmSync(tempDir, { recursive: true, force: true });
   process.exit(1);
 }
@@ -110,7 +136,8 @@ function entry(overrides) {
     group: '', savePassword: false, noPassword: false, lastConnectedAt: 0,
     protocol: 'vnc', username: '', domain: '', sunshineApp: '',
     sunshinePreset: 'balanced', sunshineWidth: 1920, sunshineHeight: 1080,
-    sunshineFps: 60, sunshineBitrate: 20, sunshineCodec: 'auto'
+    sunshineFps: 60, sunshineBitrate: 20, sunshineCodec: 'auto',
+    sunshineLocalCursor: true, sunshineHostCursorHidden: false
   }, overrides || {});
 }
 
@@ -325,6 +352,40 @@ test('legacy record without quality fields loads as 均衡 and keeps its id', ()
   assert.equal(record.sunshineFps, 60);
   assert.equal(record.sunshineBitrate, 20);
   assert.equal(record.sunshineCodec, SUNSHINE_CODEC_AUTO);
+  // Local cursor defaults ON for every record; the recorded host state is
+  // "shown" until a session reports otherwise.
+  assert.equal(record.sunshineLocalCursor, true);
+  assert.equal(record.sunshineHostCursorHidden, false);
+});
+
+test('local cursor only a literal false disables it; host state only literal true', () => {
+  const parsed = parseConnectionRecords(JSON.stringify([
+    { id: 'c1', host: 'a', protocol: 'sunshine', sunshineLocalCursor: 'false' },
+    { id: 'c2', host: 'b', protocol: 'sunshine', sunshineLocalCursor: 0 },
+    { id: 'c3', host: 'c', protocol: 'sunshine', sunshineLocalCursor: false },
+    { id: 'c4', host: 'd', protocol: 'sunshine', sunshineHostCursorHidden: 'true' },
+    { id: 'c5', host: 'e', protocol: 'sunshine', sunshineHostCursorHidden: 1 },
+    { id: 'c6', host: 'f', protocol: 'sunshine', sunshineHostCursorHidden: true }
+  ]));
+  assert.deepEqual(parsed.map((record) => record.sunshineLocalCursor),
+    [true, true, false, true, true, true]);
+  assert.deepEqual(parsed.map((record) => record.sunshineHostCursorHidden),
+    [false, false, false, false, false, true]);
+});
+
+test('local cursor preference and recorded host state round-trip', () => {
+  const expected = [entry({
+    id: 'csun-cursor', host: '10.0.0.5', port: '47989', protocol: 'sunshine',
+    sunshineLocalCursor: false, sunshineHostCursorHidden: true
+  })];
+  const text = serializeConnectionRecords(expected);
+  assert.deepEqual(parseConnectionRecords(text), expected);
+  // A second round trip is stable, and both fields are really on disk.
+  assert.deepEqual(parseConnectionRecords(serializeConnectionRecords(parseConnectionRecords(text))),
+    expected);
+  const raw = JSON.parse(text)[0];
+  assert.equal(raw.sunshineLocalCursor, false);
+  assert.equal(raw.sunshineHostCursorHidden, true);
 });
 
 test('username/domain default to empty string and reject non-strings', () => {
@@ -520,8 +581,144 @@ test('newConnectionId returns opaque unique ids, not host:port', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Sunshine virtual-display mode selection (model/SunshineResolutions.ets)
+// ---------------------------------------------------------------------------
+
+const {
+  SUNSHINE_MODE_GROUPS, SUNSHINE_MODE_PIXEL_CAP, selectSunshineMode
+} = resolutions;
+
+/** '1920x1080' for readable assertions. */
+function modeText(mode) {
+  return `${mode.width}x${mode.height}`;
+}
+
+test('Sunshine mode table covers every host mode (74 entries, 14 ratio families)', () => {
+  assert.equal(SUNSHINE_MODE_GROUPS.length, 14);
+  let count = 0;
+  for (const group of SUNSHINE_MODE_GROUPS) {
+    count += group.modes.length;
+  }
+  assert.equal(count, 74);
+  // The pixel budget is 3840x2160.
+  assert.equal(SUNSHINE_MODE_PIXEL_CAP, 3840 * 2160);
+});
+
+test('PC window 1620x1024 snaps to the 16:10 mode closest in height', () => {
+  assert.equal(modeText(selectSunshineMode(1620, 1024)), '1680x1050');
+});
+
+test('2-in-1 fullscreen 3000x2000 maps to the 3:2 mode of the same size', () => {
+  assert.equal(modeText(selectSunshineMode(3000, 2000)), '3000x2000');
+});
+
+test('1920x1080 stays on the 16:9 mode of the same size', () => {
+  assert.equal(modeText(selectSunshineMode(1920, 1080)), '1920x1080');
+});
+
+test('ultrawide window 3840x1640 snaps to the 21:9 mode 3440x1440', () => {
+  assert.equal(modeText(selectSunshineMode(3840, 1640)), '3440x1440');
+});
+
+test('portrait 1600x2560 keeps the portrait 10:16 mode 1600x2560', () => {
+  assert.equal(modeText(selectSunshineMode(1600, 2560)), '1600x2560');
+});
+
+test('phone fullscreen 1316x2832 snaps to the closest portrait phone mode', () => {
+  // 1260x2720 leaves only 0.3% black bars and is scaled 1.04x; 1080x2340 would
+  // leave 0.7% bars but be blown up 1.21x, so the score picks 1260x2720.
+  assert.equal(modeText(selectSunshineMode(1316, 2832)), '1260x2720');
+  // Same orientation is enforced: a phone window never gets a landscape mode.
+  const portrait = selectSunshineMode(1316, 2832);
+  assert.ok(portrait.height > portrait.width);
+});
+
+test('over-budget modes are excluded before scoring (cap 3840x2160 px)', () => {
+  // 16:9 window above the budget: 5120x2880 is excluded up front, so the best
+  // remaining candidate is the 3840x2160 16:9 mode (zero bars, scale 1.56).
+  assert.equal(modeText(selectSunshineMode(6000, 3375)), '3840x2160');
+  assert.ok(3840 * 2160 <= SUNSHINE_MODE_PIXEL_CAP);
+  // A huge 4:3 window: the 4:3 4096x3072 is over budget, and among the modes
+  // that remain the 2732x2048 tablet mode fits 4:3 almost exactly with the
+  // lowest scale penalty, so it beats 2048x1536 (which would be a 2.4x blow-up).
+  assert.equal(modeText(selectSunshineMode(5000, 3750)), '2732x2048');
+  // Whatever the window, the pick never exceeds the pixel budget.
+  for (const [w, h] of [[8000, 4500], [7000, 7000], [9000, 4000]]) {
+    const mode = selectSunshineMode(w, h);
+    assert.ok(mode.width * mode.height <= SUNSHINE_MODE_PIXEL_CAP,
+      `${modeText(mode)} is over the pixel cap`);
+  }
+});
+
+test('invalid window sizes fall back to 1920x1080', () => {
+  assert.equal(modeText(selectSunshineMode(0, 0)), '1920x1080');
+  assert.equal(modeText(selectSunshineMode(-10, 100)), '1920x1080');
+  assert.equal(modeText(selectSunshineMode(Number.NaN, 1080)), '1920x1080');
+});
+
+// ---------------------------------------------------------------------------
+// Presented-picture geometry (model/PictureGeometry.ets): the system pointer is
+// hidden exactly when the point is on the picture, so the black bars keep it.
+// ---------------------------------------------------------------------------
+
+const { containGeometry, pointInPicture, remotePointInPicture, hidesSystemPointer } = picture;
+
+test('contain geometry: 1920x1080 frame in a 2000x1000 area is pillarboxed', () => {
+  const geometry = containGeometry(1920, 1080, 2000, 1000);
+  assert.ok(geometry !== undefined);
+  assert.equal(geometry.height, 1000);
+  assert.ok(Math.abs(geometry.width - 1777.7778) < 0.001);
+  assert.ok(Math.abs(geometry.left - 111.1111) < 0.001);
+  assert.equal(geometry.top, 0);
+});
+
+test('pointer on a black bar does NOT hide the cursor; on the picture it does', () => {
+  const geometry = containGeometry(1920, 1080, 2000, 1000);
+  // Left / right pillarbox: the system pointer must stay visible.
+  assert.equal(pointInPicture(0, 500, geometry), false);
+  assert.equal(pointInPicture(111, 500, geometry), false);
+  assert.equal(pointInPicture(1999, 500, geometry), false);
+  // Just inside the picture: the remote cursor takes over.
+  assert.equal(pointInPicture(112, 500, geometry), true);
+  assert.equal(pointInPicture(1000, 500, geometry), true);
+  // 16:9 frame in a 3:2 window is letterboxed instead (top / bottom bars).
+  const letterbox = containGeometry(1920, 1080, 3000, 2000);
+  assert.equal(pointInPicture(1500, 10, letterbox), false);
+  assert.equal(pointInPicture(1500, 1000, letterbox), true);
+  assert.equal(pointInPicture(1500, 1999, letterbox), false);
+});
+
+test('remotePointInPicture maps only inside the picture (sendPointer geometry)', () => {
+  const geometry = containGeometry(1920, 1080, 2000, 1000);
+  assert.deepEqual(remotePointInPicture(1000, 500, geometry), [960, 540]);
+  assert.deepEqual(remotePointInPicture(0, 500, geometry), [-1, -1]);
+  assert.deepEqual(remotePointInPicture(1999, 500, geometry), [-1, -1]);
+});
+
+test('degenerate geometry (not connected / no frame) never reports on-picture', () => {
+  assert.equal(containGeometry(0, 1080, 2000, 1000), undefined);
+  assert.equal(containGeometry(1920, 1080, 0, 0), undefined);
+  assert.equal(containGeometry(Number.NaN, 1080, 2000, 1000), undefined);
+  // No picture => the caller keeps the system pointer visible.
+  assert.equal(pointInPicture(10, 10, undefined), false);
+  const geometry = containGeometry(1920, 1080, 2000, 1000);
+  assert.equal(pointInPicture(Number.NaN, 500, geometry), false);
+  assert.equal(pointInPicture(1000, Number.NaN, geometry), false);
+});
+
+test('local-cursor mode keeps the system pointer visible even on the picture', () => {
+  // Normal mode: hidden on the picture, visible on the black bars.
+  assert.equal(hidesSystemPointer(true, false), true);
+  assert.equal(hidesSystemPointer(false, false), false);
+  // Local-cursor mode (Sunshine): the host cursor is hidden, so the system
+  // pointer IS the cursor and must stay visible everywhere.
+  assert.equal(hidesSystemPointer(true, true), false);
+  assert.equal(hidesSystemPointer(false, true), false);
+});
+
+// ---------------------------------------------------------------------------
 
 fs.rmSync(tempDir, { recursive: true, force: true });
 
-console.log(`# connection codec: ${passed} passed, ${failed} failed`);
+console.log(`# connection codec + sunshine modes: ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

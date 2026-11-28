@@ -14,6 +14,17 @@
 // moonlight-common-c and the static OpenSSL prefix); without the macro
 // sessionMain() reports the missing backend instead of running the VNC loop.
 #include "sunshine_backend.h"
+// 视频链路的分段耗时快照（statusJson.perf 的 inFps/decFps/convert/commit）与渲染
+// 线程的帧延迟快照（outFps/lag）。两者都是进程级只读快照，只在 Sunshine 目标里
+// 有定义；宿主构建不带 TIANGUAN_WITH_SUNSHINE，因此这一整段不会编译。
+#include "sunshine_video.h"
+#include "render.h"
+namespace tianguan {
+// Implemented in sunshine_backend.cxx: one "enqueue -> LiSend* returned" latency
+// sample (microseconds) from the drain adapter into the backend's 5 s window.
+// Only called on the Sunshine backend's input thread.
+void sunshineNoteInputQueueLag(unsigned long long lagUs);
+}  // namespace tianguan
 #endif
 #include <rfb/CConnection.h>
 #include <rfb/CMsgWriter.h>
@@ -899,6 +910,21 @@ const char* phaseName(int phase) {
   return "failed";
 }
 
+// steady_clock 微秒（since epoch）。帧镜像的提交时间戳、渲染线程的 lag 都用这
+// 一个时钟，两端才能相减；只用整数，不做浮点累积。
+inline unsigned long long steadyNowUs() {
+  return static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Enqueue timestamp (steady_clock microseconds since epoch, 0 = unknown). Used by
+// the Sunshine input path to report "queue -> LiSend* returned" latency; the VNC /
+// RDP paths ignore it.
+inline unsigned long long inputNowUs() {
+  return steadyNowUs();
+}
+
 struct QueuedInput {
   // 0 = pointer (a=x, b=y, c=mask), 1 = key (a=keysym, b=pressed),
   // 2 = clipboard text (text).
@@ -907,6 +933,7 @@ struct QueuedInput {
   int a;
   int b;
   int c;
+  unsigned long long queuedAtUs = 0;
   // Pointer only: true when this event changes the button mask (press or
   // release, including a wheel notch). Boundary events are never coalesced or
   // trimmed, so their coordinates and their place in the order are preserved.
@@ -1164,7 +1191,7 @@ struct SessionState {
       updAny(false), updX0(0), updY0(0), updX1(0), updY1(0),
       pendAny(false),
       pendX0(0), pendY0(0), pendX1(0), pendY1(0), regionFull(false),
-      mirrorComplete(false), wantFull(true),
+      mirrorComplete(false), wantFull(true), commitTimeUs(0),
       pfBpp(0), pfDepth(0), pfRedMax(0), pfGreenMax(0), pfBlueMax(0),
       pfRedShift(0), pfGreenShift(0), pfBlueShift(0), pfBigEndian(false),
       cursorW(0), cursorH(0), cursorHotX(0),
@@ -1231,6 +1258,12 @@ struct SessionState {
   bool desktopPending;      // desk
   bool desktopAwaiting;     // desk
   int resizeSupport;        // desk: ResizeSupport*
+  // Sunshine only: a resize is being processed (the session thread is restarting
+  // the stream at the new size). Reported as statusJson().resize for the UI
+  // ("正在按窗口调整分辨率…"). Cleared by the finish callback or a terminal phase.
+  bool resizeActive = false;   // desk
+  int resizeWidth = 0;         // desk
+  int resizeHeight = 0;        // desk
   PerfStats perf;    // own mutex; timing summaries only
 
   std::atomic<bool> stop;
@@ -1252,6 +1285,13 @@ struct SessionState {
   // the /applist title that was actually launched (additive status fields).
   std::string pairingAppVersion;  // meta
   std::string appTitle;           // meta
+
+  // Sunshine 主机光标（本地光标模式）。Sunshine 的 display_cursor 是主机进程级、
+  // 跨会话保持的，客户端只能记录：cursorHidden 是本地记录/已确认值；
+  // cursorPending=true 表示有一个尚未成功发送的目标值（连接建立后由输入线程补发）。
+  bool cursorHidden = false;        // input
+  bool cursorPending = false;       // input
+  bool cursorDesiredHidden = false;  // input
 
   std::deque<QueuedInput> inputs;  // input
   // syncRemoteLockState(): newest absolute CapsLock/NumLock state for RDP.
@@ -1284,6 +1324,10 @@ struct SessionState {
   bool regionFull;                // pix: pending region is the whole screen
   bool mirrorComplete;            // pix: at least one full frame was applied
   bool wantFull;                  // pix
+  // 最近一次把像素写进镜像的时刻（steady_clock 微秒，0 = 生产者没打时间戳）。
+  // 渲染线程用「取帧时刻 - commitTimeUs」算 lag；VNC/RDP 目前不写这个字段，
+  // 因此只有 Sunshine 的帧会被计入延迟统计。随 FrameGrab 一起交给取帧方。
+  unsigned long long commitTimeUs;  // pix
   // Pixel format the current framebuffer was created with (from the server's
   // ServerInit). Reported additively by statusJson(); all zero before the first
   // framebuffer exists.
@@ -2925,9 +2969,74 @@ int sunshineHostBeginAttempt(void* user, int* lastApplied) {
 
 void sunshineHostSetPhase(void* user, int phase, const char* error,
                           const char* errorCode, int retryInMs) {
-  setPhase(*static_cast<SessionState*>(user), phase,
-           error != nullptr ? error : "",
+  SessionState& state = *static_cast<SessionState*>(user);
+  setPhase(state, phase, error != nullptr ? error : "",
            errorCode != nullptr ? errorCode : "none", retryInMs);
+  // A terminal phase ends any in-progress resize: drop its in-flight flag and the
+  // statusJson resize pair (a successful restart clears them via finish()).
+  if (phase == tianguan::SunshinePhaseFailed ||
+      phase == tianguan::SunshinePhaseDisconnected) {
+    std::lock_guard<std::mutex> lock(state.desk);
+    state.resizeActive = false;
+    state.desktopAwaiting = false;
+  }
+}
+
+// requestDesktopSize() adapter for Sunshine: the session thread takes the newest
+// queued size every 200 ms, one request at a time (same slot as RDP/VNC). Taking
+// it marks the request in-flight and publishes the resize pair for statusJson.
+bool sunshineTakeDesktopSizeRequest(void* user, int* width, int* height) {
+  if (width == nullptr || height == nullptr) return false;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.desk);
+  if (state.desktopAwaiting || !state.desktopPending) return false;
+  state.desktopPending = false;
+  state.desktopAwaiting = true;
+  state.resizeActive = true;
+  state.resizeWidth = state.desktopWidth;
+  state.resizeHeight = state.desktopHeight;
+  *width = state.desktopWidth;
+  *height = state.desktopHeight;
+  return true;
+}
+
+// Host-cursor toggle: the backend's input thread peeks the pending desired value
+// (the chord is sent with LiSend* there) and confirms it with noteCursorHidden().
+bool sunshineTakeCursorHiddenRequest(void* user, bool* hidden) {
+  if (hidden == nullptr) return false;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.input);
+  if (state.stop || !state.cursorPending) return false;
+  *hidden = state.cursorDesiredHidden;
+  return true;
+}
+
+void sunshineNoteCursorHidden(void* user, int generation, bool hidden) {
+  (void)generation;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.input);
+  if (state.stop) return;
+  if (state.cursorPending && state.cursorDesiredHidden == hidden) {
+    state.cursorHidden = hidden;
+    state.cursorPending = false;
+  }
+}
+
+// Finish the in-flight resize. Sunshine has no server answer for a size change:
+// applied == true means the restarted stream reached connectionStarted (positive
+// ack -> resizeSupport "ok"); applied == false (failure/terminal) just clears the
+// in-flight flag and the resize pair, leaving resizeSupport "unknown".
+void sunshineFinishDesktopSizeRequest(void* user, int generation, int width,
+                                      int height, bool applied) {
+  (void)width;
+  (void)height;
+  SessionState& state = *static_cast<SessionState*>(user);
+  std::lock_guard<std::mutex> lock(state.desk);
+  if (state.stop || state.generation.load() != generation) return;
+  const bool wasAwaiting = state.desktopAwaiting;
+  state.desktopAwaiting = false;
+  state.resizeActive = false;
+  if (applied && wasAwaiting) state.resizeSupport = ResizeSupportOk;
 }
 
 bool sunshineHostSleepUnlessStopped(void* user, int milliseconds) {
@@ -2992,6 +3101,7 @@ void sunshineResizeFrame(void* user, int generation, int width, int height) {
   state.regionFull = false;
   state.mirrorComplete = false;
   state.wantFull = true;
+  state.commitTimeUs = 0;  // 新镜像还没有任何一帧被提交
   state.version++;
   state.frameGeneration = generation;
   state.pixEpoch++;
@@ -3109,6 +3219,9 @@ void sunshineCommitFrame(void* user, int generation,
   }
   state.version++;
   state.frameGeneration = generation;
+  // 分段耗时：记下这帧进镜像的时刻，渲染线程取帧时算 lag = now - commitTimeUs。
+  // 在 pix 锁内写，和 version++ 属于同一次提交，取帧方读到的两者一定配套。
+  state.commitTimeUs = steadyNowUs();
 }
 
 unsigned sunshinePrepareInput(void* user) {
@@ -3140,6 +3253,11 @@ void sunshineDrainInput(void* user, const tianguan::SunshineInputSink* sink,
     } else {
       if (sink->clipboard != nullptr) sink->clipboard(sink->ctx, it->text.c_str());
     }
+    // The sink call above is synchronous: it returns after the LiSend* calls it
+    // makes have returned. That instant is the end of the "queue -> send" sample.
+    const unsigned long long nowUs = inputNowUs();
+    if (it->queuedAtUs != 0 && nowUs >= it->queuedAtUs)
+      tianguan::sunshineNoteInputQueueLag(nowUs - it->queuedAtUs);
   }
   if (targetRelease != *appliedRelease) {
     if (sink->release != nullptr) sink->release(sink->ctx);
@@ -3178,6 +3296,10 @@ void runSunshineSession(const std::shared_ptr<SessionState>& state) {
   bridge.setAppTitle = sunshineHostSetAppTitle;
   bridge.resizeFrame = sunshineResizeFrame;
   bridge.commitFrame = sunshineCommitFrame;
+  bridge.takeDesktopSizeRequest = sunshineTakeDesktopSizeRequest;
+  bridge.finishDesktopSizeRequest = sunshineFinishDesktopSizeRequest;
+  bridge.takeCursorHiddenRequest = sunshineTakeCursorHiddenRequest;
+  bridge.noteCursorHidden = sunshineNoteCursorHidden;
   bridge.prepareInput = sunshinePrepareInput;
   bridge.drainInput = sunshineDrainInput;
 
@@ -3188,6 +3310,12 @@ void runSunshineSession(const std::shared_ptr<SessionState>& state) {
     std::lock_guard<std::mutex> lock(state->pin);
     wipeString(state->pendingPin);
     state->hasPendingPin = false;
+  }
+  {
+    // No in-flight resize can survive the session thread.
+    std::lock_guard<std::mutex> lock(state->desk);
+    state->resizeActive = false;
+    state->desktopAwaiting = false;
   }
   {
     std::lock_guard<std::mutex> lock(state->meta);
@@ -3358,7 +3486,44 @@ struct SessionOptions {
   int sunshineBitrate = 20000;
   std::string sunshineFormats;
   bool sunshineEncryption = true;
+  // 上次记录的主机光标隐藏状态（Sunshine 的 display_cursor 客户端无法查询，只能
+  // 记录并由 ArkTS 持久化到连接条目；主机进程重启后会回到「显示」）。
+  bool sunshineHostCursorHidden = false;
 };
+
+// Reads an optional JSON boolean option (bare true/false, or the strings
+// "true"/"false"/"1"/"0" for callers that stringify everything). Returns false
+// only when the key is present but not a recognised boolean.
+bool readBoolOption(const std::string& json, const char* key, bool* out) {
+  const std::string needle = "\"" + std::string(key) + "\"";
+  size_t at = json.find(needle);
+  if (at == std::string::npos) return true;  // absent: keep the default
+  at = json.find(':', at + needle.size());
+  if (at == std::string::npos) return false;
+  ++at;
+  while (at < json.size() && (json[at] == ' ' || json[at] == '\t')) ++at;
+  std::string token;
+  if (at < json.size() && json[at] == '"') {
+    const size_t end = json.find('"', at + 1);
+    if (end == std::string::npos) return false;
+    token = json.substr(at + 1, end - at - 1);
+  } else {
+    size_t end = at;
+    while (end < json.size() &&
+           (std::isalnum(static_cast<unsigned char>(json[end])) != 0))
+      ++end;
+    token = json.substr(at, end - at);
+  }
+  if (token == "true" || token == "1") {
+    *out = true;
+    return true;
+  }
+  if (token == "false" || token == "0") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
 
 // Reads an optional integer option. Missing key -> *out untouched (keeps the
 // default). Present but not an integer in [minValue, maxValue] -> false with an
@@ -3439,6 +3604,11 @@ bool parseSessionOptions(const std::string& json, SessionOptions& options,
     if (json.find("\"sunshineEncryption\"") != std::string::npos) {
       const std::string requested = jsonValue(json, "sunshineEncryption");
       if (!requested.empty()) options.sunshineEncryption = requested != "none";
+    }
+    if (!readBoolOption(json, "sunshineHostCursorHidden",
+                        &options.sunshineHostCursorHidden)) {
+      error = "invalid sunshine host cursor state";
+      return false;
     }
   } catch (const std::exception& failure) {
     error = sanitizeLine(failure.what());
@@ -3553,6 +3723,7 @@ std::shared_ptr<SessionState> launchSession(const SessionOptions& options,
   state->sunshineBitrate = options.sunshineBitrate;
   state->sunshineFormats = options.sunshineFormats;
   state->sunshineEncryption = options.sunshineEncryption;
+  state->cursorHidden = options.sunshineHostCursorHidden;
   // Start the thread before publishing the session so closeSession() can never
   // find a session whose thread is still not joinable.
   try {
@@ -3589,7 +3760,11 @@ std::string perfSeriesJson(const PerfSummary& summary) {
 
 // Additive status field: the summary of the last completed one-second window.
 // Timings are microseconds; frames/delivered are counts in that window.
-std::string perfJson(const PerfSnapshot& snapshot) {
+// extraFields (already-formatted "k":v pairs, no braces) is appended when
+// non-empty: Sunshine adds its 5 s pipeline summary there so the existing perf
+// object keeps its shape and the JSON has no duplicate "perf" key.
+std::string perfJson(const PerfSnapshot& snapshot,
+                     const std::string& extraFields = std::string()) {
   std::string out = "{\"windowMs\":1000,\"frames\":" +
                     std::to_string(snapshot.frames) +
                     ",\"delivered\":" + std::to_string(snapshot.delivered);
@@ -3597,7 +3772,9 @@ std::string perfJson(const PerfSnapshot& snapshot) {
   out += ",\"convert\":" + perfSeriesJson(snapshot.convert);
   out += ",\"pixWait\":" + perfSeriesJson(snapshot.pixWait);
   out += ",\"commit\":" + perfSeriesJson(snapshot.commit);
-  out += ",\"takeFrame\":" + perfSeriesJson(snapshot.takeFrame) + "}";
+  out += ",\"takeFrame\":" + perfSeriesJson(snapshot.takeFrame);
+  if (!extraFields.empty()) out += "," + extraFields;
+  out += "}";
   return out;
 }
 
@@ -3683,9 +3860,19 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
     clipTruncated = state->clipTruncated;
   }
   int resizeSupport = ResizeSupportUnknown;
+  bool resizeActive = false;
+  int resizeWidth = 0, resizeHeight = 0;
   {
     std::lock_guard<std::mutex> lock(state->desk);
     resizeSupport = state->resizeSupport;
+    resizeActive = state->resizeActive;
+    resizeWidth = state->resizeWidth;
+    resizeHeight = state->resizeHeight;
+  }
+  bool remoteCursorHidden = false;
+  {
+    std::lock_guard<std::mutex> lock(state->input);
+    remoteCursorHidden = state->cursorHidden;
   }
   const int generation = state->generation.load();
   std::string out = "{\"id\":\"" + jsonEscape(state->id) + "\",\"state\":\"" +
@@ -3710,7 +3897,30 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
          std::to_string(static_cast<long long>(width) * height * 4);
   // Appended last so every existing field keeps its position and meaning: the
   // perf and pf objects are additive only.
-  out += ",\"perf\":" + perfJson(state->perf.snapshot());
+  // Sunshine 且已连接时，把视频链路的分段耗时（5 秒窗口）并进同一个 perf 对象：
+  // inFps/decFps/convert/commit/netToSubmit/submitToOutput 来自解码线程的快照
+  // （sunshine_video.h），outFps/lag 来自渲染线程的快照（render.h）。两边都是
+  // 进程级只读快照，读取不加锁等待解码或渲染。
+  std::string perfExtra;
+#if defined(TIANGUAN_WITH_SUNSHINE)
+  if (state->protocol == "sunshine" && phase == PhaseConnected) {
+    const tianguan::SunshineVideoPerf video = tianguan::sunshineVideoPerf();
+    const tianguan::RenderFramePerf render = tianguan::renderFramePerf();
+    char numbers[384];
+    std::snprintf(numbers, sizeof(numbers),
+                  "\"inFps\":%.1f,\"decFps\":%.1f,\"outFps\":%.1f,"
+                  "\"lagMsAvg\":%.2f,\"lagMsP95\":%.2f,"
+                  "\"convertMsAvg\":%.2f,\"commitMsAvg\":%.2f,"
+                  "\"netToSubmitMsAvg\":%.2f,\"submitToOutputMsAvg\":%.2f,"
+                  "\"perfWindowMs\":%llu",
+                  video.inFps, video.decFps, render.outFps, render.lagAvgMs,
+                  render.lagP95Ms, video.convertAvgMs, video.commitAvgMs,
+                  video.netToSubmitAvgMs, video.submitToOutputAvgMs,
+                  video.windowMs);
+    perfExtra = numbers;
+  }
+#endif
+  out += ",\"perf\":" + perfJson(state->perf.snapshot(), perfExtra);
   out += ",\"pf\":" + pixelFormatJson(pfBpp, pfDepth, pfRedMax, pfGreenMax,
                                      pfBlueMax, pfBigEndian, pfRedShift,
                                      pfGreenShift, pfBlueShift);
@@ -3740,6 +3950,18 @@ std::string statusJson(const std::shared_ptr<SessionState>& state) {
                                    : ",\"pictureBlack\":false");
   }
 #endif
+  // Additive, Sunshine only: an in-progress requestDesktopSize() restart. The UI
+  // shows "正在按窗口调整分辨率…" for this pair until the new stream connects.
+  if (resizeActive) {
+    out += ",\"resize\":{\"width\":" + std::to_string(resizeWidth) +
+           ",\"height\":" + std::to_string(resizeHeight) + "}";
+  }
+  // Additive, Sunshine only: the locally recorded host-cursor state (the host's
+  // display_cursor is process-global and cannot be queried). The UI persists it
+  // in the connection entry and passes it back as sunshineHostCursorHidden.
+  if (state->protocol == "sunshine")
+    out += remoteCursorHidden ? ",\"remoteCursorHidden\":true"
+                              : ",\"remoteCursorHidden\":false";
   out += "}";
   return out;
 }
@@ -4007,6 +4229,42 @@ bool tianguan::submitPin(const std::string& sessionId, const std::string& pin) {
   return true;
 }
 
+// Sunshine only: hide/show the host's cursor. Sunshine draws the cursor inside
+// the video (latency = video latency), so the Moonlight client hides the host
+// cursor and shows its own. The toggle is a Sunshine shortcut (Ctrl+Alt+Shift+N,
+// src/input.cpp apply_shortcut) that flips the process-global display_cursor and
+// is not delivered to the desktop. The state persists across sessions, so the
+// client records it and ArkTS persists it in the connection entry.
+//   * already at the requested state -> true, nothing sent (a pending request for
+//     the opposite value is cancelled);
+//   * request accepted -> true; the chord is sent by the backend's input thread
+//     within ~2 ms (LiSend* is only safe/available there) and the recorded value
+//     is updated once the send succeeds;
+//   * unknown session / not Sunshine / not connected -> false, but the desired
+//     state is still recorded and sent after the next connection is established.
+bool tianguan::setRemoteCursorHidden(const std::string& sessionId, bool hidden) {
+  const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
+  if (!state) return false;
+  if (state->protocol != "sunshine") return false;
+  bool connected = false;
+  {
+    std::lock_guard<std::mutex> lock(state->meta);
+    connected = state->connected;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->input);
+    if (state->cursorHidden == hidden) {
+      // The recorded host state already matches: drop a not-yet-sent request for
+      // the opposite value (the host was never toggled).
+      state->cursorPending = false;
+      return true;
+    }
+    state->cursorDesiredHidden = hidden;
+    state->cursorPending = true;
+  }
+  return connected;
+}
+
 // Times one takeFrame() call (including calls that return NONE). Declared
 // before the pixel lock_guard so its destructor runs after that lock is
 // released.
@@ -4045,6 +4303,9 @@ tianguan::FrameGrabStatus tianguan::takeFrameStruct(const std::string& sessionId
   out.fbWidth = width;
   out.fbHeight = height;
   out.generation = state->frameGeneration;
+  // 交付的像素属于哪一帧提交：取帧方（渲染线程）用它算 lag。0 表示该镜像没有
+  // 提交时间戳（VNC/RDP），此时不统计 lag。
+  out.commitTimeUs = static_cast<long long>(state->commitTimeUs);
   if (width <= 0 || height <= 0 || current <= 0) return FrameGrabNone;
   // NONE means "the caller already has the newest version".
   if (!forceFull && afterVersion == current) return FrameGrabNone;
@@ -4175,8 +4436,12 @@ std::string tianguan::sendPointer(const std::string& sessionId, int x, int y, in
       state->inputs.back().kind == QueuedInput::PointerKind &&
       state->inputs.back().c == mask && !state->inputs.back().boundary;
   if (canMerge) {
+    // Only same-mask motion is merged (never a press/release/wheel boundary); the
+    // timestamp moves with the newest position so the latency sample measures the
+    // age of the information actually sent.
     state->inputs.back().a = x;
     state->inputs.back().b = y;
+    state->inputs.back().queuedAtUs = inputNowUs();
     return "COALESCED";
   }
   // Boundary = the button/wheel state differs from the last pointer event that
@@ -4198,6 +4463,7 @@ std::string tianguan::sendPointer(const std::string& sessionId, int x, int y, in
   item.a = x;
   item.b = y;
   item.c = mask;
+  item.queuedAtUs = inputNowUs();
   item.boundary = wheel || mask != lastMask;
   state->inputs.push_back(item);
   trimInputQueue(*state);
@@ -4218,6 +4484,7 @@ std::string tianguan::sendKey(const std::string& sessionId, int keysym, int pres
   item.a = keysym;
   item.b = pressed;
   item.c = 0;
+  item.queuedAtUs = inputNowUs();
   item.boundary = false;
   state->inputs.push_back(item);
   return "QUEUED";
@@ -4278,6 +4545,7 @@ std::string tianguan::setClipboard(const std::string& sessionId, const std::stri
   item.a = 0;
   item.b = 0;
   item.c = 0;
+  item.queuedAtUs = inputNowUs();
   item.boundary = false;
   item.text = filtered;
   std::lock_guard<std::mutex> lock(state->input);
@@ -4320,13 +4588,42 @@ bool tianguan::requestDesktopSize(const std::string& sessionId, int width,
   const std::shared_ptr<SessionState> state = g_sessions.find(sessionId);
   if (!state) return false;
   bool rdp = false;
+  bool sunshine = false;
   {
     std::lock_guard<std::mutex> lock(state->meta);
     // The PDU/write must happen on the session thread; require a live
     // connection so a queued request can actually reach it.
-    if (!state->connected) return false;
-    if (state->protocol != "vnc" && state->protocol != "rdp") return false;
-    rdp = state->protocol == "rdp";
+    sunshine = state->protocol == "sunshine";
+    if (!sunshine) {
+      if (!state->connected) return false;
+      if (state->protocol != "vnc" && state->protocol != "rdp") return false;
+      rdp = state->protocol == "rdp";
+    }
+  }
+  if (sunshine) {
+    // Sunshine: the size goes through a full stop + relaunch, so the backend
+    // consumes it from the session thread every 200 ms. Validation: even sides,
+    // 16..7680, and at most a 4:1 aspect ratio in either direction.
+    if (width < 16 || height < 16 || width > 7680 || height > 7680) return false;
+    if ((width & 1) != 0 || (height & 1) != 0) return false;
+    if (width > height * 4 || height > width * 4) return false;
+    bool resizing = false;
+    {
+      std::lock_guard<std::mutex> lock(state->desk);
+      resizing = state->desktopAwaiting;
+    }
+    {
+      // A request may arrive while the previous one is being processed: it only
+      // overwrites the pending slot (the newest size wins), so accepting it
+      // needs a live connection OR an in-flight resize.
+      std::lock_guard<std::mutex> lock(state->meta);
+      if (!state->connected && !resizing) return false;
+    }
+    std::lock_guard<std::mutex> lock(state->desk);
+    state->desktopWidth = width;
+    state->desktopHeight = height;
+    state->desktopPending = true;
+    return true;
   }
   // RDP (MS-RDPEDISP / DISPLAY_CONTROL): Width and Height are 200..8192; the
   // session mirror keeps the same 4096 cap as VNC. VNC itself has no lower

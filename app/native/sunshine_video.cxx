@@ -35,6 +35,8 @@
 //   * setup() 在调用 Start() 之前就发布 codec_/running_（解码器可能在 Start 返回
 //     的瞬间交还输入 buffer），started_ 标记 Start 是否已经成功：未成功时交还的
 //     输入 buffer 只是存进 freeInputs_，不 Push。
+//   * 分段耗时统计（g_videoPerf，见下面「5 秒窗口」）只用自己的一把锁，做几次
+//     时钟读取和一次直方图自增；任何调用点都不在持有 mutex_/codecApiMutex_ 时写它。
 //
 // 本次范围：H.264/HEVC、Buffer 模式的 CPU 输出（NV12/NV21 -> BGRA）。Surface
 // 模式直出纹理、P010 十比特、AV1（OBU 而非 AnnexB）不在本次实现内，见文件末尾。
@@ -105,6 +107,168 @@ uint64_t monotonicMillis() {
       std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+uint64_t monotonicMicros() {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
+// ---------------------------------------------------------------------------
+// 分段耗时统计（5 秒窗口）
+//
+// 每帧只做几次 steady_clock 读取和一次直方图自增：avg 用整数和，P95 用 1 ms 一桶
+// 的直方图（2000 ms 之后落进溢出桶），不对样本排序，也不保存无界样本。聚合状态
+// 是进程级的（common-c 同时只允许一个串流），setup() 时重置；读取方是后端（5 秒
+// 汇总日志）和宿主（statusJson.perf），拿到的是算好的快照，不等待解码。
+// ---------------------------------------------------------------------------
+const size_t kPerfBucketCount = 2001;  // 0..1999 ms 各一桶 + >=2000 ms 溢出桶
+const uint64_t kPerfWindowUs = 5000000;  // 5 秒
+
+struct PerfMetricWindow {
+  PerfMetricWindow() : count(0), sumUs(0) {
+    std::memset(buckets, 0, sizeof(buckets));
+  }
+  void add(uint64_t us) {
+    ++count;
+    sumUs += us;
+    size_t bucket = static_cast<size_t>(us / 1000);
+    if (bucket >= kPerfBucketCount) bucket = kPerfBucketCount - 1;
+    if (buckets[bucket] != 0xffffffffu) ++buckets[bucket];
+  }
+  void reset() {
+    count = 0;
+    sumUs = 0;
+    std::memset(buckets, 0, sizeof(buckets));
+  }
+  double avgMs() const {
+    return count != 0 ? static_cast<double>(sumUs) / static_cast<double>(count) / 1000.0
+                      : 0.0;
+  }
+  // 直方图桶下界即毫秒值；桶宽 1 ms，误差 < 1 ms。
+  double p95Ms() const {
+    if (count == 0) return 0.0;
+    const uint64_t target = (count * 95 + 99) / 100;  // ceil(0.95 * count)
+    uint64_t running = 0;
+    for (size_t i = 0; i < kPerfBucketCount; ++i) {
+      running += buckets[i];
+      if (running >= target) return static_cast<double>(i);
+    }
+    return static_cast<double>(kPerfBucketCount - 1);
+  }
+  uint64_t count;
+  uint64_t sumUs;
+  uint32_t buckets[kPerfBucketCount];
+};
+
+class VideoPerfAggregator {
+ public:
+  VideoPerfAggregator()
+      : windowStartUs_(0), inFrames_(0), decFrames_(0), droppedUnits_(0) {}
+
+  void reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    windowStartUs_ = 0;
+    inFrames_ = 0;
+    decFrames_ = 0;
+    droppedUnits_ = 0;
+    netToSubmit_.reset();
+    submitToOutput_.reset();
+    convert_.reset();
+    commit_.reset();
+    last_ = SunshineVideoPerf();
+  }
+
+  void noteInFrame() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    ++inFrames_;
+  }
+  void noteDecodedFrame() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    ++decFrames_;
+  }
+  void noteDroppedUnit() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    ++droppedUnits_;
+  }
+  void noteNetToSubmit(uint64_t us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    netToSubmit_.add(us);
+  }
+  void noteSubmitToOutput(uint64_t us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    submitToOutput_.add(us);
+  }
+  void noteConvert(uint64_t us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    convert_.add(us);
+  }
+  void noteCommit(uint64_t us) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    commit_.add(us);
+  }
+
+  SunshineVideoPerf snapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rotateLocked(monotonicMicros());
+    return last_;
+  }
+
+ private:
+  void rotateLocked(uint64_t nowUs) {
+    if (windowStartUs_ == 0) {
+      windowStartUs_ = nowUs;
+      return;
+    }
+    if (nowUs - windowStartUs_ < kPerfWindowUs) return;
+    const uint64_t windowUs = nowUs - windowStartUs_;
+    const double seconds = static_cast<double>(windowUs) / 1000000.0;
+    SunshineVideoPerf out;
+    out.windowMs = windowUs / 1000;
+    out.inFrames = inFrames_;
+    out.decFrames = decFrames_;
+    out.droppedUnits = droppedUnits_;
+    out.inFps = seconds > 0.0 ? static_cast<double>(inFrames_) / seconds : 0.0;
+    out.decFps = seconds > 0.0 ? static_cast<double>(decFrames_) / seconds : 0.0;
+    out.netToSubmitAvgMs = netToSubmit_.avgMs();
+    out.netToSubmitP95Ms = netToSubmit_.p95Ms();
+    out.submitToOutputAvgMs = submitToOutput_.avgMs();
+    out.submitToOutputP95Ms = submitToOutput_.p95Ms();
+    out.convertAvgMs = convert_.avgMs();
+    out.convertP95Ms = convert_.p95Ms();
+    out.commitAvgMs = commit_.avgMs();
+    out.commitP95Ms = commit_.p95Ms();
+    last_ = out;
+    windowStartUs_ = nowUs;
+    inFrames_ = 0;
+    decFrames_ = 0;
+    droppedUnits_ = 0;
+    netToSubmit_.reset();
+    submitToOutput_.reset();
+    convert_.reset();
+    commit_.reset();
+  }
+
+  std::mutex mutex_;
+  uint64_t windowStartUs_;
+  uint64_t inFrames_;
+  uint64_t decFrames_;
+  uint64_t droppedUnits_;
+  PerfMetricWindow netToSubmit_;
+  PerfMetricWindow submitToOutput_;
+  PerfMetricWindow convert_;
+  PerfMetricWindow commit_;
+  SunshineVideoPerf last_;
+};
+
+VideoPerfAggregator g_videoPerf;
+
 // 有界输入队列的深度：解码器自己还有若干在途 buffer，超过这个数再攒只会增加
 // 端到端延迟；满了就让 common-c 去要一个 IDR（画面会跳一下，但不会无限积压）。
 const size_t kMaxQueuedDecodeUnits = 4;
@@ -139,6 +303,16 @@ struct FreeInputBuffer {
   OH_AVBuffer* buffer;
 };
 
+// 一次输入下发的记录：输出回调拿同样的 PTS 回来配对 submitToOutput 间隔。
+// 有界（解码器同时在途的帧远少于这个数），满了丢最旧的。
+struct PendingSubmit {
+  PendingSubmit() : ptsUs(0), submitUs(0) {}
+  PendingSubmit(int64_t pts, uint64_t atUs) : ptsUs(pts), submitUs(atUs) {}
+  int64_t ptsUs;
+  uint64_t submitUs;
+};
+const size_t kMaxPendingSubmits = 240;
+
 // AVCodec 硬解渲染器。只有 SunshineVideoSink::create() 会构造它。
 class AvCodecVideoSink : public SunshineVideoSink {
  public:
@@ -150,6 +324,9 @@ class AvCodecVideoSink : public SunshineVideoSink {
         generation_(0),
         configuredFps_(0),
         lastPtsUs_(0),
+        matchedSubmitToOutputSumUs_(0),
+        matchedSubmitToOutputCount_(0),
+        lastSubmitToOutputUs_(0),
         sws_(nullptr),
         swsWidth_(0),
         swsHeight_(0),
@@ -277,7 +454,13 @@ class AvCodecVideoSink : public SunshineVideoSink {
       lastPtsUs_ = 0;
       lastWarnMs_ = 0;
       lastProgressMs_ = 0;
+      pendingSubmits_.clear();
+      matchedSubmitToOutputSumUs_ = 0;
+      matchedSubmitToOutputCount_ = 0;
+      lastSubmitToOutputUs_ = 0;
     }
+    // 新的连接从空的 5 秒统计窗口开始（进程级聚合器，见文件头的统计说明）。
+    g_videoPerf.reset();
     result = OH_VideoDecoder_Start(codec);
     if (result != AV_ERR_OK) {
       logWarn(formatText("sunshine video: Start failed: %d", static_cast<int>(result)));
@@ -298,6 +481,14 @@ class AvCodecVideoSink : public SunshineVideoSink {
 
   int submitDecodeUnit(PDECODE_UNIT decodeUnit) override {
     if (decodeUnit == nullptr || decodeUnit->bufferList == nullptr) return DR_OK;
+
+    // 分段耗时 1：common-c 的 enqueueTimeUs 用 PltGetMicroseconds() 取值，那是它
+    // 自己的单调时钟（CLOCK_MONOTONIC_RAW 减启动偏移），不能和 steady_clock 直接
+    // 相减；LiGetMicroseconds() 是同一时钟，用它取「现在」才得到真实间隔。
+    const uint64_t commonNowUs = static_cast<uint64_t>(LiGetMicroseconds());
+    if (decodeUnit->enqueueTimeUs != 0 && commonNowUs > decodeUnit->enqueueTimeUs)
+      g_videoPerf.noteNetToSubmit(commonNowUs - decodeUnit->enqueueTimeUs);
+    g_videoPerf.noteInFrame();
 
     // 1. 拼 AnnexB（不持锁：buffer 链归调用线程所有，拼的过程只读）。
     QueuedDecodeUnit unit;
@@ -351,6 +542,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
     }
     if (hasInput) pushInput(codec, input, unit);
     if (dropped) {
+      g_videoPerf.noteDroppedUnit();
       logWarnThrottled("sunshine video: input queue full, dropped a decode unit");
     }
     return result;
@@ -366,6 +558,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
       codec_ = nullptr;
       queue_.clear();
       freeInputs_.clear();
+      pendingSubmits_.clear();
       // 在途的 submit/回调退出前会把 activeCalls_ 减回去；它们看到 running_ 为
       // false 后不会再碰解码器，所以下面的 Stop/Destroy 不会与它们并发。
       if (!idleCond_.wait_for(lock, std::chrono::seconds(3),
@@ -479,12 +672,19 @@ class AvCodecVideoSink : public SunshineVideoSink {
       logWarnThrottled("sunshine video: SetBufferAttr failed");
       return false;
     }
+    const uint64_t submitUs = monotonicMicros();
     std::lock_guard<std::mutex> apiLock(codecApiMutex_);
     const OH_AVErrCode result = OH_VideoDecoder_PushInputBuffer(codec, input.index);
     if (result != AV_ERR_OK) {
       logWarnThrottled(formatText("sunshine video: PushInputBuffer failed: %d",
                                   static_cast<int>(result)));
       return false;
+    }
+    // 分段耗时 2：记下「送进解码器」的时刻，输出回调用同一个 PTS 配对。
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pendingSubmits_.push_back(PendingSubmit(unit.ptsUs, submitUs));
+      while (pendingSubmits_.size() > kMaxPendingSubmits) pendingSubmits_.pop_front();
     }
     return true;
   }
@@ -636,6 +836,30 @@ class AvCodecVideoSink : public SunshineVideoSink {
       logDebug("sunshine video: decoder reported EOS");
       return;
     }
+    // 分段耗时 2：按 PTS 配对「送进解码器 -> 输出回调」的间隔。解码器会把输入
+    // 的 pts 原样带回；配不上（pts 被改写/为 0）时用最近已配对样本的运行均值，
+    // 这样统计不会因为个别帧配不上就断档（见文件末尾的说明）。
+    const uint64_t outputUs = monotonicMicros();
+    {
+      uint64_t submitToOutputUs = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::deque<PendingSubmit>::iterator it = pendingSubmits_.begin();
+             it != pendingSubmits_.end(); ++it) {
+          if (it->ptsUs != attr.pts) continue;
+          if (outputUs > it->submitUs) submitToOutputUs = outputUs - it->submitUs;
+          // 运行均值，配对不上时的兜底就是这个均值。
+          matchedSubmitToOutputSumUs_ += submitToOutputUs;
+          ++matchedSubmitToOutputCount_;
+          lastSubmitToOutputUs_ = static_cast<uint64_t>(
+              matchedSubmitToOutputSumUs_ / matchedSubmitToOutputCount_);
+          pendingSubmits_.erase(it);
+          break;
+        }
+        if (submitToOutputUs == 0) submitToOutputUs = lastSubmitToOutputUs_;
+      }
+      if (submitToOutputUs != 0) g_videoPerf.noteSubmitToOutput(submitToOutputUs);
+    }
     uint8_t* addr = OH_AVBuffer_GetAddr(buffer);
     const int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
     if (addr == nullptr || capacity <= 0) {
@@ -685,6 +909,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
       OH_VideoDecoder_FreeOutputBuffer(codec, index);
       return;
     }
+    g_videoPerf.noteDecodedFrame();
 
     // NV12/NV21：Y 平面从 buffer 起始，UV 交错平面在 Y + sliceHeight*stride。
     const uint8_t* source[3];
@@ -695,8 +920,11 @@ class AvCodecVideoSink : public SunshineVideoSink {
     int sourceStride[3] = {frameStride_, frameStride_, 0};
     uint8_t* destination[3] = {bgra_.data(), nullptr, nullptr};
     int destinationStride[3] = {frameWidth_ * 4, 0, 0};
+    // 分段耗时 3：NV12/NV21 -> BGRA 的 sws 转换本身。
+    const uint64_t convertStartUs = monotonicMicros();
     sws_scale(sws_, source, sourceStride, 0, frameHeight_, destination,
               destinationStride);
+    g_videoPerf.noteConvert(monotonicMicros() - convertStartUs);
 
     // swscale 的 BGRA 输出通常已经把 alpha 写成 255，这里显式补齐（与 RDP 路径
     // commit 前强制 alpha 的做法一致，不依赖 sws 的行为）。
@@ -743,7 +971,10 @@ class AvCodecVideoSink : public SunshineVideoSink {
       rect.h = frameHeight_;
       rect.stride = frameWidth_ * 4;
       rect.pixels = bgra_.data();
+      // 分段耗时 4：宿主 commit（含镜像拷贝，宿主在 pix 锁内做完才返回）。
+      const uint64_t commitStartUs = monotonicMicros();
       sink.commit(sink.user, generation, &rect, 1, frameWidth_, frameHeight_);
+      g_videoPerf.noteCommit(monotonicMicros() - commitStartUs);
     }
     OH_VideoDecoder_FreeOutputBuffer(codec, index);
 
@@ -835,6 +1066,11 @@ class AvCodecVideoSink : public SunshineVideoSink {
   std::deque<FreeInputBuffer> freeInputs_;  // 受 mutex_ 保护
   int configuredFps_;  // 受 mutex_ 保护（submit 里读）
   int64_t lastPtsUs_;  // 受 mutex_ 保护（PTS 递推）
+  // 分段耗时 2 的配对表：push 时记 {pts, 时刻}，输出回调按 pts 取回（受 mutex_）。
+  std::deque<PendingSubmit> pendingSubmits_;
+  uint64_t matchedSubmitToOutputSumUs_;  // 受 mutex_ 保护（已配对样本的运行和）
+  uint64_t matchedSubmitToOutputCount_;  // 受 mutex_ 保护
+  uint64_t lastSubmitToOutputUs_;        // 受 mutex_ 保护（运行均值，配对失败兜底）
 
   // 解码输出与转换状态：只在 AVCodec 输出回调线程里读写；sws_ / bgra_ 的释放在
   // stop() 里，且发生在 activeCalls_ 归零之后。
@@ -863,6 +1099,13 @@ class AvCodecVideoSink : public SunshineVideoSink {
 
 SunshineVideoSink* SunshineVideoSink::create() {
   return new AvCodecVideoSink();
+}
+
+// 进程级分段耗时快照（见 sunshine_video.h）。读取方在任意线程调用；聚合器内部
+// 只用自己的一把锁，且从不在持有它的时候再拿别的锁，所以不会和上面的解码锁序
+// 交叉。
+SunshineVideoPerf sunshineVideoPerf() {
+  return g_videoPerf.snapshot();
 }
 
 }  // namespace tianguan

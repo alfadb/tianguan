@@ -41,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -58,6 +59,7 @@
 #include <hilog/log.h>
 #endif
 
+#include "render.h"
 #include "sunshine/nv_http.h"
 #include "sunshine_audio.h"
 #include "sunshine_video.h"
@@ -363,11 +365,51 @@ char modifierBitForVk(short vk) {
 // 状态，release 时按此精确抬起。RFB mask 约定与 rdp_backend.cxx 一致：
 // bit0 左键、bit1 中键、bit2 右键、bit3 滚轮上、bit4 滚轮下。
 // ---------------------------------------------------------------------------
+// 输入延迟窗口（5 秒）：从「入队」到「LiSend* 返回」的间隔，以及发送次数/失败数。
+// 只在后端输入线程上读写（drain 适配层在 sink 调用返回后调用 noteLag()），所以
+// 不需要锁；窗口满后由 takeStats() 一次性取走并清零。
+struct InputWindowStats {
+  InputWindowStats() : avgMs(0), p95Ms(0), samples(0), sendCalls(0), sendFail(0) {}
+  double avgMs;
+  double p95Ms;
+  size_t samples;
+  unsigned long long sendCalls;
+  unsigned long long sendFail;
+};
+
 class InputTranslator {
  public:
   InputTranslator()
       : streamWidth_(1280), streamHeight_(720), pointerMask_(0), modifiers_(0),
-        dropLogs_(0) {}
+        dropLogs_(0), lagCount_(0), lagSumUs_(0), sendCalls_(0), sendFail_(0) {}
+
+  // 一条「入队 -> 发送返回」的延迟样本（微秒）。只在输入线程调用。
+  void noteLag(unsigned long long lagUs) {
+    if (lagCount_ < kLagSamples) lagUs_[lagCount_] = lagUs;
+    if (lagCount_ < kLagSamples) ++lagCount_;
+    lagSumUs_ += lagUs;
+  }
+
+  // 取走并清空当前 5 秒窗口；avg/p95 以毫秒返回。
+  InputWindowStats takeStats() {
+    InputWindowStats stats;
+    stats.samples = lagCount_;
+    stats.sendCalls = sendCalls_;
+    stats.sendFail = sendFail_;
+    if (lagCount_ > 0) {
+      stats.avgMs = static_cast<double>(lagSumUs_) / lagCount_ / 1000.0;
+      std::vector<unsigned long long> ordered(lagUs_, lagUs_ + lagCount_);
+      std::sort(ordered.begin(), ordered.end());
+      const size_t index =
+          static_cast<size_t>((static_cast<double>(ordered.size() - 1)) * 0.95);
+      stats.p95Ms = static_cast<double>(ordered[index]) / 1000.0;
+    }
+    lagCount_ = 0;
+    lagSumUs_ = 0;
+    sendCalls_ = 0;
+    sendFail_ = 0;
+    return stats;
+  }
 
   void setStreamSize(int width, int height) {
     if (width > 0) streamWidth_.store(width);
@@ -388,30 +430,31 @@ class InputTranslator {
     if (height <= 0) height = 720;
     x = std::max(0, std::min(x, width - 1));
     y = std::max(0, std::min(y, height - 1));
-    // 绝对坐标：x/y 已是远端像素，参考尺寸就是流分辨率。
-    LiSendMousePositionEvent(static_cast<short>(x), static_cast<short>(y),
-                             static_cast<short>(width),
-                             static_cast<short>(height));
+    // 绝对坐标：x/y 已是远端像素，参考尺寸取「当前流」的最新尺寸（setStreamSize()
+    // 在每次视频 setup 里更新，分辨率调整后自然跟随）。
+    noteSend(LiSendMousePositionEvent(static_cast<short>(x), static_cast<short>(y),
+                                      static_cast<short>(width),
+                                      static_cast<short>(height)));
     const int held = mask & 7;
     const int changed = held ^ (pointerMask_ & 7);
     if ((changed & 1) != 0)
-      LiSendMouseButtonEvent((held & 1) != 0 ? BUTTON_ACTION_PRESS
-                                             : BUTTON_ACTION_RELEASE,
-                             BUTTON_LEFT);
+      noteSend(LiSendMouseButtonEvent((held & 1) != 0 ? BUTTON_ACTION_PRESS
+                                                      : BUTTON_ACTION_RELEASE,
+                                      BUTTON_LEFT));
     if ((changed & 2) != 0)
-      LiSendMouseButtonEvent((held & 2) != 0 ? BUTTON_ACTION_PRESS
-                                             : BUTTON_ACTION_RELEASE,
-                             BUTTON_MIDDLE);
+      noteSend(LiSendMouseButtonEvent((held & 2) != 0 ? BUTTON_ACTION_PRESS
+                                                      : BUTTON_ACTION_RELEASE,
+                                      BUTTON_MIDDLE));
     if ((changed & 4) != 0)
-      LiSendMouseButtonEvent((held & 4) != 0 ? BUTTON_ACTION_PRESS
-                                             : BUTTON_ACTION_RELEASE,
-                             BUTTON_RIGHT);
+      noteSend(LiSendMouseButtonEvent((held & 4) != 0 ? BUTTON_ACTION_PRESS
+                                                      : BUTTON_ACTION_RELEASE,
+                                      BUTTON_RIGHT));
     pointerMask_ = held;
     // 一个 mask 最多带一个方向的滚轮位；两个都有时按上滚处理（与 RDP 路径一致）。
     if ((mask & 8) != 0)
-      LiSendScrollEvent(1);
+      noteSend(LiSendScrollEvent(1));
     else if ((mask & 16) != 0)
-      LiSendScrollEvent(-1);
+      noteSend(LiSendScrollEvent(-1));
   }
 
   void key(int keysym, int pressed) {
@@ -428,12 +471,12 @@ class InputTranslator {
     const char bit = modifierBitForVk(vk);
     if (pressed != 0) {
       // 修饰键本身按下时，modifiers 里还不包含它自己。
-      LiSendKeyboardEvent(vk, KEY_ACTION_DOWN, modifiers_);
+      noteSend(LiSendKeyboardEvent(vk, KEY_ACTION_DOWN, modifiers_));
       pressedKeys_.insert(vk);
       if (bit != 0) modifiers_ = static_cast<char>(modifiers_ | bit);
     } else {
       if (bit != 0) modifiers_ = static_cast<char>(modifiers_ & ~bit);
-      LiSendKeyboardEvent(vk, KEY_ACTION_UP, modifiers_);
+      noteSend(LiSendKeyboardEvent(vk, KEY_ACTION_UP, modifiers_));
       pressedKeys_.erase(vk);
     }
   }
@@ -444,17 +487,17 @@ class InputTranslator {
          it != pressedKeys_.end(); ++it) {
       const char bit = modifierBitForVk(*it);
       const char mods = bit != 0 ? static_cast<char>(modifiers_ & ~bit) : modifiers_;
-      LiSendKeyboardEvent(*it, KEY_ACTION_UP, mods);
+      noteSend(LiSendKeyboardEvent(*it, KEY_ACTION_UP, mods));
     }
     pressedKeys_.clear();
     modifiers_ = 0;
     const int held = pointerMask_ & 7;
     if ((held & 1) != 0)
-      LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT));
     if ((held & 2) != 0)
-      LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE);
+      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE));
     if ((held & 4) != 0)
-      LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+      noteSend(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT));
     pointerMask_ = 0;
   }
 
@@ -462,12 +505,25 @@ class InputTranslator {
   void clipboard(const char*) {}
 
  private:
+  // 每次 LiSend* 调用都计数；返回非 0（如 -2 输入流未就绪）单独累计，便于在
+  // W 级日志里区分「没在发」和「发了但没被接收」。
+  void noteSend(int result) {
+    ++sendCalls_;
+    if (result != 0) ++sendFail_;
+  }
+
+  static const size_t kLagSamples = 4096;
   std::atomic<int> streamWidth_;
   std::atomic<int> streamHeight_;
   std::set<short> pressedKeys_;
   int pointerMask_;
   char modifiers_;
   int dropLogs_;
+  unsigned long long lagUs_[kLagSamples];
+  size_t lagCount_;
+  unsigned long long lagSumUs_;
+  unsigned long long sendCalls_;
+  unsigned long long sendFail_;
 };
 
 // ---------------------------------------------------------------------------
@@ -480,7 +536,7 @@ struct MediaContext {
         failedStage(0), failedStageError(0), pictureFrameMs(0),
         pictureBlackStartMs(0), pictureFirstNonBlackMs(0),
         pictureLastNonBlackMs(0), terminationPictureMs(0), currentStage(0),
-        firstFrameTimeoutLogged(false) {}
+        firstFrameTimeoutLogged(false), negotiatedVideoFormat(0) {}
 
   const SunshineHost* host;
   int generation;
@@ -513,6 +569,9 @@ struct MediaContext {
   // 只打一次的标记，便于判断慢在 RTSP/控制流/视频哪一段。
   std::atomic<int> currentStage;
   std::atomic<bool> firstFrameTimeoutLogged;
+  // 当前流实际协商到的 VIDEO_FORMAT_*（videoSetup 成功时写入）；分辨率调整时的
+  // 码率系数按它判断 HEVC。0 = 还没有协商过。
+  std::atomic<int> negotiatedVideoFormat;
 
   std::mutex textMutex;
   std::string terminationText;
@@ -546,6 +605,8 @@ int videoSetupCallback(int videoFormat, int width, int height, int redrawRate,
                        videoFormat, width, height, redrawRate));
     return -1;
   }
+  // 记录协商到的格式：resize 的码率缩放用它判断 HEVC（H265/Main10 家族）。
+  media.negotiatedVideoFormat.store(videoFormat);
   // 先把几何交给宿主（重建镜像），再让解码器出帧；输入线程的参考分辨率也在这里更新。
   media.input.setStreamSize(width, height);
   if (media.host != nullptr && media.host->resizeFrame != nullptr)
@@ -618,6 +679,10 @@ void connectionStartedCallback(void) {
   media.started.store(true);
   // 该回调在 LiStartConnection() 内部、会话线程上触发，所以直接写宿主状态是安全的。
   setHostPhase(*media.host, SunshinePhaseConnected, "", "none", 0);
+  // 按新尺寸重启的串流已经建立：这是 Sunshine 的唯一正 ack（没有服务端应答）。
+  // 没有 in-flight 请求时该调用是空操作。
+  if (media.host->finishDesktopSizeRequest != nullptr)
+    media.host->finishDesktopSizeRequest(media.host->user, media.generation, 0, 0, true);
   logWarn("sunshine connection established");
 }
 
@@ -680,6 +745,15 @@ void setHdrModeCallback(bool hdrEnabled) {
 bool hasHevcHardwareDecoder() {
   return OH_AVCodec_GetCapabilityByCategory(OH_AVCODEC_MIMETYPE_VIDEO_HEVC, false,
                                             HARDWARE) != nullptr;
+}
+
+// resize 码率用的编解码系数：以当前流实际协商到的格式为准（H265 / Main10 等
+// VIDEO_FORMAT_MASK_H265 内为 HEVC -> 0.7，其余含 H.264 -> 1.0）。首次协商前
+// （格式未知）按「自动且设备有 HEVC 硬解」处理，与 chooseVideoFormats() 一致。
+bool resizeUsesHevc(const SunshineOptions& options) {
+  const int format = g_media.negotiatedVideoFormat.load();
+  if (format != 0) return (format & VIDEO_FORMAT_MASK_H265) != 0;
+  return options.formats.empty() && hasHevcHardwareDecoder();
 }
 
 // "h264,hevc" -> VIDEO_FORMAT_* 掩码。空串返回 0（交给自动探测）。大小写不敏感，
@@ -984,11 +1058,15 @@ PickLaunchOutcome pickAndLaunchApp(
 // ---------------------------------------------------------------------------
 struct MediaOutcome {
   MediaOutcome()
-      : stopped(false), connected(false), restart(false), terminationCode(0),
-        pictureMs(0), failedStage(0) {}
+      : stopped(false), connected(false), restart(false), resize(false),
+        resizeWidth(0), resizeHeight(0), terminationCode(0), pictureMs(0),
+        failedStage(0) {}
   bool stopped;    // 宿主已要求停止
   bool connected;  // LiStartConnection 成功过
   bool restart;    // generation 变化（手动重连），应立即进入下一次尝试
+  bool resize;     // 客户端请求按新尺寸重启（窗口调整分辨率）
+  int resizeWidth;
+  int resizeHeight;
   std::string text;  // 启动失败或终止原因
   int terminationCode;        // common-c 终止错误码（0 / -1 = 主机结束类）
   unsigned long long pictureMs;  // 本次会话正常画面持续时长（0 = 从未有画面）
@@ -1258,13 +1336,43 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
   std::thread inputThread;
   try {
     inputThread = std::thread(
-        [&host, &media, &inputSink, &applied, &inputDone, streamStart]() {
+        [&host, &media, &inputSink, &applied, &inputDone, streamStart, generation]() {
       int ticks = 0;
+      int cursorToggleLogs = 0;
       while (!inputDone.load()) {
         if (host.stopRequested(host.user) || media.terminated.load()) break;
+        // drainInput() 内部逐条调用 sink -> LiSend*，返回即已发出；这里紧接着只做
+        // 2 ms 的兜底轮询等待（不做任何额外 sleep 或攒批），把输入延迟压到最低。
         if (host.drainInput != nullptr)
           host.drainInput(host.user, &inputSink, &applied);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // 主机光标切换（本地光标模式）：Sunshine input.cpp apply_shortcut 在
+        // Ctrl+Alt+Shift+VKEY_N 按下时翻转全局 display_cursor，并且这个组合键
+        // 不传给桌面。必须在输入流就绪后发送，所以放在这里（2 ms 节拍）；
+        // 发送失败（例如 -2 输入流未就绪）时保持待发，下一 tick 重试。
+        if (host.takeCursorHiddenRequest != nullptr) {
+          bool hidden = false;
+          if (host.takeCursorHiddenRequest(host.user, &hidden)) {
+            const char chordModifiers = static_cast<char>(
+                MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT);
+            const int down =
+                LiSendKeyboardEvent(0x4E, KEY_ACTION_DOWN, chordModifiers);
+            const int up =
+                LiSendKeyboardEvent(0x4E, KEY_ACTION_UP, chordModifiers);
+            if (down == 0 && up == 0) {
+              logWarn(formatText(
+                  "sunshine: host cursor %s (Ctrl+Alt+Shift+N sent)",
+                  hidden ? "hidden" : "shown"));
+              if (host.noteCursorHidden != nullptr)
+                host.noteCursorHidden(host.user, generation, hidden);
+            } else if (cursorToggleLogs < 3) {
+              ++cursorToggleLogs;
+              logWarn(formatText(
+                  "sunshine: host cursor toggle deferred (down=%d, up=%d); will retry",
+                  down, up));
+            }
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         // 连上了但 5 秒还没有任何解码帧：打一行 W 级日志（只打一次），说明卡在
         // 视频阶段，而不是让用户对着黑屏猜。
         if (!media.firstFrameTimeoutLogged.load() &&
@@ -1281,8 +1389,9 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
                 elapsedMs, LiGetStageName(stage), stage));
           }
         }
-        // 每 5 秒打一次媒体计数（只读计数，不含任何画面内容）。
-        if (++ticks % 500 == 0 && media.video != nullptr) {
+        // 每 5 秒打一次媒体计数（只读计数，不含任何画面内容）。2 ms 节拍下
+        // 2500 个 tick = 5 秒。
+        if (++ticks % 2500 == 0 && media.video != nullptr) {
           const SunshineVideoStats videoStats = media.video->stats();
           const SunshineAudioStats audioStats =
               media.audio != nullptr ? media.audio->stats() : SunshineAudioStats();
@@ -1296,6 +1405,35 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
               videoStats.frames, videoStats.idrFrames, videoStats.bytes,
               audioStats.packets, audioStats.bytes, picture.blackMs,
               picture.lastFrameAgeMs, g_autoReconnects.load()));
+          // 输入延迟窗口：入队 -> LiSend* 返回的平均/P95（毫秒）+ 发送次数/失败数。
+          const InputWindowStats inputStats = media.input.takeStats();
+          logWarn(formatText(
+              "sunshine input: queueLag=%.2f/%.2f sendCalls=%llu sendFail=%llu "
+              "(avg/p95 ms, samples=%llu)",
+              inputStats.avgMs, inputStats.p95Ms, inputStats.sendCalls,
+              inputStats.sendFail,
+              static_cast<unsigned long long>(inputStats.samples)));
+          // 视频链路分段耗时（同一 5 秒窗口，avg/p95 毫秒）：
+          //   解码侧（sunshine_video.cxx）netToSubmit / submitToOutput / convert /
+          //     commit 与 in/dec 帧率；
+          //   渲染侧（render.cxx）实际上屏帧率 out、取帧滞后 lag、取帧到 swap 返回
+          //     的 swap。
+          // 两边都是进程级只读快照，读它不阻塞解码或渲染线程。
+          const SunshineVideoPerf videoPerf = sunshineVideoPerf();
+          const RenderFramePerf renderPerf = renderFramePerf();
+          logWarn(formatText(
+              "sunshine perf: in=%.1ffps dec=%.1ffps out=%.1ffps "
+              "netToSubmit=%.1f/%.1f submitToOutput=%.1f/%.1f convert=%.1f/%.1f "
+              "commit=%.1f/%.1f lag=%.1f/%.1f swap=%.1f/%.1f (avg/p95 ms, "
+              "window=%llums, dropped=%llu)",
+              videoPerf.inFps, videoPerf.decFps, renderPerf.outFps,
+              videoPerf.netToSubmitAvgMs, videoPerf.netToSubmitP95Ms,
+              videoPerf.submitToOutputAvgMs, videoPerf.submitToOutputP95Ms,
+              videoPerf.convertAvgMs, videoPerf.convertP95Ms,
+              videoPerf.commitAvgMs, videoPerf.commitP95Ms,
+              renderPerf.lagAvgMs, renderPerf.lagP95Ms,
+              renderPerf.pickupToSwapAvgMs, renderPerf.pickupToSwapP95Ms,
+              videoPerf.windowMs, videoPerf.droppedUnits));
         }
       }
         });
@@ -1305,13 +1443,42 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
     logWarn("sunshine: cannot create the input thread; input disabled for this stream");
   }
 
-  // 连接期间的等待循环：停止、对端终止或换代（手动重连）三者之一。
+  // 连接期间的等待循环：停止、对端终止、换代（手动重连）或分辨率调整。
+  int resizePollTicks = 0;
   while (!host.stopRequested(host.user) && !media.terminated.load()) {
     const int currentGeneration =
         host.generation != nullptr ? host.generation(host.user) : generation;
     if (currentGeneration != generation) {
       outcome.restart = true;
       break;
+    }
+    // 每 200ms（20 个 10ms 节拍）取一次客户端主动分辨率请求。take 之后请求槽
+    // 处于 in-flight，处理期间再来的请求只覆盖待发槽（最后一个生效），下一次
+    // 轮询会再处理——与 RDP 的请求槽语义一致。
+    if (host.takeDesktopSizeRequest != nullptr && ++resizePollTicks >= 20) {
+      resizePollTicks = 0;
+      int resizeWidth = 0;
+      int resizeHeight = 0;
+      if (host.takeDesktopSizeRequest(host.user, &resizeWidth, &resizeHeight)) {
+        if (resizeWidth == options.width && resizeHeight == options.height) {
+          // 和当前流尺寸相同：不需要重启，直接 ack。
+          if (host.finishDesktopSizeRequest != nullptr)
+            host.finishDesktopSizeRequest(host.user, generation, resizeWidth,
+                                          resizeHeight, true);
+        } else {
+          // 立即进入 reconnecting（适配层在 take 时已写好 resize 标记）；真正的
+          // 停流/重新 launch 由外层循环完成。
+          logWarn(formatText("sunshine: resize request %dx%d (current %dx%d)",
+                             resizeWidth, resizeHeight, options.width,
+                             options.height));
+          setHostPhase(host, SunshinePhaseReconnecting,
+                       "正在按窗口调整分辨率…", "none", 0);
+          outcome.resize = true;
+          outcome.resizeWidth = resizeWidth;
+          outcome.resizeHeight = resizeHeight;
+          break;
+        }
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -1340,6 +1507,14 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
 }
 
 }  // namespace
+
+// 输入队列延迟样本：由 diagnostics.cxx 的 drain 适配层在每次 sink 调用（即
+// LiSend* 返回）之后调用，入参是「入队 -> 发送返回」的微秒数。只在后端输入线程
+// 上调用，所以直接写 InputTranslator 的窗口，不加锁。
+void sunshineNoteInputQueueLag(unsigned long long lagUs) {
+  if (!g_media.active.load()) return;
+  g_media.input.noteLag(lagUs);
+}
 
 // 视频解码回调线程每帧上报一次（见 sunshine_backend.h）。这里只写原子时间戳：
 // 不读时钟、不加锁，所以对解码线程的开销是一次 store。
@@ -1440,6 +1615,12 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
   }
 
   g_lastPhase.store(-1);
+  // 会话内可变副本：分辨率调整会改宽高与码率（原始 options 只作为缩放基准）。
+  SunshineOptions current = options;
+  // 码率缩放基准：会话选项里的原始分辨率与码率。
+  const long long basePixels =
+      static_cast<long long>(options.width) * options.height;
+  const int baseBitrate = options.bitrate;
   int lastApplied = 0;
   int backoffMs = 1000;
   int transportPairFailures = 0;
@@ -1460,17 +1641,52 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
   std::chrono::steady_clock::time_point reconnectDeadline =
       std::chrono::steady_clock::now();
 
+  int generation = 0;
+  // 分辨率调整的续跑标记：下一次尝试沿用同一个 generation，并且不重置请求槽
+  // （beginAttempt 会清 desktopPending/desktopAwaiting，而 in-flight 与处理期间
+  // 到达的最新请求必须保留）。
+  bool resizeContinuation = false;
+  // 分辨率调整续播成功后，下一次迭代直接用它起流（跳过 identity/probe/applist）。
+  bool pendingResumeLaunch = false;
+  tg::sunshine::SessionLaunch resumeLaunch;
+  std::string resumeAppVersion;
+  std::string resumeGfeVersion;
+  int resumeCodecSupport = 0;
+  // 客户端跨迭代保留：续播路径不重建它（后续的 cancel/launch 还要用）。
+  std::unique_ptr<tg::sunshine::NvHttpClient> client;
   while (!host.stopRequested(host.user)) {
-    const int generation = host.beginAttempt(host.user, &lastApplied);
+    const bool continuation = resizeContinuation;
+    resizeContinuation = false;
+    if (!continuation) generation = host.beginAttempt(host.user, &lastApplied);
     // 自动重连窗口里不要先跳回 connecting：UI 的「正在重新连接…」只在
-    // reconnecting 状态显示，探测/重试期间保持该状态直到真正连上。
-    if (autoReconnects == 0)
+    // reconnecting 状态显示，探测/重试期间保持该状态直到真正连上。分辨率调整
+    // 同理，保持 reconnecting 直到新尺寸的串流建立。
+    if (autoReconnects == 0 && !continuation)
       setHostPhase(host, SunshinePhaseConnecting, "", "none", 0);
 
     try {
+      // 本次尝试要用的服务端信息与 launch 结果。分辨率调整的续播（/resume 已在
+      // 上一次迭代末尾拿到新的 sessionUrl0/rikey）直接复用，跳过整段控制面。
+      tg::sunshine::ServerInfo info;
+      tg::sunshine::SessionLaunch launch;
+      bool startReady = false;
+      bool resumedFastPath = false;
+      if (pendingResumeLaunch) {
+        pendingResumeLaunch = false;
+        resumedFastPath = true;
+        launch = resumeLaunch;
+        info.appversion = resumeAppVersion;
+        info.gfe_version = resumeGfeVersion;
+        info.server_codec_mode_support = static_cast<uint32_t>(resumeCodecSupport);
+        logWarn(formatText(
+            "sunshine: resize continuation (%dx%d) uses the /resume session",
+            current.width, current.height));
+        startReady = true;
+      }
+      if (!startReady) {
       // 1. 客户端身份（证书/私钥/uniqueid），缺失时生成并落盘。
       const tg::sunshine::Identity identity =
-          tg::sunshine::load_or_create_identity(options.stateDir);
+          tg::sunshine::load_or_create_identity(current.stateDir);
       logDebug(formatText("sunshine identity ready (created_now=%d)",
                           identity.created_now ? 1 : 0));
 
@@ -1482,16 +1698,14 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
                                : (options.port > 5
                                       ? static_cast<uint16_t>(options.port - 5)
                                       : 0);
-      std::unique_ptr<tg::sunshine::NvHttpClient> client(
-          new tg::sunshine::NvHttpClient(
-              makeClientOptions(options, httpsPort, probeTimeoutMs)));
+      client.reset(new tg::sunshine::NvHttpClient(
+          makeClientOptions(current, httpsPort, probeTimeoutMs)));
 
       // 3. /serverinfo。首次连接：完整探测（明文拿 HttpsPort + HTTPS），10 s 超时。
       //    重连：只走 HTTPS 快路径 + 1 s 退避重试（见 probeHttpsWithRetry），超时
       //    类失败不再退回明文长探测；只有 401/403（证书不再被接受）才补一次完整
       //  探测去走配对流程。
       tg::sunshine::ServerInfoProbe probe;
-      tg::sunshine::ServerInfo info;
       bool needFullProbe = firstAttempt;
       if (!firstAttempt) {
         if (savedHttpsPort == 0) {
@@ -1536,7 +1750,7 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
           // 服务端在别的 HTTPS 端口上：按它公布的值重建客户端并重新探测。
           httpsPort = static_cast<uint16_t>(info.https_port);
           client.reset(new tg::sunshine::NvHttpClient(
-              makeClientOptions(options, httpsPort, probeTimeoutMs)));
+              makeClientOptions(current, httpsPort, probeTimeoutMs)));
           probe = client->get_server_info();
           info = probe.server;
         }
@@ -1631,13 +1845,12 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
                            cachedAppTitle.c_str(), cachedAppId));
       }
       tg::sunshine::LaunchOptions launchOptions;
-      launchOptions.width = options.width;
-      launchOptions.height = options.height;
-      launchOptions.fps = options.fps;
-      tg::sunshine::SessionLaunch launch;
+      launchOptions.width = current.width;
+      launchOptions.height = current.height;
+      launchOptions.fps = current.fps;
       bool resumed = false;
       const PickLaunchOutcome pickOutcome = pickAndLaunchApp(
-          host, generation, *client, options, &info, &cachedAppId, &cachedAppTitle,
+          host, generation, *client, current, &info, &cachedAppId, &cachedAppTitle,
           &launchOptions, &launch, &resumed);
       if (pickOutcome == PickLaunchAborted) {
         if (host.stopRequested(host.user)) break;
@@ -1652,14 +1865,97 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
       logWarn(formatText("sunshine launch: app=\"%s\" (id %d), resumed=%d, sessionUrl set=%d",
                          cachedAppTitle.c_str(), cachedAppId, resumed ? 1 : 0,
                          launch.session_url0.empty() ? 0 : 1));
+      }  // !startReady（控制面）
+
+      logWarn(formatText("sunshine stream start: %dx%d @ %d fps, %d kbps, resume=%d",
+                         current.width, current.height, current.fps,
+                         current.bitrate, resumedFastPath ? 1 : 0));
 
       // 7. 串流（阻塞到终止 / 停止 / 换代）。
       const MediaOutcome outcome =
-          runMediaStream(host, options, info.appversion, info.gfe_version,
+          runMediaStream(host, current, info.appversion, info.gfe_version,
                          static_cast<int>(info.server_codec_mode_support),
                          launch.session_url0, launch.rikey, launch.rikeyid,
                          generation);
       backoffMs = 1000;
+      // 分辨率调整（窗口拖动/最大化/全屏）：停流 -> /cancel -> 用新尺寸重新
+      // launch（Moonlight 的分辨率只能在 launch 时指定）。整个调整沿用同一个
+      // generation（不重置请求槽），也不计入 network 重连次数。
+      if (outcome.resize && !outcome.stopped) {
+        const int newWidth = outcome.resizeWidth;
+        const int newHeight = outcome.resizeHeight;
+        // new = baseBitrate × (pixels/basePixels)^0.8 × (HEVC ? 0.7 : 1.0)。
+        // 0.8 次幂让码率随像素增长得比线性慢；HEVC 再打 0.7（同画质更省）。
+        const double ratio =
+            basePixels > 0
+                ? static_cast<double>(newWidth) * newHeight /
+                      static_cast<double>(basePixels)
+                : 1.0;
+        const bool hevc = resizeUsesHevc(options);
+        const double codecFactor = hevc ? 0.7 : 1.0;
+        const double raw = static_cast<double>(baseBitrate) *
+                           std::pow(ratio, 0.8) * codecFactor;
+        long long rounded = 0;
+        if (!std::isfinite(raw)) {
+          // NaN/inf 按钳位处理：NaN 落最小值，+inf 落最大值。
+          rounded = raw > 0.0 ? 80000 : 15000;
+        } else {
+          rounded = static_cast<long long>(std::llround(raw / 1000.0)) * 1000;
+        }
+        // 四舍五入到 1000 kbps，再钳在 15000..80000。
+        rounded = std::max(15000LL, std::min(80000LL, rounded));
+        const int newBitrate = static_cast<int>(rounded);
+        logWarn(formatText(
+            "sunshine: resize request %dx%d -> ratio %.3f, codec %s (factor %.1f), "
+            "scaled bitrate %d kbps (base %dx%d %d kbps)",
+            newWidth, newHeight, ratio, hevc ? "HEVC" : "H.264", codecFactor,
+            newBitrate, options.width, options.height, baseBitrate));
+        current.width = newWidth;
+        current.height = newHeight;
+        current.bitrate = newBitrate;
+        // 续播优先：/resume 带新 mode，Sunshine 返回新的 sessionUrl0/rikey/
+        // rikeyid，新流按新分辨率出画。实测停流→首帧约 11.4 s、0 次 RTSP 失败；
+        // 而「cancel → 立即再 launch」会撞上陈旧会话，RTSP 握手要等 ~20 s。
+        tg::sunshine::LaunchOptions resumeOptions;
+        resumeOptions.app_id = cachedAppId;
+        resumeOptions.width = newWidth;
+        resumeOptions.height = newHeight;
+        resumeOptions.fps = current.fps;
+        const std::chrono::steady_clock::time_point resumeStart =
+            std::chrono::steady_clock::now();
+        try {
+          const tg::sunshine::SessionLaunch resumedLaunch =
+              client->resume(resumeOptions);
+          const long long resumeMs = static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - resumeStart).count());
+          logWarn(formatText(
+              "sunshine: resize via /resume ok in %lld ms; starting new stream",
+              resumeMs));
+          resumeLaunch = resumedLaunch;
+          resumeAppVersion = info.appversion;
+          resumeGfeVersion = info.gfe_version;
+          resumeCodecSupport = static_cast<int>(info.server_codec_mode_support);
+          pendingResumeLaunch = true;
+          resizeContinuation = true;
+          continue;
+        } catch (const tg::sunshine::PinMismatchError&) {
+          throw;
+        } catch (const std::exception& error) {
+          // 续播失败（HTTP 非 200、nv_status_code 4xx、超时等）：退回原路径
+          // 「/cancel -> 等 FREE -> /launch」，保留陈旧会话清理逻辑。
+          const long long failedMs = static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - resumeStart).count());
+          logWarn(formatText(
+              "sunshine: resize /resume failed after %lld ms (%s); falling back to "
+              "cancel + launch",
+              failedMs, error.what()));
+        }
+        if (client != nullptr) cancelServerSession(*client);
+        resizeContinuation = true;
+        continue;
+      }
       // 主机已经结束串流（0/-1）时它自己已经清理过会话，再 /cancel 只会白等一次
       // 网络超时（真机实测 10.5 s）。只有客户端主动停止、或其它错误码（服务端上
       // 可能还留着会话）才发 /cancel。closeSession() 只置 stop 并唤醒本线程，
@@ -1668,7 +1964,8 @@ void runSunshineSession(const SunshineHost& host, const SunshineOptions& options
       const bool hostEndedStream =
           outcome.connected &&
           (outcome.terminationCode == 0 || outcome.terminationCode == -1);
-      if (outcome.stopped || !hostEndedStream) cancelServerSession(*client);
+      if (client != nullptr && (outcome.stopped || !hostEndedStream))
+        cancelServerSession(*client);
       if (outcome.stopped) break;
       if (outcome.restart) {
         // 用户手动重连：重新给 3 次「无画面自动重连」机会。

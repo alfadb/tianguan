@@ -39,6 +39,15 @@ std::string forgetTrustedFingerprint(const std::string& sessionId);
 // not exactly 4 digits. The backend takes it once ("PIN 用完即清"); it is never
 // logged and never part of the status JSON.
 bool submitPin(const std::string& sessionId, const std::string& pin);
+// Sunshine only: hide/show the host's cursor ("local cursor" mode). Sunshine draws
+// its cursor inside the video, so the client hides it with the Ctrl+Alt+Shift+N
+// shortcut and shows its own. The host state is process-global and cannot be
+// queried, so the client records it (statusJson().remoteCursorHidden) and ArkTS
+// persists it; it goes back to "shown" when Sunshine restarts. Returns true when
+// the request is satisfied or accepted; false for an unknown / non-Sunshine /
+// not-connected session (in the not-connected case the desired state is still
+// recorded and sent once the connection is established).
+bool setRemoteCursorHidden(const std::string& sessionId, bool hidden);
 // Writes the pending region or a full BGRA_8888 frame into dst. Returns JSON
 // metadata, "NONE" when there is nothing newer than afterVersion, or
 // "ERROR:BUFFER_TOO_SMALL" without touching dst.
@@ -59,6 +68,11 @@ struct FrameGrab {
   int version = 0;         // mirror version after this grab
   int generation = 0;      // connection that produced that version
   int fbWidth = 0, fbHeight = 0;   // current mirror geometry
+  // steady_clock microseconds (since epoch) of the commit that produced this
+  // version, 0 when the producer does not timestamp frames. A consumer computes
+  // lag = now - commitTimeUs; the value is only meaningful together with the
+  // same clock (render.h's RenderFramePerf.lagAvgMs). Sunshine commits set it.
+  long long commitTimeUs = 0;
 };
 enum FrameGrabStatus {
   FrameGrabNone,            // "NONE"

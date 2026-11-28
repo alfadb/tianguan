@@ -82,7 +82,7 @@ import {
   requestFullFrame, requestDesktopSize, sendKey, sendPointer, sessionStatus, submitPin,
   takeFrameRaw,
   attachRenderSurface, detachRenderSurface, renderStats, setViewTransform, suspendRenderSurface,
-  syncRemoteLockState,
+  syncRemoteLockState, setRemoteCursorHidden,
   SESSION_STATE_CONNECTED, SESSION_STATE_FAILED, SESSION_STATE_TRUST_REQUIRED,
   SESSION_STATE_PAIRING_REQUIRED, SESSION_ERROR_SESSION_TAKEN_OVER, SESSION_ERROR_PAIR_FAILED
 } from '../diag/SessionApi';
@@ -93,12 +93,16 @@ import {
 } from '../model/SessionRegistry';
 import type { SessionsChangeListener } from '../model/SessionRegistry';
 import {
-  findConnection, pinKeyFor, readTrustedFingerprint, trustFingerprint
+  findConnection, pinKeyFor, readTrustedFingerprint, trustFingerprint, upsertConnection
 } from '../model/ConnectionStore';
+import type { ConnectionEntry } from '../model/ConnectionStore';
 import { onRemoteClipboardVersion, clipboardRegisterSession,
   clipboardUnregisterSession, clipboardSetSessionVisible,
   clipboardRequestReadPermission } from '../clipboard/TianguanClipboard';
 import { closeRemoteWindow, remoteReopenKeyForSession, sessionKeyForWindow } from '../windows/RemoteWindows';
+import { selectSunshineMode } from '../model/SunshineResolutions';
+import { containGeometry, pointInPicture, remotePointInPicture, hidesSystemPointer } from '../model/PictureGeometry';
+import type { PictureGeometry } from '../model/PictureGeometry';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'TianguanDiag';
@@ -538,6 +542,13 @@ const RESIZE_DISABLE_REASON_REJECTED: string = 'resizeSupport=rejected';
 // later drag and stayed letterboxed until a reconnect.
 const RESIZE_MAX_FAILED_TARGETS: number = 3;
 
+// --- Sunshine mode selection -----------------------------------------------
+// The backend stops, cancels and restarts the whole stream for a size change,
+// so it is much more expensive than an RFB/RDP resize: a longer debounce and a
+// hard 2 s minimum between requests (a drag produces many interim sizes).
+const SUNSHINE_RESIZE_SETTLE_MS: number = 700;
+const SUNSHINE_RESIZE_MIN_INTERVAL_MS: number = 2000;
+
 // --- Fullscreen -------------------------------------------------------------
 // recover() resolves before the window manager has re-laid out the restored
 // window, so the rect is read again after the restore settles. The fullscreen
@@ -664,6 +675,8 @@ struct Remote {
    * their own except after an explicit reconnect).
    */
   @State private reconnectingHintVisible: boolean = false;
+  /** Sunshine only: the reconnect is a requested resolution change (status.resize). */
+  @State private reconnectingResizeHint: boolean = false;
   /**
    * Sunshine only: native status.pictureBlack is true while the decoded picture
    * has been continuously black (or no frame arrived) for >= 3 s, which usually
@@ -805,6 +818,19 @@ struct Remote {
   // remote cursor is unmounted: the system pointer is visible there and a stale
   // remote cursor image would be left floating over the picture.
   @State private cursorOverlayHidden: boolean = false;
+  /**
+   * True while the pointer is over remote_area (set by its onHover). The system
+   * pointer is hidden only when this is ALSO true of the presented picture
+   * rectangle: over the black bars the normal pointer stays visible.
+   */
+  private pointerOverPicture: boolean = false;
+  /** Last system-pointer visibility applied (avoids a NAPI call per poll). */
+  private hostPointerVisible: boolean = true;
+  // Sunshine local cursor (Moonlight style): the saved connection preference
+  // (default ON, read in bootstrap) and the host-wide cursor state the backend
+  // reports. The system pointer is the cursor while localCursor is on.
+  @State private sunshineLocalCursor: boolean = false;
+  @State private remoteCursorHidden: boolean = false;
   private bubbleMenuHideTimer: number = -1;
   private bubbleMenuHintHideTimer: number = -1;
   // Cached vp2px(16) for the menu icon drawing area (px). commands and stroke
@@ -900,6 +926,29 @@ struct Remote {
   // -1 = not armed; otherwise the render frame count seen at the generation
   // change.
   private resizeResyncFrameBase: number = -1;
+  // --- Sunshine automatic mode selection (see model/SunshineResolutions.ets) --
+  // Sunshine ignores the VNC/RDP target rules above: the stream is restarted at
+  // one of the host's virtual-display modes, chosen by the picture area. Its own
+  // debounce (700 ms) / minimum interval (2 s) / first-report guard apply.
+  private sunshineProtocol: boolean = false;
+  private sunshineFollowTimer: number = -1;
+  /** Last size sent to requestDesktopSize() / reported as the stream size. */
+  private sunshineStreamW: number = 0;
+  private sunshineStreamH: number = 0;
+  private sunshineLastRequestMs: number = 0;
+  private sunshineLastTargetW: number = 0;
+  private sunshineLastTargetH: number = 0;
+  /**
+   * Picture area reported by the ONE first connection of this window. That is
+   * the "first size report": the stream already runs at the configured
+   * sunshineWidth/Height, so this exact area must not restart it. Later
+   * connections (network drop / host end / our own resize restart) clear it and
+   * re-evaluate immediately on `connected` instead (see applyStatus).
+   */
+  private sunshineSkipAreaW: number = 0;
+  private sunshineSkipAreaH: number = 0;
+  /** True once this window has completed its very first connection. */
+  private sunshineFirstConnectionDone: boolean = false;
   private lastTouchX: number = -1;
   private lastTouchY: number = -1;
   private viewPointerX: number = -1;
@@ -1094,6 +1143,18 @@ struct Remote {
     }
     hilog.info(DOMAIN, TAG, 'remote 页面启动 session=%{public}s window=%{public}s',
       this.sessionId, this.ownWindowName);
+    // Sunshine restarts the whole stream for a size change: its follow uses the
+    // host mode table and starts from the connection's configured stream size.
+    this.sunshineProtocol = this.sessionProtocol() === 'sunshine';
+    this.resyncSunshineResizeFollow();
+    // Sunshine local cursor: the saved connection preference decides whether the
+    // host cursor is hidden for this page; the recorded host state seeds the
+    // value until the first status poll reports the authoritative one.
+    const cursorEntry = this.connectionEntry();
+    this.sunshineLocalCursor = this.sunshineProtocol && cursorEntry !== undefined &&
+      cursorEntry.sunshineLocalCursor !== false;
+    this.remoteCursorHidden = cursorEntry !== undefined &&
+      cursorEntry.sunshineHostCursorHidden === true;
     markWindowOpen(this.sessionId, true);
     clipboardRegisterSession(this.sessionId);
     // onPageShow may have run (or not) before the session id was known; keep the
@@ -1251,6 +1312,9 @@ struct Remote {
   }
 
   private setHostCursorVisible(visible: boolean): void {
+    // Remember what was applied even when the call fails: refreshCursorVisibility()
+    // only re-issues the call when the desired state changes.
+    this.hostPointerVisible = visible;
     try {
       pointer.setPointerVisible(visible).catch((error: Error): void => {
         hilog.error(DOMAIN, TAG, '光标可见性设置失败：%{public}s', String(error));
@@ -1998,33 +2062,46 @@ struct Remote {
 
   /**
    * PC: 3 buttons; phone: 2 (no fullscreen). Tablet keeps 3 (fullscreen), but
-   * its first button is "主列表" like the phone. The first button is always at
-   * the -end of the fan.
+   * its first button is "主列表" like the phone. A Sunshine session adds the
+   * 本地光标 toggle just before 断开. The first button is always at the -end of
+   * the fan and 断开 at the +end.
    */
   private bubbleMenuCount(): number {
-    return this.phoneUi ? 2 : 3;
+    const base = this.phoneUi ? 2 : 3;
+    return this.sunshineProtocol ? base + 1 : base;
   }
 
   private bubbleMenuAction(index: number): string {
+    const count = this.bubbleMenuCount();
+    if (index === count - 1) {
+      return 'disconnect';
+    }
+    if (this.sunshineProtocol && index === count - 2) {
+      return 'local-cursor';
+    }
     if (index === 0) {
       // 2-in-1 minimises its floating window; phone/tablet raise the connection
       // list instead because minimize() would background the whole app task.
       return this.pcUi ? 'minimize' : 'main-list';
     }
-    if (this.phoneUi) {
-      return 'disconnect';
-    }
-    return index === 1 ? 'fullscreen' : 'disconnect';
+    return 'fullscreen';
   }
 
   private bubbleMenuLabel(index: number): string {
-    if (index === 0) {
-      return this.pcUi ? '最小化' : '主列表';
+    const action = this.bubbleMenuAction(index);
+    if (action === 'local-cursor') {
+      return '本地光标（' + (this.sunshineLocalCursor ? '开' : '关') + '）';
     }
-    if (this.phoneUi) {
-      return '断开';
+    if (action === 'minimize') {
+      return '最小化';
     }
-    return index === 1 ? (this.fullscreen ? '退出全屏' : '全屏') : '断开';
+    if (action === 'main-list') {
+      return '主列表';
+    }
+    if (action === 'fullscreen') {
+      return this.fullscreen ? '退出全屏' : '全屏';
+    }
+    return '断开';
   }
 
   private bubbleMenuDanger(index: number): boolean {
@@ -2092,6 +2169,11 @@ struct Remote {
         m(14, 10) + l(14, 14) + l(10, 14) +
         m(6, 14) + l(2, 14) + l(2, 10);
     }
+    if (action === 'local-cursor') {
+      // Arrow pointer outline (16-unit grid): the "local cursor" mark.
+      return m(3, 1.5) + l(3, 13) + l(6.2, 10) + l(8.4, 14.5) +
+        l(10.8, 13.4) + l(8.6, 9.2) + l(12.8, 8.6) + l(3, 1.5);
+    }
     return m(1.5, 1.5) + l(14.5, 14.5) + m(14.5, 1.5) + l(1.5, 14.5);
   }
 
@@ -2115,14 +2197,26 @@ struct Remote {
       BUBBLE_MENU_SAFE_VP, h - BUBBLE_MENU_SAFE_VP);
   }
 
+  /**
+   * Evenly spaced fan angles from -span/2 to +span/2. For 2 and 3 buttons this is
+   * bit-for-bit the previous layout ([±span/2] and [-span/2, 0, +span/2]); a
+   * Sunshine session adds a 4th button and gets [-span/2, -span/6, +span/6,
+   * +span/2].
+   */
   private bubbleMenuAnglesFor(count: number, centerDeg: number, spanDeg: number): number[] {
-    if (count <= 1) {
-      return [centerDeg];
+    const angles: number[] = [];
+    if (count <= 0) {
+      return angles;
     }
-    if (count === 2) {
-      return [centerDeg - spanDeg / 2, centerDeg + spanDeg / 2];
+    if (count === 1) {
+      angles.push(centerDeg);
+      return angles;
     }
-    return [centerDeg - spanDeg / 2, centerDeg, centerDeg + spanDeg / 2];
+    const step = spanDeg / (count - 1);
+    for (let i = 0; i < count; i++) {
+      angles.push(centerDeg - spanDeg / 2 + step * i);
+    }
+    return angles;
   }
 
   private bubbleMenuAngleGap(a: number, b: number): number {
@@ -2207,6 +2301,8 @@ struct Remote {
       this.returnToMainList();
     } else if (action === 'fullscreen') {
       this.toggleFullscreen();
+    } else if (action === 'local-cursor') {
+      this.toggleSunshineLocalCursor();
     } else if (action === 'disconnect') {
       this.disconnectThisSession();
     }
@@ -2332,29 +2428,39 @@ struct Remote {
     return width.toString() + 'x' + height.toString();
   }
 
+  /**
+   * Picture area in physical px, or [] when it is not known yet. Both the
+   * VNC/RDP follow and the Sunshine mode selection read the same XComponent
+   * size through this.
+   */
+  private pictureAreaPx(): number[] {
+    if (this.viewWidth <= 0 || this.viewHeight <= 0) {
+      return [];
+    }
+    try {
+      // vp2px uses this window's density; the XComponent surface is allocated
+      // at this physical size, so this is the picture area in px (not vp).
+      const ui = this.getUIContext();
+      const width = Math.round(ui.vp2px(this.viewWidth));
+      const height = Math.round(ui.vp2px(this.viewHeight));
+      return width > 0 && height > 0 ? [width, height] : [];
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'remote resize 读取 surface 物理尺寸失败：%{public}s', String(error));
+      return [];
+    }
+  }
+
   /** Target remote size in px, or [] when this session must not request one. */
   private resizeTarget(): number[] {
     if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
       return [];
     }
-    if (this.viewWidth <= 0 || this.viewHeight <= 0) {
+    const area = this.pictureAreaPx();
+    if (area.length !== 2) {
       return [];
     }
-    let width = 0;
-    let height = 0;
-    try {
-      // vp2px uses this window's density; the XComponent surface is allocated
-      // at this physical size, so this is the picture area in px (not vp).
-      const ui = this.getUIContext();
-      width = Math.round(ui.vp2px(this.viewWidth));
-      height = Math.round(ui.vp2px(this.viewHeight));
-    } catch (error) {
-      hilog.warn(DOMAIN, TAG, 'remote resize 读取 surface 物理尺寸失败：%{public}s', String(error));
-      return [];
-    }
-    if (width <= 0 || height <= 0) {
-      return [];
-    }
+    const width = area[0];
+    const height = area[1];
     this.resizeAreaW = width;
     this.resizeAreaH = height;
     if (this.resizePcForm) {
@@ -2378,9 +2484,228 @@ struct Remote {
     return [targetW, targetH];
   }
 
+  // --- Sunshine automatic mode selection -----------------------------------
+  //
+  // A Sunshine resize is not an in-place RFB/RDP desktop resize: the backend
+  // stops the stream, cancels it and restarts it at one of the host's virtual
+  // display modes (the stream size is reported as status.resize while this
+  // happens). Therefore the window area is mapped onto the host mode table
+  // (model/SunshineResolutions.ets) instead of the local scale rules above, and
+  // the request is throttled much harder.
+
+  /** Saved connection of this session, or undefined for an orphan session. */
+  private connectionEntry(): ConnectionEntry | undefined {
+    const session = findSession(this.sessionId);
+    if (session === undefined || session.connectionId.length === 0) {
+      return undefined;
+    }
+    return findConnection(session.connectionId);
+  }
+
+  /** Configured stream size of the owning connection ('' when unknown). */
+  private sunshineConfiguredSize(): number[] {
+    const entry = this.connectionEntry();
+    if (entry === undefined) {
+      return [];
+    }
+    const width = entry.sunshineWidth;
+    const height = entry.sunshineHeight;
+    if (typeof width !== 'number' || typeof height !== 'number' ||
+        width <= 0 || height <= 0) {
+      return [];
+    }
+    return [width, height];
+  }
+
+  /**
+   * (Re)initialises the Sunshine follow for a connection generation: the stream
+   * restarts at the configured sunshineWidth/Height, so that is the current
+   * stream size until the connected status / status.resize says otherwise.
+   */
+  private resyncSunshineResizeFollow(): void {
+    if (!this.sunshineProtocol) {
+      return;
+    }
+    const configured = this.sunshineConfiguredSize();
+    if (configured.length === 2) {
+      this.sunshineStreamW = configured[0];
+      this.sunshineStreamH = configured[1];
+    }
+    this.sunshineLastTargetW = 0;
+    this.sunshineLastTargetH = 0;
+  }
+
+  /** 700 ms debounce for Sunshine (a drag produces many interim sizes). */
+  private scheduleSunshineResizeFollow(delayMs: number = SUNSHINE_RESIZE_SETTLE_MS): void {
+    if (this.disposed || this.sessionId.length === 0) {
+      return;
+    }
+    if (this.sunshineFollowTimer >= 0) {
+      clearTimeout(this.sunshineFollowTimer);
+    }
+    this.sunshineFollowTimer = setTimeout((): void => {
+      this.sunshineFollowTimer = -1;
+      this.maybeRequestSunshineSize();
+    }, SUNSHINE_RESIZE_SETTLE_MS);
+  }
+
+  /**
+   * Asks the backend to restart the stream at the host mode that best matches
+   * the picture area. Guards: connected only, not the first size report of the
+   * page's first connection, >= 2 s since the previous request, and the target
+   * must differ from both the last request and the current stream size.
+   */
+  private maybeRequestSunshineSize(): void {
+    if (this.disposed || this.sessionId.length === 0 || !this.sunshineProtocol) {
+      return;
+    }
+    if (this.lastState !== SESSION_STATE_CONNECTED) {
+      return;
+    }
+    const area = this.pictureAreaPx();
+    if (area.length !== 2) {
+      return;
+    }
+    if (this.sunshineSkipAreaW > 0 && this.sunshineSkipAreaH > 0 &&
+        Math.abs(area[0] - this.sunshineSkipAreaW) <= FOLLOW_TOLERANCE_PX &&
+        Math.abs(area[1] - this.sunshineSkipAreaH) <= FOLLOW_TOLERANCE_PX) {
+      // The size report that came with the window's very first connection: the
+      // stream already runs at the configured sunshineWidth/Height, so
+      // restarting it would be churn. Later connections clear the skip area and
+      // are re-evaluated on connect.
+      return;
+    }
+    const now = Date.now();
+    const sinceLast = now - this.sunshineLastRequestMs;
+    if (sinceLast < SUNSHINE_RESIZE_MIN_INTERVAL_MS) {
+      // Throttled: try once more when the 2 s window opens instead of dropping
+      // this evaluation. The retry re-checks target vs current stream size, so a
+      // just-finished resize restart cannot start another one.
+      this.scheduleSunshineResizeFollow(SUNSHINE_RESIZE_MIN_INTERVAL_MS - sinceLast);
+      return;
+    }
+    const target = selectSunshineMode(area[0], area[1]);
+    if (target.width <= 0 || target.height <= 0) {
+      return;
+    }
+    if (this.sunshineStreamW > 0 && this.sunshineStreamH > 0 &&
+        Math.abs(target.width - this.sunshineStreamW) <= FOLLOW_TOLERANCE_PX &&
+        Math.abs(target.height - this.sunshineStreamH) <= FOLLOW_TOLERANCE_PX) {
+      return;
+    }
+    if (target.width === this.sunshineLastTargetW &&
+        target.height === this.sunshineLastTargetH) {
+      return;
+    }
+    // The attempt is throttled even when the native side refuses it.
+    this.sunshineLastRequestMs = now;
+    this.sunshineLastTargetW = target.width;
+    this.sunshineLastTargetH = target.height;
+    // The first-report skip only ever covers the initial connection's area.
+    this.sunshineSkipAreaW = 0;
+    this.sunshineSkipAreaH = 0;
+    const accepted = requestDesktopSize(this.sessionId, target.width, target.height);
+    if (!accepted) {
+      hilog.warn(DOMAIN, TAG,
+        'sunshine resize 请求未被受理 session=%{public}s area=%{public}dx%{public}d target=%{public}dx%{public}d',
+        this.sessionId, area[0], area[1], target.width, target.height);
+      return;
+    }
+    this.sunshineStreamW = target.width;
+    this.sunshineStreamH = target.height;
+    hilog.info(DOMAIN, TAG,
+      'sunshine resize request session=%{public}s area=%{public}dx%{public}d target=%{public}dx%{public}d',
+      this.sessionId, area[0], area[1], target.width, target.height);
+  }
+
+  // --- Sunshine local cursor -------------------------------------------------
+  //
+  // Moonlight-style: the HOST hides its own cursor and this client shows the
+  // system pointer, which follows the hand with no network latency (at the cost
+  // of a fixed arrow shape). The host state is host-wide and outlives this app,
+  // so it is recorded on the connection and only toggled when needed.
+
+  /** Recorded host cursor state of this session's saved connection. */
+  private recordedHostCursorHidden(): boolean {
+    const entry = this.connectionEntry();
+    return entry !== undefined && entry.sunshineHostCursorHidden === true;
+  }
+
+  /**
+   * Asks the backend to hide (true) / show (false) the host cursor and records
+   * the result. Returns false when the backend refused / the interface is not
+   * available yet.
+   */
+  private applySunshineHostCursorHidden(hidden: boolean): boolean {
+    if (!this.sunshineProtocol || this.sessionId.length === 0) {
+      return false;
+    }
+    const accepted = setRemoteCursorHidden(this.sessionId, hidden);
+    if (!accepted) {
+      // A not-connected session still RECORDS the desired state in the backend
+      // and sends it once connected (see the NAPI contract), so the preference
+      // must not be reverted here — only a refusal on a live session is a real
+      // failure.
+      if (this.lastState === SESSION_STATE_CONNECTED) {
+        hilog.warn(DOMAIN, TAG,
+          'sunshine 本地光标切换未被受理 session=%{public}s hidden=%{public}s',
+          this.sessionId, String(hidden));
+        return false;
+      }
+      hilog.info(DOMAIN, TAG,
+        'sunshine 本地光标期望状态已记录（未连接）session=%{public}s hidden=%{public}s',
+        this.sessionId, String(hidden));
+    }
+    this.remoteCursorHidden = hidden;
+    this.persistSunshineCursorState(this.sunshineLocalCursor, hidden);
+    // The local-cursor mode decides whether the system pointer may be hidden.
+    this.refreshCursorVisibility(true);
+    return true;
+  }
+
+  /**
+   * Records the local-cursor preference and the host cursor state on the saved
+   * connection. findConnection() returns the live record; upsertConnection()
+   * persists a normalized copy, so no other field can be lost.
+   */
+  private persistSunshineCursorState(localCursor: boolean, hostHidden: boolean): void {
+    const entry = this.connectionEntry();
+    if (entry === undefined) {
+      return;
+    }
+    if (entry.sunshineLocalCursor === localCursor &&
+        entry.sunshineHostCursorHidden === hostHidden) {
+      return;
+    }
+    entry.sunshineLocalCursor = localCursor;
+    entry.sunshineHostCursorHidden = hostHidden;
+    upsertConnection(entry);
+  }
+
+  /** 本地光标 radial-menu action (Sunshine only): flips the host cursor state. */
+  private toggleSunshineLocalCursor(): void {
+    if (!this.sunshineProtocol || this.sessionId.length === 0) {
+      return;
+    }
+    const next = !this.sunshineLocalCursor;
+    this.sunshineLocalCursor = next;
+    if (!this.applySunshineHostCursorHidden(next)) {
+      // The host refused (or the native interface is missing): keep the old
+      // preference so the menu label and the record stay truthful.
+      this.sunshineLocalCursor = !next;
+      this.refreshCursorVisibility(true);
+    }
+  }
+
   /** (Re)starts the debounce; only a real area size change calls this. */
   private scheduleResizeFollow(delayMs: number = FOLLOW_SETTLE_MS): void {
     if (!this.followRemoteSize || this.disposed || this.resizeDisabled) {
+      return;
+    }
+    if (this.sunshineProtocol) {
+      // Sunshine must never use the VNC/RDP target rules; its own debounce and
+      // mode table take over.
+      this.scheduleSunshineResizeFollow();
       return;
     }
     if (this.resizeFollowTimer >= 0) {
@@ -2847,6 +3172,9 @@ struct Remote {
       this.frameWidth = stats.texWidth;
       this.frameHeight = stats.texHeight;
     }
+    // The presented rectangle (size, zoom, pan) may have changed: hide the
+    // system pointer only over the picture, so the black bars keep it.
+    this.refreshCursorVisibility();
     if (stats.state === 'running' && stats.frames > 0) {
       this.glReattachCount = 0;
     }
@@ -3223,6 +3551,8 @@ struct Remote {
         this.canvasShown = true;
         // First frame on the Canvas path: same one-shot follow request.
         this.scheduleResizeFollow();
+        // There is a picture now: the pointer rule may hide the system cursor.
+        this.refreshCursorVisibility();
       } else if (this.resizeResyncFrameBase >= 0) {
         // A reconnected desktop gets its own one-shot after its first applied
         // frame (the hook above only fires once per page).
@@ -3434,6 +3764,9 @@ struct Remote {
       this.invalidateRender();
       this.frameWidth = width;
       this.frameHeight = height;
+      // The picture rectangle changed with the new stream size: re-apply the
+      // pointer rule so the black bars keep the normal cursor.
+      this.refreshCursorVisibility();
     }
     // A reconnect (generation bump) rebuilt the native mirror: the local
     // PixelMap now describes a picture that no longer exists. Drop it, so the
@@ -3452,18 +3785,75 @@ struct Remote {
         // The new desktop may have come back at another size: forget the old
         // connection's requested target and evaluate once after its first frame.
         this.resetResizeFollowForReconnect(generation);
+        // Sunshine: a new generation means the stream restarted at the
+        // configured size; the connect boundary below then adopts the actual
+        // negotiated size and re-evaluates once (see the connected transition).
+        if (this.sunshineProtocol) {
+          this.resyncSunshineResizeFollow();
+        }
       }
       this.lastGeneration = generation;
     }
     // Leaving "connected" (reconnect, failure, trust prompt, disconnect) means
     // the server side may never have seen the key/button releases.
-    if (this.lastState === SESSION_STATE_CONNECTED && status.state !== SESSION_STATE_CONNECTED) {
+    const wasConnected = this.lastState === SESSION_STATE_CONNECTED;
+    if (wasConnected && status.state !== SESSION_STATE_CONNECTED) {
       this.releaseAllInputs('state-left-connected');
       // The black-picture hint belongs to a connected picture; leaving the
       // state (reconnect / failure / disconnect) hides it immediately.
       this.pictureBlackHintVisible = false;
     }
     this.lastState = status.state;
+    // Sunshine: `resize` is the stream size the backend restarts at, so it IS
+    // the current stream size for the dedupe in maybeRequestSunshineSize().
+    if (this.sunshineProtocol && status.resize !== undefined) {
+      this.sunshineStreamW = status.resize.width;
+      this.sunshineStreamH = status.resize.height;
+    }
+    // Sunshine: the host cursor state is authoritative in the status; keep the
+    // saved connection in sync whenever it changes (it may change on the host
+    // side or by another client). Applied BEFORE the connect boundary below, so
+    // the mode the boundary re-asserts on a fresh connection is not immediately
+    // overwritten by the stale pre-command value of this same poll.
+    if (this.sunshineProtocol && typeof status.remoteCursorHidden === 'boolean' &&
+        this.remoteCursorHidden !== status.remoteCursorHidden) {
+      this.remoteCursorHidden = status.remoteCursorHidden;
+      this.persistSunshineCursorState(this.sunshineLocalCursor, status.remoteCursorHidden);
+    }
+    // Sunshine connection boundaries. Only the window's FIRST connection skips
+    // its initial size report (the stream already runs at the configured
+    // sunshineWidth/Height). Every later connection — a network drop, the host
+    // ending the stream, or our own resize restart — adopts the negotiated
+    // stream size and re-evaluates once right here, so the stream gets back to
+    // the right mode without the user resizing the window again.
+    if (this.sunshineProtocol && status.state === SESSION_STATE_CONNECTED && !wasConnected) {
+      if (!this.sunshineFirstConnectionDone) {
+        this.sunshineFirstConnectionDone = true;
+        const connectArea = this.pictureAreaPx();
+        if (connectArea.length === 2) {
+          this.sunshineSkipAreaW = connectArea[0];
+          this.sunshineSkipAreaH = connectArea[1];
+        }
+      } else {
+        this.sunshineSkipAreaW = 0;
+        this.sunshineSkipAreaH = 0;
+        if (width > 0 && height > 0) {
+          this.sunshineStreamW = width;
+          this.sunshineStreamH = height;
+        }
+        // lastState is already "connected", so this can send (throttled) now.
+        this.maybeRequestSunshineSize();
+      }
+      // Local cursor: re-assert the host cursor mode on every connection. ON
+      // hides the host cursor (the system pointer becomes the cursor); OFF only
+      // undoes a state this app recorded as its own — the host state is
+      // host-wide, so it is never toggled blindly.
+      if (this.sunshineLocalCursor) {
+        this.applySunshineHostCursorHidden(true);
+      } else if (this.remoteCursorHidden || this.recordedHostCursorHidden()) {
+        this.applySunshineHostCursorHidden(false);
+      }
+    }
     // Clipboard edge: one take per version bump.
     const clip = status.clipboard;
     if (clip !== undefined && typeof clip.version === 'number' &&
@@ -3592,6 +3982,7 @@ struct Remote {
     // The reconnect note only lives while the state is reconnecting; the
     // reconnecting case below re-enables it for Sunshine.
     this.reconnectingHintVisible = false;
+    this.reconnectingResizeHint = false;
     switch (status.state) {
       case SESSION_STATE_CONNECTED:
         // The stream is up: a PIN submitted earlier is confirmed and the
@@ -3602,6 +3993,11 @@ struct Remote {
         // "hidden". A dismissal wins over a later true; a false value hides it.
         this.pictureBlackHintVisible =
           !this.pictureBlackHintDismissed && status.pictureBlack === true;
+        // The negotiated stream size is authoritative once the stream is up.
+        if (this.sunshineProtocol && width > 0 && height > 0) {
+          this.sunshineStreamW = width;
+          this.sunshineStreamH = height;
+        }
         this.statusText = '已连接（实时刷新）';
         if (!USE_GL_RENDER) {
           // GL mode: the native render thread consumes frames itself; the
@@ -3614,8 +4010,12 @@ struct Remote {
         // Sunshine reconnects on its own and keeps the last frame on screen, so
         // without a note the window looks frozen. VNC/RDP keep their existing
         // behaviour (text in the status string only, nothing on the picture).
-        this.reconnectingHintVisible = this.sessionProtocol() === 'sunshine';
-        this.statusText = '连接中断，正在重连（' + Math.max(1, Math.ceil(retry / 1000)) + 's）';
+        // A reconnect carrying status.resize is our own request being applied:
+        // say what is happening instead of a generic reconnect.
+        this.reconnectingHintVisible = this.sunshineProtocol;
+        this.reconnectingResizeHint = this.sunshineProtocol && status.resize !== undefined;
+        this.statusText = this.reconnectingResizeHint ? '正在按窗口调整分辨率…' :
+          '连接中断，正在重连（' + Math.max(1, Math.ceil(retry / 1000)) + 's）';
         return;
       }
       case 'failed': {
@@ -4715,44 +5115,75 @@ struct Remote {
   // no snapshot exists (first frame) does it fall back to the old contain
   // formula in vp.
   private mapToRemote(x: number, y: number): number[] {
+    const geometry = this.pictureGeometry();
+    return geometry === undefined ? [-1, -1] : remotePointInPicture(x, y, geometry);
+  }
+
+  /**
+   * Presented picture rectangle in vp, from the same renderStats() geometry the
+   * native renderer drew with (or the contain fit before the first snapshot).
+   * undefined when there is nothing to show (no frame / no layout).
+   */
+  private pictureGeometry(): PictureGeometry | undefined {
     if (this.frameWidth <= 0 || this.frameHeight <= 0 ||
         this.viewWidth <= 0 || this.viewHeight <= 0) {
-      return [-1, -1];
+      return undefined;
     }
     if (USE_GL_RENDER && this.statsGeometryValid) {
       const pxPerVpX = this.surfacePixelsPerVpX();
       const pxPerVpY = this.surfacePixelsPerVpY();
       if (pxPerVpX > 0 && pxPerVpY > 0 && this.statsContentScale > 0 &&
-          this.statsContentScaleY > 0) {
-        const px = x * pxPerVpX;
-        const py = y * pxPerVpY;
-        if (px < this.statsContentLeft || py < this.statsContentTop ||
-            px > this.statsContentLeft + this.statsContentW ||
-            py > this.statsContentTop + this.statsContentH) {
-          return [-1, -1];
-        }
-        return [
-          Math.max(0, Math.min(this.frameWidth - 1,
-            Math.round((px - this.statsContentLeft) / this.statsContentScale))),
-          Math.max(0, Math.min(this.frameHeight - 1,
-            Math.round((py - this.statsContentTop) / this.statsContentScaleY)))
-        ];
+          this.statsContentScaleY > 0 && this.statsContentW > 0 &&
+          this.statsContentH > 0) {
+        return {
+          left: this.statsContentLeft / pxPerVpX,
+          top: this.statsContentTop / pxPerVpY,
+          width: this.statsContentW / pxPerVpX,
+          height: this.statsContentH / pxPerVpY,
+          frameWidth: this.frameWidth,
+          frameHeight: this.frameHeight
+        };
       }
     }
-    // Fallback (Canvas path / before the first stats snapshot): the historical
-    // contain layout computed in vp.
-    const scale = Math.min(this.viewWidth / this.frameWidth, this.viewHeight / this.frameHeight);
-    const contentW = this.frameWidth * scale;
-    const contentH = this.frameHeight * scale;
-    const offsetX = (this.viewWidth - contentW) / 2;
-    const offsetY = (this.viewHeight - contentH) / 2;
-    if (x < offsetX || y < offsetY || x > offsetX + contentW || y > offsetY + contentH) {
-      return [-1, -1];
+    return containGeometry(this.frameWidth, this.frameHeight,
+      this.viewWidth, this.viewHeight);
+  }
+
+  /**
+   * Applies the pointer rule: hide the system pointer (and show the locally
+   * drawn remote cursor) ONLY while the pointer is on the presented picture.
+   * Over the black bars, while connecting / waiting for the first frame, and
+   * whenever the picture rectangle is unknown, the normal system pointer stays
+   * visible. Called on pointer movement and on every geometry change (window
+   * resize, stream resolution/zoom change, fullscreen enter/exit); it only
+   * toggles the cursor attribute, never rebuilds a component.
+   *
+   * `force` re-issues the system-pointer call even when this page's cached state
+   * already matches: setPointerVisible() is process-global and another session
+   * window may have left it hidden, so entering this page must re-assert it.
+   */
+  private refreshCursorVisibility(force: boolean = false): void {
+    if (this.disposed) {
+      return;
     }
-    return [
-      Math.max(0, Math.min(this.frameWidth - 1, Math.round((x - offsetX) / scale))),
-      Math.max(0, Math.min(this.frameHeight - 1, Math.round((y - offsetY) / scale)))
-    ];
+    const geometry = this.pictureGeometry();
+    const onPicture = this.canvasShown && geometry !== undefined &&
+      this.pointerOverPicture && this.viewPointerX >= 0 && this.viewPointerY >= 0 &&
+      pointInPicture(this.viewPointerX, this.viewPointerY, geometry);
+    // Local-cursor mode (Sunshine): the host cursor is hidden, so the system
+    // pointer IS the cursor and must stay visible over the picture too. In the
+    // normal mode it is hidden only over the picture.
+    const localCursorMode = this.sunshineProtocol && this.sunshineLocalCursor;
+    const hideSystemPointer = hidesSystemPointer(onPicture, localCursorMode);
+    // The locally drawn remote cursor is the opposite of the system pointer: it
+    // shows only when the system pointer is hidden.
+    if (this.cursorOverlayHidden !== !hideSystemPointer) {
+      this.cursorOverlayHidden = !hideSystemPointer;
+    }
+    if (force || this.hostPointerVisible !== !hideSystemPointer) {
+      this.hostPointerVisible = !hideSystemPointer;
+      this.setHostCursorVisible(!hideSystemPointer);
+    }
   }
 
   // The UIContext FocusController transfers synchronously, which is what a
@@ -5628,18 +6059,31 @@ struct Remote {
               this.scheduleResizeFollow();
             }
             this.placeCursor();
+            // Window resize / rotation / fullscreen changes the picture
+            // rectangle: re-apply the pointer rule for the current pointer.
+            this.refreshCursorVisibility();
           })
           // Keys are handled on the page root only: key events bubble, so two
           // handlers forwarded every key twice and broke Shift combinations.
           .onAxisEvent((event: AxisEvent) => {
             this.forwardWheel(event);
           })
-          .onHover((isHover: boolean) => {
+          .onHover((isHover: boolean, event: HoverEvent) => {
             // The system pointer is shown outside the picture; the locally
             // drawn remote cursor must not stay behind as a ghost when the
-            // pointer moves up into the bubble or its radial menu.
-            this.cursorOverlayHidden = !isHover;
-            this.setHostCursorVisible(!isHover);
+            // pointer moves up into the bubble or its radial menu. Entering the
+            // area does not by itself hide the pointer: refreshCursorVisibility()
+            // hides it only when the point is on the presented picture, so the
+            // black bars keep the normal cursor.
+            this.pointerOverPicture = isHover;
+            if (isHover && event !== undefined && typeof event.x === 'number' &&
+                typeof event.y === 'number') {
+              this.viewPointerX = event.x;
+              this.viewPointerY = event.y;
+            }
+            // Entering / leaving re-asserts the process-global pointer state
+            // (another session window may have left it hidden).
+            this.refreshCursorVisibility(true);
           })
           .onTouch((event: TouchEvent) => {
             // On PC one physical mouse action also produces a synthetic
@@ -5714,7 +6158,10 @@ struct Remote {
                 if (this.bubbleMenuVisible) {
                   this.closeBubbleMenu('picture-touch');
                 }
-                this.cursorOverlayHidden = false;
+                // A touch on remote_area: let the position rule decide whether
+                // the local cursor belongs here (black bars keep it hidden).
+                this.pointerOverPicture = true;
+                this.refreshCursorVisibility();
                 this.requestViewFocus();
               }
               this.bubbleMenuDismissSwallowTouch = true;
@@ -5736,15 +6183,19 @@ struct Remote {
               this.lastTouchY = event.touches[0].y;
               this.viewPointerX = this.lastTouchX;
               this.viewPointerY = this.lastTouchY;
-              // Move the local cursor now, not on the next poll.
+              this.pointerOverPicture = true;
+              // Move the local cursor now, not on the next poll; the visibility
+              // follows the picture rectangle (black bars show nothing local).
               this.placeCursor();
+              this.refreshCursorVisibility();
             }
             if (event.type === TouchType.Down) {
               // A touch on the picture means the pointer is no longer over the
               // bubble / menu: restore the local cursor and retract an open
               // menu. This stays inside the existing touch path; no pointer
               // event is added or removed by it.
-              this.cursorOverlayHidden = false;
+              this.pointerOverPicture = true;
+              this.refreshCursorVisibility();
               this.closeBubbleMenu('picture-touch');
               this.requestViewFocus();
               // Do not press yet: this touch may still become a pinch, a tap
@@ -5849,9 +6300,10 @@ struct Remote {
             }
             this.viewPointerX = event.x;
             this.viewPointerY = event.y;
-            // The pointer is back over the picture: show the local cursor again
-            // (it was suppressed while on the bubble / menu).
-            this.cursorOverlayHidden = false;
+            // The pointer is over remote_area; only the presented picture
+            // hides the system pointer (the black bars keep the normal one).
+            this.pointerOverPicture = true;
+            this.refreshCursorVisibility();
             // The local cursor follows every pointer event; the poll only acts
             // as the fallback for server-side shape/size changes.
             this.placeCursor();
@@ -5965,7 +6417,11 @@ struct Remote {
             Column() {
               Row({ space: 8 }) {
                 LoadingProgress().width(22).height(22).color(Color.White)
-                Text('正在重新连接…').fontSize(14).fontColor(Color.White)
+                // A requested resolution change restarts the stream; say so
+                // instead of the generic reconnect wording.
+                Text(this.reconnectingResizeHint ? '正在按窗口调整分辨率…' : '正在重新连接…')
+                  .fontSize(14)
+                  .fontColor(Color.White)
               }
               .padding({ left: 16, right: 16, top: 10, bottom: 10 })
               .backgroundColor('#B3202124')
@@ -6097,13 +6553,18 @@ struct Remote {
           if (this.bubbleMenuVisible && this.bubbleMenuAngles.length > 0) {
             // The fan is computed so every button circle stays fully inside the
             // picture. 断开 (red) is the +end of the arc: [最小化, 全屏, 断开] on
-            // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone.
+            // PC, [主列表, 全屏, 断开] on tablet, [主列表, 断开] on phone. A
+            // Sunshine session inserts 本地光标 just before 断开:
+            // [最小化/主列表, 全屏, 本地光标, 断开].
             this.bubbleMenuButton(0)
             if (this.bubbleMenuAngles.length > 1) {
               this.bubbleMenuButton(1)
             }
             if (this.bubbleMenuAngles.length > 2) {
               this.bubbleMenuButton(2)
+            }
+            if (this.bubbleMenuAngles.length > 3) {
+              this.bubbleMenuButton(3)
             }
             if (this.bubbleMenuHintIndex >= 0 &&
                 this.bubbleMenuHintIndex < this.bubbleMenuAngles.length) {

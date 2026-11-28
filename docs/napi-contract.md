@@ -39,7 +39,8 @@
   "sunshineWidth": 1280, "sunshineHeight": 720, "sunshineFps": 60,
   "sunshineBitrate": 20000,   // 可选，默认 1280/720/60/20000（bitrate 单位 kbps）
   "sunshineFormats": "h264,hevc", // 可选，缺省按设备硬解能力自动
-  "sunshineEncryption": "none" }  // 可选，默认 ENCFLG_ALL；"none" 关闭
+  "sunshineEncryption": "none",  // 可选，默认 ENCFLG_ALL；"none" 关闭
+  "sunshineHostCursorHidden": false }  // 可选，上次记录的主机光标隐藏状态
 ```
 
 `protocol` 选择原生后端：缺省或 `"vnc"` 走 RFB，`"rdp"` 走 FreeRDP，`"sunshine"` 走 Moonlight（Sunshine 服务端）。`username`/`domain` 只在 RDP 下有意义（`domain` 可空），用于 RDP 登录；VNC 与 Sunshine 忽略这两个字段。RDP **必须**带 `password`（没有「无需密码」语义）。`security`（RFB 安全类型）只用于 VNC。`expectedFingerprint` 两种协议都用于服务端证书指纹固定：VNC 是 RA2 指纹，RDP 是服务端 X.509 证书的 SHA-256 指纹（小写、字节间用 `-` 连接，如 `84-64-…`）；RDP 首次连接（该字段为空）会以 `state=trust-required` 结束本次尝试并带出 `fingerprint`，不自动重试，界面确认后由 `reconnectSession` 重连，后续连接必须带该 pin。RDP 与 VNC 复用同一套会话状态（`connecting`/`connected`/`failed`/`reconnecting` 等）与 `errorCode`（`auth-failed`/`fingerprint-mismatch`/`protocol`/`network`；RDP 另有 `session-taken-over`），因此界面的失败提示与密码重输流程对两种协议一致。
@@ -74,18 +75,42 @@
   "resizeSupport": "unknown",
   "pictureBlack": false,
   "pairing": { "host": "192.168.50.62", "appVersion": "7.1.431.-1" },
-  "app": "Desktop" }
+  "app": "Desktop",
+  "resize": { "width": 1600, "height": 900 },
+  "remoteCursorHidden": false }
 ```
 
 - `state=trust-required` 时附带 `fingerprint`，界面据此展示确认；确认写入 ArkTS 侧信任库后由界面调用 `reconnectSession`。
 - `state=pairing-required`（Sunshine 专用）时附带 `pairing: {host, appVersion}`：会话正在等界面把服务端网页上显示的 4 位 PIN 用 `submitPin()` 提交上来。它是「等用户动作」的状态（与 `trust-required` 同级），不是失败；关窗/停止/`closeSession` 都能打断它。
 - `errorCode=pair-failed`（Sunshine 专用）表示上一次配对失败：正常重试路径（PIN 错误 / 网页端超时）下会话回到 `state=pairing-required`，`error` 带服务端消息，界面重新调用 `submitPin()` 即可再试；外层 `PairError` 兜底分支也可能以 `state=reconnecting` + `pair-failed` 出现，界面不应假定两者绑定。连续两次传输层失败会转为 `state=failed` + `errorCode="network"`。
 - `app`（Sunshine 专用，可选）是 `/applist` 实际匹配并启动的应用标题；没有匹配时会回退到第一个应用，与请求的 `sunshineApp` 可能不同。
+- `remoteCursorHidden`（Sunshine 专用，布尔）：本地记录的「主机光标是否已隐藏」（本地光标模式）。Sunshine 把光标画在视频里，延迟等于视频链路；隐藏主机光标后由客户端显示本地系统光标。该状态是主机进程级、跨会话保持、**客户端无法查询**，只能由客户端记录（ArkTS 持久化到连接条目，下次 `createSession` 通过 `sunshineHostCursorHidden` 传回）；Sunshine 进程重启后会回到「显示」，此时界面应把记录重置为 `false` 后再切换。
+- `resize`（Sunshine 专用，可选）表示**正在**按 `requestDesktopSize` 的新尺寸重启串流：`{width, height}` 是目标分辨率。出现该字段时界面可显示「正在按窗口调整分辨率…」；新尺寸的串流 `connectionStarted` 后该字段消失（`resizeSupport` 变为 `"ok"`），重启失败/会话终态时也会消失。
 - `state=failed` 且 `errorCode=fingerprint-mismatch` 时也附带当前观测到的 `fingerprint`（VNC 与 RDP 一致）：它是本次连接中服务端实际出示的指纹，供界面与已信任值对比展示。
 - `errorCode` 是枚举；`error` 只用于辅助显示。指纹不一致时 `error` 统一为「服务端指纹与已信任值不一致，已拒绝连接」。
 - `errorCode=session-taken-over` 只出现在 RDP：同一 Windows 账号已有另一个远程会话，服务端用 `ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION` 结束了本连接（连接阶段或已连接之后都可能发生）。会话为 `state=failed`，且原生后端**不会自动重连**——自动重连会反过来顶掉另一个窗口，形成两个会话互相接管、最终远端会话不可用的循环。`error` 固定为「该账号的远程会话已被其它连接接管：同一 Windows 账号只允许一个远程会话」，界面提示后由用户手动调用 `reconnectSession`。
 - `resizeSupport` 按会话独立维护，重连后复位为 `"unknown"`：`"ok"` 表示服务端已按客户端请求确认/应用过至少一次（VNC：收到 `reasonClient` 的成功答复；RDP：收到与在途请求对应的 `DesktopResize`）；`"rejected"` 只可能来自 VNC（服务端明确拒绝）。RDP 协议没有拒绝应答，请求被忽略时保持 `"unknown"`，界面必须自行超时并停用该会话的自动跟随。
 - `pictureBlack`（Sunshine 专用，仅 `state=connected` 时出现）：布尔。视频解码路径在解码回调线程里对每一帧做稀疏亮度采样（每 16 行取一行、每 16 像素取一个点，取 R/G/B 平均并忽略 alpha），平均亮度 < 4 视为黑帧；连续全黑或本次尝试迟迟没有帧达到 3000 ms 时为 `true`，出现任一非黑帧后立即变为 `false`。常见原因是主机控制台上没有可用的登录会话（例如正被另一个远程桌面会话占用，Windows 把控制台会话搬走），界面可据此提示用户去主机上断开远程桌面或重新登录控制台。VNC/RDP 不产生该字段；未连接时不出现（读取方应按 `false` 处理）。
+
+### 分段耗时（`perf`）
+
+`perf` 是所有协议都有的对象：`{windowMs, frames, delivered, decode, convert, pixWait, commit, takeFrame}`，每个 timing 子对象是 `{n, mean, p50, max}`（微秒），表示最近一个 1 秒窗口的摘要；`frames`/`delivered` 是该窗口的提交帧数与 `takeFrame` 交付数。
+
+`protocol="sunshine"` 且 `state=connected` 时，同一个 `perf` 对象里**追加**（不新增重复的 `perf` 键）最近一个 5 秒窗口的视频链路分段耗时，单位毫秒：
+
+| 字段 | 含义 |
+| --- | --- |
+| `inFps` / `decFps` / `outFps` | 输入（common-c 交付）帧率 / 解码输出帧率 / 实际上屏帧率（`outFps` 由渲染线程统计，窗口内 swap 成功数 / 窗口长度） |
+| `netToSubmitMsAvg` | common-c 入队（`enqueueTimeUs`）到 `submitDecodeUnit` 被调用的平均耗时 |
+| `submitToOutputMsAvg` | 送进 AVCodec 到对应帧输出回调的平均耗时（按 PTS 配对） |
+| `convertMsAvg` | 输出回调里 NV12/NV21 → BGRA 的 libswscale 转换平均耗时 |
+| `commitMsAvg` | `commitFrame`（含镜像拷贝）平均耗时 |
+| `lagMsAvg` / `lagMsP95` | 镜像提交时间戳到渲染线程取走该帧的滞后（平均 / P95） |
+| `perfWindowMs` | 上述 5 秒窗口的实际长度 |
+
+- 这些都是**只读快照**，读取不等待解码或渲染；窗口没有样本时为 `0`。未连接、还没攒满一个 5 秒窗口、或没有挂载原生渲染器时，对应字段为 `0`（`perfWindowMs=0` 表示解码侧尚未发布过窗口）。
+- 只有 Sunshine 的帧镜像会写提交时间戳（`commitTimeUs`），所以 `lagMsAvg`/`lagMsP95` 只对 Sunshine 有意义；VNC/RDP 不产生这两个字段。
+- 后端同时每 5 秒打一条 W 级日志：`sunshine perf: in=…fps dec=…fps out=…fps netToSubmit=…/… submitToOutput=…/… convert=…/… commit=…/… lag=…/… swap=…/… (avg/p95 ms, window=…ms, dropped=…)`，其中 `swap` 是「取到帧到 `eglSwapBuffers` 返回」的平均/P95（含拷贝、上传、绘制）；渲染线程自己的 `TianguanRender` 统计行也带 `lag=`/`pickupSwap=`。这些数字只用于定位瓶颈，不改变任何渲染或解码行为。
 
 ### 重新确认服务端指纹
 
@@ -148,7 +173,11 @@ requestDesktopSize(sessionId: string, width: number, height: number): boolean
 - **VNC**：会话线程在协议状态 `NORMAL` 时调用 `CMsgWriter::writeSetDesktopSize()`。ScreenSet 固定为一个屏幕：`id=0`、矩形 `(0,0,width,height)`、`flags=0`。服务端是否支持由 `resizeSupport` 异步报告；若服务端从未宣告 ExtendedDesktopSize，请求会留在待发状态并保持 `"unknown"`。服务端也可能给出近似模式（例如偶数化/最接近的可用模式），`width`/`height` 与交付帧以服务端实际采用的几何为准。
 - **RDP**：`PreConnect` 打开 `FreeRDP_SupportDisplayControl` 与 `FreeRDP_DynamicResolutionUpdate`（等同参照客户端的 `/dynamic-resolution`），client-common 加载 `disp` 动态通道；服务端打开 `Microsoft::Windows::RDS::DisplayControl` 并下发 caps 后，会话线程构造单个显示器的 `DISPLAY_CONTROL_MONITOR_LAYOUT`（`Flags=PRIMARY`、`Left=Top=0`、`Width/Height=请求值`、`PhysicalWidth/Height=请求值`、orientation/scale 取协商设置）并调用 `DispClientContext::SendMonitorLayout`。FreeRDP 的 disp 插件会把宽度规整为偶数并夹到 `200..8192`，所以奇数宽度可能以相邻偶数值生效。
 - **RDP 的判定**：没有接受/拒绝应答。只有收到 `DesktopResize`（服务端应用了新的桌面尺寸）才把 `resizeSupport` 置 `"ok"`；请求被忽略则一直保持 `"unknown"`，由界面超时判定。`"rejected"` 不会由 RDP 产生。
-- VNC 与 RDP 都用同一个 `resizeSupport` 字段，因此页面无需按协议分支读取。
+- **Sunshine（Moonlight）**：分辨率只能在 `/launch` 的 `mode` 里指定，所以调整 = **停流 → `/cancel` → 用新尺寸重新 `/launch` → 重启串流**。参数校验：宽高必须为**偶数**、范围 **16–7680**、宽高比不超过 **4:1**（任一方向），否则返回 `false`。会话线程每 200 ms 取一次请求槽：与当前流尺寸相同则直接 ack；不同则立即 `state=reconnecting` 并出现上面的 `resize` 字段，停止当前媒体（**不发 `/cancel`**）后按新尺寸重启。**续播优先**：直接 `GET /resume`（appid 不变、`mode=新WxHxFPS`、码率按下面的公式），用返回的 `sessionUrl0/rikey/rikeyid` 起新流——实测停流→首帧约 11.4 s 且没有 RTSP 失败；`/resume` 失败（HTTP 非 200、`nv_status_code` 4xx、超时等）才退回原路径「`/cancel` → 等空闲 → `/launch`」，并保留陈旧会话清理逻辑。走哪条路径与耗时都打 W 级日志。处理期间到达的新请求只覆盖待发槽（最后一个生效），下一次轮询会再处理。码率按像素同比、带 0.8 次幂与编码系数缩放：
+`new = baseBitrate × ((w×h) / (baseW×baseH))^0.8 × (HEVC ? 0.7 : 1.0)`
+（base 取 `sunshineWidth/Height/Bitrate`），四舍五入到 1000 kbps 后钳在 **15000–80000 kbps**；帧率与编码格式不变。HEVC 判定取**当前流实际协商到的视频格式**（视频 setup 的 `videoFormat` 落在 `VIDEO_FORMAT_MASK_H265` 内即算，含 Main10），首次协商前按「自动且设备有 HEVC 硬解」处理。以 1080p / 20 Mbps 为基准的示例：1440p HEVC ≈ 22 Mbps、4K HEVC ≈ 42 Mbps、1440p H.264 ≈ 32 Mbps、720p（无论编码）回落到下限 **15 Mbps**。整个调整计入本次会话，不计入「主机结束且无画面」的自动重连次数。
+- **Sunshine 的 ack 语义与 RDP 一致**：会话线程「取到」请求时把它标记为 in-flight（`desktopAwaiting`），此时可以再接收新请求但只保留最后一个；正 ack 是新尺寸的串流重新 `connectionStarted`（没有服务端应答），`resizeSupport` 由 `"unknown"` 变 `"ok"`；重启失败/会话终态只清 in-flight 与 `resize` 字段，`resizeSupport` 保持 `"unknown"`，由界面超时判定。
+- VNC、RDP 与 Sunshine 都用同一个 `resizeSupport` 字段，因此页面无需按协议分支读取。
 
 ### 视图变换（缩放/平移）
 
@@ -196,6 +225,18 @@ releaseSessionInput(sessionId: string): string   // 释放按键/按钮并清指
 
 - 返回 `QUEUED`、`COALESCED`、`NOT_CONNECTED`、`NOT_READY`、`INVALID_SESSION`。
 - 纯移动（`mask == 0`）可合并为最新位置；按下/抬起/滚轮不得静默丢弃。
+### 主机光标（本地光标模式）
+
+```
+setRemoteCursorHidden(sessionId: string, hidden: boolean): boolean
+```
+
+- **Sunshine/Moonlight 专用**。Sunshine 的光标编在视频里，跟随延迟等于视频链路；隐藏主机光标后由客户端显示本地系统光标。切换方式是发送 Sunshine 快捷键 **Ctrl+Alt+Shift+N**（`src/input.cpp` 的 `apply_shortcut` 翻转主机全局 `display_cursor`，且该组合键不传给桌面）。
+- **同步**返回。会话已是目标状态 → `true`（不发送；同时取消尚未发出的反向请求）；请求被受理 → `true`（组合键由后端输入线程在 ~2 ms 内发出，发送成功后 `remoteCursorHidden` 才更新）；会话不存在 / 非 Sunshine / 未连接 → `false`（未连接时仍记录「期望状态」，连接建立后补发一次）。
+- 状态是**主机进程级、跨会话保持**的，客户端无法查询：原生只记录，ArkTS 负责持久化到连接条目并通过 `sunshineHostCursorHidden` 传回。**Sunshine 重启后会回到「显示」**，界面若怀疑主机重启过，应把记录重置为 `false` 再做切换。
+- 发送与前后状态均打 W 级日志；不涉及 PIN/密钥。
+
+- **Sunshine 输入低延迟**：输入线程每 **2 ms** 轮询一次共享队列（条件唤醒尚未接入，2 ms 即兜底上限），`drainInput` 内逐条同步调用 `LiSend*`，返回后立刻处理下一条，不做攒批或额外 sleep。绝对坐标用 `LiSendMousePositionEvent(x, y, 流宽, 流高)`，参考尺寸取**当前流**的最新值（分辨率调整后随视频 setup 更新）。同 mask 且非 boundary 的尾部移动才会合并（保留最新位置与时间戳），按下/抬起/滚轮等 boundary 事件永不合并或丢弃。每 5 秒一条 W 级日志 `sunshine input: queueLag=avg/p95 sendCalls=N sendFail=M (avg/p95 ms, samples=S)`：queueLag 是「入队 → `LiSend*` 返回」的间隔（`QueuedInput` 带 `steady_clock` 入队时刻），`sendFail` 单独统计 `LiSend*` 返回非 0（如 -2 输入流未就绪）的次数。
 
 ### RDP 锁定状态同步
 

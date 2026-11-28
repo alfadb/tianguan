@@ -73,4 +73,46 @@ class SunshineVideoSink {
   virtual SunshineVideoStats stats() const = 0;
 };
 
+// 视频链路上的分段耗时快照：最近一个完整的 5 秒统计窗口，耗时单位毫秒。
+// 与 sunshine_backend.h 的 SunshinePictureStatus 一样是进程级只读快照：视频线程
+// 与 AVCodec 输出回调线程写入，后端（5 秒汇总日志）和宿主（statusJson.perf）在
+// 任意线程读取，读到的是一份算好的值，不加锁等待解码。
+//   netToSubmit      common-c 入队（enqueueTimeUs）到 submitDecodeUnit 被调用；
+//   submitToOutput   送进 AVCodec 到对应帧的输出回调（按 PTS 配对，配不上用最近
+//                    已配对样本的均值，见 sunshine_video.cxx）；
+//   convert          输出回调里 NV12/NV21 -> BGRA（libswscale）的耗时；
+//   commit           frameSink.commit（含宿主镜像拷贝）的耗时。
+// inFps/decFps 是本窗口的输入帧率与解码输出帧率；上屏帧率在 render.h 的
+// RenderFramePerf.outFps 里（由渲染线程统计）。
+struct SunshineVideoPerf {
+  SunshineVideoPerf()
+      : windowMs(0),
+        inFrames(0),
+        decFrames(0),
+        droppedUnits(0),
+        inFps(0.0),
+        decFps(0.0),
+        netToSubmitAvgMs(0.0),
+        netToSubmitP95Ms(0.0),
+        submitToOutputAvgMs(0.0),
+        submitToOutputP95Ms(0.0),
+        convertAvgMs(0.0),
+        convertP95Ms(0.0),
+        commitAvgMs(0.0),
+        commitP95Ms(0.0) {}
+  unsigned long long windowMs;      // 窗口实际长度（0 = 还没有完整窗口）
+  unsigned long long inFrames;      // 窗口内 submitDecodeUnit 调用数
+  unsigned long long decFrames;     // 窗口内解码输出并提交给宿主的帧数
+  unsigned long long droppedUnits; // 窗口内因输入队列满丢弃的解码单元数
+  double inFps;
+  double decFps;
+  double netToSubmitAvgMs, netToSubmitP95Ms;
+  double submitToOutputAvgMs, submitToOutputP95Ms;
+  double convertAvgMs, convertP95Ms;
+  double commitAvgMs, commitP95Ms;
+};
+
+// 最近一个完整 5 秒窗口的耗时快照；没有连接或还没到 5 秒时全 0。
+SunshineVideoPerf sunshineVideoPerf();
+
 }  // namespace tianguan

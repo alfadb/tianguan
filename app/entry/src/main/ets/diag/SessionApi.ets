@@ -54,6 +54,10 @@ export interface SessionOptions {
   // "none" disables Moonlight stream encryption (ENCFLG_NONE); omit for the
   // native default (encrypted).
   sunshineEncryption?: string;
+  // Sunshine/Moonlight local cursor: the host cursor state recorded by the last
+  // session (default false = host cursor shown). Passed so the backend can
+  // restore the host-wide state without a needless toggle.
+  sunshineHostCursorHidden?: boolean;
 }
 
 /** Sunshine pairing info attached to state="pairing-required". */
@@ -62,6 +66,12 @@ export interface PairingInfo {
   host: string;
   /** Sunshine appversion reported by /serverinfo. */
   appVersion: string;
+}
+
+/** Sunshine: the size the backend restarts the stream at (status.resize). */
+export interface ResizeInfo {
+  width: number;
+  height: number;
 }
 
 /** cursor object inside the status JSON. */
@@ -102,6 +112,13 @@ export interface SessionStatus {
    */
   resizeSupport?: string;
   /**
+   * Sunshine only: present while the backend is restarting the stream at a new
+   * size (state="reconnecting"): the width/height it is switching to. Used by
+   * the remote page to show 「正在按窗口调整分辨率…」 instead of the generic
+   * reconnect text, and to remember the current stream size.
+   */
+  resize?: ResizeInfo;
+  /**
    * Sunshine only: present while the session waits for the 4-digit PIN shown by
    * the server's web page (state="pairing-required").
    */
@@ -115,6 +132,13 @@ export interface SessionStatus {
    * renders black. VNC/RDP never set it.
    */
   pictureBlack?: boolean;
+  /**
+   * Sunshine only: authoritative HOST cursor state (true = the host cursor is
+   * hidden, because this client hides it for the local-cursor feature). Host
+   * wide, so it survives the session; the page records it on the connection
+   * entry whenever it changes.
+   */
+  remoteCursorHidden?: boolean;
   /** Sunshine only: the /applist title that was actually launched. */
   app?: string;
 }
@@ -380,6 +404,23 @@ export function submitPin(sessionId: string, pin: string): boolean {
     return diag.submitPin(sessionId, pin) === true;
   } catch (error) {
     warn('submitPin', error);
+    return false;
+  }
+}
+
+/**
+ * Sunshine only: asks the backend to hide (true) or show (false) the HOST
+ * cursor for this session. Synchronous boolean: true when the session was
+ * already in that state or the request was accepted; false for an unknown /
+ * non-Sunshine / not-connected session (a not-connected session still records
+ * the desired state and sends it once connected). The host state is host-wide
+ * and outlives the session.
+ */
+export function setRemoteCursorHidden(sessionId: string, hidden: boolean): boolean {
+  try {
+    return diag.setRemoteCursorHidden(sessionId, hidden) === true;
+  } catch (error) {
+    warn('setRemoteCursorHidden', error);
     return false;
   }
 }
