@@ -7,12 +7,15 @@
 // Vulkan buffer per frame into RenderService.
 #include "diagnostics.h"
 #include "render.h"
+#include "sunshine_backend.h"
 #include "view_geometry.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 #include <hilog/log.h>
+#include <native_image/native_image.h>
 #include <native_window/external_window.h>
 
 #include <algorithm>
@@ -178,6 +181,29 @@ EGLDisplay AcquireSharedDisplay() {
   return g_display;
 }
 
+// --- Zero-copy surface source (Sunshine) -----------------------------------
+//
+// OH_NativeImage owns a producer OHNativeWindow that the video decoder renders
+// into, and the consumer side that turns the newest buffer into an OES
+// external texture. Its frame-available callback runs on an internal thread:
+// it may only record the arrival time, flip a flag and wake the render thread
+// (calling GL or NativeImage from that callback is forbidden). The signal is
+// shared_ptr-owned by the Renderer and marked dead before the NativeImage is
+// destroyed, so a late callback can never touch a freed renderer.
+struct Renderer;  // forward declaration for the weak_ptr below
+
+struct ExternalFrameSignal {
+  ExternalFrameSignal() : alive(true), frameAvailable(false), lastFrameUs(0) {}
+  std::mutex mutex;               // guards alive + owner
+  bool alive;
+  std::weak_ptr<Renderer> owner;  // set once the shared_ptr exists
+  std::atomic<bool> frameAvailable;
+  std::atomic<long long> lastFrameUs;  // NowUs() at the callback
+};
+
+// Defined after Renderer (it needs the complete type to notify its wake cv).
+void OnExternalFrameAvailable(void* context);
+
 /** One status snapshot, guarded by the renderer's stats mutex. */
 struct RenderStats {
   std::string state = "starting";  // starting|running|suspended|stopped|failed
@@ -212,7 +238,9 @@ struct RenderStats {
 
 struct Renderer {
   explicit Renderer(const std::string& id, bool startSuspended)
-      : sessionId(id), suspended(startSuspended) {}
+      : sessionId(id),
+        suspended(startSuspended),
+        frameSignal(new ExternalFrameSignal()) {}
   const std::string sessionId;
   std::thread thread;  // owned by whoever joins; moved out under `mutex`
   // Control block: park/wake plus thread ownership. The loop re-checks these
@@ -234,10 +262,42 @@ struct Renderer {
   std::atomic<bool> viewDirty{false};
   std::mutex statsMutex;
   RenderStats stats;
+  // --- Zero-copy surface source (Sunshine) --------------------------------
+  // Control commands are executed on the render thread (it owns the GL
+  // context); the caller blocks on taskDone. At most one command is in flight.
+  std::mutex taskMutex;
+  std::condition_variable taskDone;
+  int taskKind = 0;  // 0 = none, 1 = create external source, 2 = release it
+  bool taskFinished = false;
+  bool taskOk = false;
+  unsigned int taskTextureId = 0;
+  NativeWindow* taskWindow = nullptr;
+  std::atomic<bool> loopFinished{false};
+  // Frame-arrival signal shared with OH_NativeImage's listener callback.
+  std::shared_ptr<ExternalFrameSignal> frameSignal;
+  // Video size reported by the decoder (surface mode has no stride/format).
+  std::atomic<int> sourceWidth{0};
+  std::atomic<int> sourceHeight{0};
+  std::atomic<bool> externalSourceActive{false};
 };
 
 std::mutex g_registryMutex;
 std::map<std::string, std::shared_ptr<Renderer>> g_renderers;
+
+void OnExternalFrameAvailable(void* context) {
+  ExternalFrameSignal* signal = static_cast<ExternalFrameSignal*>(context);
+  if (signal == nullptr) return;
+  signal->lastFrameUs.store(NowUs());
+  signal->frameAvailable.store(true);
+  std::shared_ptr<Renderer> owner;
+  {
+    std::lock_guard<std::mutex> lock(signal->mutex);
+    if (!signal->alive) return;
+    owner = signal->owner.lock();
+  }
+  // notify_all does not need the renderer mutex; the loop re-checks the flag.
+  if (owner) owner->wake.notify_all();
+}
 
 std::string EglErrorText(const char* stage, EGLint error) {
   char buffer[256];
@@ -362,6 +422,68 @@ GLuint BuildProgram(std::string& error) {
   return program;
 }
 
+// 零拷贝路径的着色器：解码器通过 OH_NativeImage 把帧写进 OES 外部纹理（内容已是
+// RGB，vendor 完成色彩转换），所以不做 BGR swizzle。采样坐标必须乘
+// OH_NativeImage_GetTransformMatrixV2 的 4x4 矩阵：native_image.h 说明它是
+// "transform matrix of the texture image by producer transform type"，包含裁剪
+// 区域与翻转/旋转（生产者缓冲自上而下，矩阵里通常就是 scaleY=-1 + 平移 1）。矩阵
+// 按列主序原样上传（glUniformMatrix4fv 的 transpose=GL_FALSE），乘在
+// vec4(vTexCoord, 0, 1) 左侧；alpha 强制 1。
+GLuint BuildExternalProgram(std::string& error) {
+  static const char* kVertexSource =
+      "attribute vec2 aPosition;\n"
+      "attribute vec2 aTexCoord;\n"
+      "varying vec2 vTexCoord;\n"
+      "void main() {\n"
+      "  vTexCoord = aTexCoord;\n"
+      "  gl_Position = vec4(aPosition, 0.0, 1.0);\n"
+      "}\n";
+  static const char* kFragmentSource =
+      "#extension GL_OES_EGL_image_external : require\n"
+      "precision mediump float;\n"
+      "varying vec2 vTexCoord;\n"
+      "uniform samplerExternalOES uTexture;\n"
+      "uniform mat4 uTexMatrix;\n"
+      "void main() {\n"
+      "  vec2 uv = (uTexMatrix * vec4(vTexCoord, 0.0, 1.0)).xy;\n"
+      "  vec4 texel = texture2D(uTexture, uv);\n"
+      "  gl_FragColor = vec4(texel.rgb, 1.0);\n"
+      "}\n";
+  GLuint vertex = CompileShader(GL_VERTEX_SHADER, kVertexSource, error);
+  if (vertex == 0) return 0;
+  GLuint fragment = CompileShader(GL_FRAGMENT_SHADER, kFragmentSource, error);
+  if (fragment == 0) {
+    glDeleteShader(vertex);
+    return 0;
+  }
+  GLuint program = glCreateProgram();
+  if (program == 0) {
+    error = "glCreateProgram returned 0";
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    return 0;
+  }
+  glAttachShader(program, vertex);
+  glAttachShader(program, fragment);
+  glBindAttribLocation(program, 0, "aPosition");
+  glBindAttribLocation(program, 1, "aTexCoord");
+  glLinkProgram(program);
+  glDeleteShader(vertex);
+  glDeleteShader(fragment);
+  GLint linked = GL_FALSE;
+  glGetProgramiv(program, GL_LINK_STATUS, &linked);
+  if (linked != GL_TRUE) {
+    GLint logLength = 0;
+    glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
+    std::string log(static_cast<size_t>(logLength > 1 ? logLength : 1), '\0');
+    if (logLength > 1) glGetProgramInfoLog(program, logLength, nullptr, &log[0]);
+    error = std::string("external program link failed: ") + log.c_str();
+    glDeleteProgram(program);
+    return 0;
+  }
+  return program;
+}
+
 void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
                 const std::string surfaceIdText) {
   OHNativeWindow* window = nullptr;
@@ -372,6 +494,41 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
   GLuint texture = 0;
   GLuint program = 0;
   GLuint vertexBuffer = 0;
+  // --- Zero-copy surface source (Sunshine) --------------------------------
+  // Render-thread-local: the create/release tasks run on this thread with the
+  // GL context current, so nothing here is touched from another thread. The
+  // BGRA path below is untouched and still used by VNC/RDP and by the Sunshine
+  // Buffer-mode fallback.
+  bool externalActive = false;
+  OH_NativeImage* nativeImage = nullptr;
+  uint32_t externalTexture = 0;
+  // 外部纹理专用的顶点缓冲：UV 方向与 BGRA 路径相反（v=0 在画面底部），见下面
+  // 创建处的注释。绝不能复用 BGRA 的 vertexBuffer，否则 SDK 变换矩阵里的 Y 翻转
+  // 会被预先抵消一次，画面上下颠倒。
+  GLuint externalVertexBuffer = 0;
+  GLuint externalProgram = 0;
+  GLint externalTextureLoc = -1;
+  GLint externalMatrixLoc = -1;
+  float externalTransform[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                                 0.0f, 1.0f, 0.0f, 0.0f,
+                                 0.0f, 0.0f, 1.0f, 0.0f,
+                                 0.0f, 0.0f, 0.0f, 1.0f};
+  // 变换矩阵诊断：第一帧一定打一次，之后只有矩阵变化且距上次 >= 1s 才再打。
+  bool loggedTransform = false;
+  float lastLoggedTransform[16] = {0.0f};
+  long long lastTransformLogMs = 0;
+  GLuint lumaFbo = 0;
+  GLuint lumaRenderbuffer = 0;
+  bool lumaProbeBroken = false;
+  long long lastLumaProbeMs = 0;
+  long long lastSurfaceFailLogMs = 0;
+  long long lastExternalLogMs = 0;
+  long long externalPerfWindowStartUs = NowUs();
+  long long externalPerfSwaps = 0;
+  const std::shared_ptr<ExternalFrameSignal> frameSignal = renderer->frameSignal;
+  FramePerfHistogram externalLag;          // 帧可用 -> UpdateSurfaceImage 完成
+  FramePerfHistogram externalPickupSwap;   // UpdateSurfaceImage 完成 -> swap 返回
+  FramePerfHistogram externalFrameToSwap;  // 帧可用 -> swap 返回
   std::string failure;
   EGLint lastEglError = EGL_SUCCESS;
   int clientVersion = 3;
@@ -618,6 +775,330 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     LogDebug(line);
     resetDiagWindow();
   };
+  // 零拷贝路径：把当前 OES 外部纹理按 contain 几何画满并提交，统计口径与
+  // drawAndSwap 相同（frames/diag/perf 窗口）。与原 BGRA 路径完全独立：原函数
+  // 一行未改，VNC/RDP 永远走原路径。
+  auto drawExternalAndSwap = [&]() -> bool {
+    if (externalTexture == 0 || externalProgram == 0 || texWidth <= 0 || texHeight <= 0)
+      return false;
+    const tianguan::ViewGeometry geometry = tianguan::ComputeViewGeometry(
+        texWidth, texHeight, surfaceWidth, surfaceHeight, viewZoom, viewPanX, viewPanY);
+    const int viewportLeft = tianguan::RoundViewportCoord(geometry.left);
+    const int viewportTop = tianguan::RoundViewportCoord(geometry.top);
+    glViewport(viewportLeft, surfaceHeight - viewportTop - geometry.contentH,
+               geometry.contentW, geometry.contentH);
+    {
+      std::lock_guard<std::mutex> lock(renderer->statsMutex);
+      renderer->stats.contentLeft = viewportLeft;
+      renderer->stats.contentTop = viewportTop;
+      renderer->stats.contentW = geometry.contentW;
+      renderer->stats.contentH = geometry.contentH;
+      renderer->stats.contentScale = geometry.contentScale;
+      renderer->stats.contentScaleY = geometry.contentScaleY;
+      renderer->stats.zoom = geometry.zoom;
+      renderer->stats.panX = geometry.panX;
+      renderer->stats.panY = geometry.panY;
+    }
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(externalProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
+    glUniform1i(externalTextureLoc, 0);
+    // transpose=GL_FALSE：按列主序原样上传 GetTransformMatrixV2 的矩阵（含裁剪与
+    // Y 翻转），着色器里乘在 vec4(vTexCoord,0,1) 左侧。
+    glUniformMatrix4fv(externalMatrixLoc, 1, GL_FALSE, externalTransform);
+    glBindBuffer(GL_ARRAY_BUFFER, externalVertexBuffer);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          reinterpret_cast<const void*>(0));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          reinterpret_cast<const void*>(2 * sizeof(GLfloat)));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    const long long swapStartUs = NowUs();
+    const EGLBoolean swapped = eglSwapBuffers(display, eglSurface);
+    const long long swapUs = NowUs() - swapStartUs;
+    diagSwapSumUs += swapUs;
+    diagSwapN += 1;
+    if (swapUs > diagSwapMaxUs) diagSwapMaxUs = swapUs;
+    if (swapped != EGL_TRUE) {
+      lastEglError = eglGetError();
+      ++swapFailures;
+      char line[192];
+      std::snprintf(line, sizeof(line),
+                    "session=%s surface eglSwapBuffers failed (count=%lld egl=0x%04x)",
+                    renderer->sessionId.c_str(), swapFailures,
+                    static_cast<unsigned int>(lastEglError));
+      LogLine(line);
+      return false;
+    }
+    ++frames;
+    ++diagWindowFrames;
+    ++framePerfSwaps;
+    const long long presentedAtUs = NowUs();
+    if (diagLastPresentUs != 0 && presentedAtUs - diagLastPresentUs > diagMaxFlushGapUs) {
+      diagMaxFlushGapUs = presentedAtUs - diagLastPresentUs;
+    }
+    diagLastPresentUs = presentedAtUs;
+    presented = true;
+    presentPending = false;
+    return true;
+  };
+  // 黑屏检测（Surface 模式没有可采样的 BGRA 镜像）：把外部纹理画进 32x32 的 FBO
+  // 再 glReadPixels，按平均亮度判定，结果交给 sunshineNoteVideoLuma，与 Buffer 模式
+  // 的采样阈值一致（平均亮度 < 4 为黑）。每 500ms 最多一次，且在正常 swap 之后做，
+  // 不进入正常呈现路径。FBO 建不起来就永久停用这个探针（只记一次）。
+  auto probeExternalLuma = [&]() {
+    if (lumaProbeBroken || externalTexture == 0 || externalProgram == 0) return;
+    if (lumaFbo == 0) {
+      glGenFramebuffers(1, &lumaFbo);
+      glGenRenderbuffers(1, &lumaRenderbuffer);
+      glBindRenderbuffer(GL_RENDERBUFFER, lumaRenderbuffer);
+      // RGBA4 是 ES2 核心格式，32x32 足够判黑，且读回仍是 8 位。
+      glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 32, 32);
+      glBindFramebuffer(GL_FRAMEBUFFER, lumaFbo);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                                lumaRenderbuffer);
+      const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      if (status != GL_FRAMEBUFFER_COMPLETE) {
+        lumaProbeBroken = true;
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "session=%s black probe unavailable (fbo=0x%04x)",
+                      renderer->sessionId.c_str(), static_cast<unsigned int>(status));
+        LogLine(line);
+        return;
+      }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, lumaFbo);
+    glViewport(0, 0, 32, 32);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(externalProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
+    glUniform1i(externalTextureLoc, 0);
+    glUniformMatrix4fv(externalMatrixLoc, 1, GL_FALSE, externalTransform);
+    glBindBuffer(GL_ARRAY_BUFFER, externalVertexBuffer);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          reinterpret_cast<const void*>(0));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          reinterpret_cast<const void*>(2 * sizeof(GLfloat)));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    unsigned char pixels[32 * 32 * 4];
+    glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    unsigned long long sum = 0;
+    for (size_t i = 0; i < sizeof(pixels); i += 4) {
+      sum += pixels[i] + pixels[i + 1] + pixels[i + 2];
+    }
+    const bool black = sum < 4ull * 3 * (sizeof(pixels) / 4);
+    tianguan::sunshineNoteVideoLuma(static_cast<unsigned long long>(NowMs()), black);
+  };
+  // Surface 模式的 5 秒窗口：发布 RenderFramePerf（后端 5 秒汇总行与 statusJson.perf
+  // 读它），并打一条带 src=surface 的统计行。
+  auto logExternalStatsIfDue = [&]() {
+    const long long nowMs = NowMs();
+    if (lastExternalLogMs != 0 && nowMs - lastExternalLogMs < 5000) return;
+    lastExternalLogMs = nowMs;
+    const long long windowUs = NowUs() - externalPerfWindowStartUs;
+    tianguan::RenderFramePerf perf;
+    perf.windowMs =
+        windowUs > 0 ? static_cast<unsigned long long>(windowUs / 1000) : 0;
+    perf.outFps = windowUs > 0
+                      ? static_cast<double>(externalPerfSwaps) * 1000000.0 /
+                            static_cast<double>(windowUs)
+                      : 0.0;
+    perf.lagAvgMs = externalLag.avgMs();
+    perf.lagP95Ms = externalLag.p95Ms();
+    perf.pickupToSwapAvgMs = externalPickupSwap.avgMs();
+    perf.pickupToSwapP95Ms = externalPickupSwap.p95Ms();
+    perf.frameAvailableToSwapAvgMs = externalFrameToSwap.avgMs();
+    perf.frameAvailableToSwapP95Ms = externalFrameToSwap.p95Ms();
+    {
+      std::lock_guard<std::mutex> lock(g_framePerfMutex);
+      g_framePerf = perf;
+    }
+    externalLag.reset();
+    externalPickupSwap.reset();
+    externalFrameToSwap.reset();
+    externalPerfSwaps = 0;
+    externalPerfWindowStartUs = NowUs();
+    char line[640];
+    std::snprintf(line, sizeof(line),
+                  "session=%s src=surface frames=%lld fps=%.1f size=%dx%d tex=%dx%d "
+                  "lag=%.1f/%.1fms pickupSwap=%.1f/%.1fms frameToSwap=%.1f/%.1fms",
+                  renderer->sessionId.c_str(), frames, perf.outFps, surfaceWidth,
+                  surfaceHeight, texWidth, texHeight, perf.lagAvgMs, perf.lagP95Ms,
+                  perf.pickupToSwapAvgMs, perf.pickupToSwapP95Ms,
+                  perf.frameAvailableToSwapAvgMs, perf.frameAvailableToSwapP95Ms);
+    LogDebug(line);
+  };
+  auto hasPendingTask = [&]() -> bool {
+    std::lock_guard<std::mutex> lock(renderer->taskMutex);
+    return renderer->taskKind != 0;
+  };
+  // 在渲染线程执行宿主投递的控制命令（建/销毁外部纹理源）。GL 上下文在这里是当前
+  // 的；完成后唤醒阻塞在 taskDone 上的调用方。
+  auto processPendingTask = [&]() {
+    int kind = 0;
+    {
+      std::lock_guard<std::mutex> lock(renderer->taskMutex);
+      kind = renderer->taskKind;
+    }
+    if (kind == 0) return;
+    bool ok = false;
+    if (kind == 1) {
+      std::string error;
+      if (externalProgram == 0) externalProgram = BuildExternalProgram(error);
+      if (externalProgram == 0) {
+        char line[320];
+        std::snprintf(line, sizeof(line), "session=%s external shader failed: %s",
+                      renderer->sessionId.c_str(), error.c_str());
+        LogLine(line);
+      } else {
+        externalTextureLoc = glGetUniformLocation(externalProgram, "uTexture");
+        externalMatrixLoc = glGetUniformLocation(externalProgram, "uTexMatrix");
+        // 外部纹理的顶点缓冲用 GL 原生 UV 方向（左下角 v=0、左上角 v=1），与
+        // OpenHarmony 官方 NativeImage 示例（applications_app_samples 的
+        // NdkNativeImage ImageRender::SetupVertexAttributes）一致。原因：
+        // OH_NativeImage_GetTransformMatrixV2 返回的 4x4 矩阵已经包含把生产者
+        // 自上而下缓冲翻正的 Y 翻转（以及裁剪/旋转），见 native_image.h 里
+        // "transform matrix of the texture image by producer transform type"。
+        // BGRA 路径的 vertexBuffer 是 v=0 在上（补偿 glTexSubImage2D 的自上而下
+        // 上传），若拿来画外部纹理就会把这次翻转预先抵消，画面上下颠倒。
+        static const GLfloat kExternalVertices[] = {
+            -1.0f, -1.0f, 0.0f, 0.0f,  // 左下 -> uv(0,0)
+            1.0f,  -1.0f, 1.0f, 0.0f,  // 右下 -> uv(1,0)
+            -1.0f, 1.0f,  0.0f, 1.0f,  // 左上 -> uv(0,1)
+            1.0f,  1.0f,  1.0f, 1.0f   // 右上 -> uv(1,1)
+        };
+        if (externalVertexBuffer == 0) {
+          glGenBuffers(1, &externalVertexBuffer);
+          glBindBuffer(GL_ARRAY_BUFFER, externalVertexBuffer);
+          glBufferData(GL_ARRAY_BUFFER, sizeof(kExternalVertices), kExternalVertices,
+                       GL_STATIC_DRAW);
+        }
+        glGenTextures(1, &externalTexture);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        nativeImage = OH_NativeImage_Create(externalTexture, GL_TEXTURE_EXTERNAL_OES);
+        if (nativeImage == nullptr) {
+          char line[192];
+          std::snprintf(line, sizeof(line), "session=%s OH_NativeImage_Create failed",
+                        renderer->sessionId.c_str());
+          LogLine(line);
+        } else {
+          {
+            std::lock_guard<std::mutex> lock(frameSignal->mutex);
+            frameSignal->alive = true;
+            frameSignal->owner = renderer;
+            frameSignal->frameAvailable.store(false);
+          }
+          OH_OnFrameAvailableListener listener;
+          listener.context = frameSignal.get();
+          listener.onFrameAvailable = OnExternalFrameAvailable;
+          const int32_t listenerResult =
+              OH_NativeImage_SetOnFrameAvailableListener(nativeImage, listener);
+          NativeWindow* sourceWindow =
+              listenerResult == 0 ? OH_NativeImage_AcquireNativeWindow(nativeImage) : nullptr;
+          if (listenerResult != 0 || sourceWindow == nullptr) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "session=%s surface source window failed (listener=%d)",
+                          renderer->sessionId.c_str(), listenerResult);
+            LogLine(line);
+          } else {
+            externalActive = true;
+            renderer->externalSourceActive.store(true);
+            loggedTransform = false;  // 新源头：第一帧重新打一次矩阵
+            {
+              std::lock_guard<std::mutex> lock(renderer->taskMutex);
+              renderer->taskTextureId = externalTexture;
+              renderer->taskWindow = sourceWindow;
+            }
+            ok = true;
+            char line[224];
+            std::snprintf(line, sizeof(line),
+                          "session=%s surface source created (texture=%u)",
+                          renderer->sessionId.c_str(), externalTexture);
+            LogLine(line);
+          }
+        }
+        if (!ok) {
+          // 建到一半失败：把已经建好的东西收干净，避免泄漏。
+          {
+            std::lock_guard<std::mutex> lock(frameSignal->mutex);
+            frameSignal->alive = false;
+            frameSignal->owner.reset();
+          }
+          if (nativeImage != nullptr) {
+            OH_NativeImage_UnsetOnFrameAvailableListener(nativeImage);
+            OH_NativeImage_Destroy(&nativeImage);
+          }
+          if (externalTexture != 0) {
+            glDeleteTextures(1, &externalTexture);
+            externalTexture = 0;
+          }
+          if (externalVertexBuffer != 0) {
+            glDeleteBuffers(1, &externalVertexBuffer);
+            externalVertexBuffer = 0;
+          }
+          if (externalProgram != 0) {
+            glDeleteProgram(externalProgram);
+            externalProgram = 0;
+          }
+        }
+      }
+    } else if (kind == 2) {
+      // 先让监听回调失效，再销毁 NativeImage/纹理；调用方保证解码器已经停止。
+      {
+        std::lock_guard<std::mutex> lock(frameSignal->mutex);
+        frameSignal->alive = false;
+        frameSignal->owner.reset();
+        frameSignal->frameAvailable.store(false);
+      }
+      if (nativeImage != nullptr) {
+        OH_NativeImage_UnsetOnFrameAvailableListener(nativeImage);
+        OH_NativeImage_Destroy(&nativeImage);
+      }
+      if (externalTexture != 0) {
+        glDeleteTextures(1, &externalTexture);
+        externalTexture = 0;
+      }
+      if (externalVertexBuffer != 0) {
+        glDeleteBuffers(1, &externalVertexBuffer);
+        externalVertexBuffer = 0;
+      }
+      if (externalProgram != 0) {
+        glDeleteProgram(externalProgram);
+        externalProgram = 0;
+      }
+      externalActive = false;
+      renderer->externalSourceActive.store(false);
+      texWidth = 0;
+      texHeight = 0;
+      ok = true;
+      char line[192];
+      std::snprintf(line, sizeof(line), "session=%s surface source released",
+                    renderer->sessionId.c_str());
+      LogLine(line);
+    }
+    {
+      std::lock_guard<std::mutex> lock(renderer->taskMutex);
+      renderer->taskOk = ok;
+      renderer->taskKind = 0;
+      renderer->taskFinished = true;
+    }
+    renderer->taskDone.notify_all();
+  };
 
   do {
     int32_t result = OH_NativeWindow_CreateNativeWindowFromSurfaceId(surfaceId, &window);
@@ -698,6 +1179,9 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     publishStatsIfDue("running");
 
     while (true) {
+      // 宿主投递的零拷贝控制命令（建/销毁外部纹理源）先执行：GL 上下文在这条
+      // 线程上是当前的。没有命令时是一次空检查。
+      processPendingTask();
       // Consume a view transform change first: it must redraw even when no new
       // frame arrives (pan/zoom over a static desktop). Then copy the current
       // transform for this iteration; the lock is released before any query,
@@ -747,6 +1231,115 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
         continue;
       }
       surfaceQueryFailures = 0;
+      // 零拷贝（Surface 模式）会话：画面来自 OH_NativeImage 的外部纹理，完全不
+      // 读 BGRA 镜像（takeFrameStruct 一次都不调）。本分支与下面的 BGRA 路径互斥，
+      // 原路径（VNC/RDP/Sunshine Buffer 回退）逐行未改。
+      if (externalActive) {
+        const int requestedWidth = renderer->sourceWidth.load();
+        const int requestedHeight = renderer->sourceHeight.load();
+        if (requestedWidth > 0 && requestedHeight > 0 &&
+            (requestedWidth != texWidth || requestedHeight != texHeight)) {
+          texWidth = requestedWidth;
+          texHeight = requestedHeight;
+          geometryDirty = true;
+          char line[192];
+          std::snprintf(line, sizeof(line), "session=%s surface source %dx%d",
+                        renderer->sessionId.c_str(), texWidth, texHeight);
+          LogLine(line);
+        }
+        if (frameSignal->frameAvailable.exchange(false) && nativeImage != nullptr) {
+          // 帧可用回调只置标志并唤醒；UpdateSurfaceImage / 查询矩阵 / 绘制都必须
+          // 在这条线程（GL 上下文当前）做。
+          const long long arrivedUs = frameSignal->lastFrameUs.load();
+          const int32_t updateResult = OH_NativeImage_UpdateSurfaceImage(nativeImage);
+          if (updateResult == 0) {
+            const long long pickedUpUs = NowUs();
+            if (arrivedUs > 0 && pickedUpUs >= arrivedUs)
+              externalLag.add(pickedUpUs - arrivedUs);
+            const int32_t matrixResult =
+                OH_NativeImage_GetTransformMatrixV2(nativeImage, externalTransform);
+            bool matrixChanged = false;
+            if (matrixResult != 0) {
+              // 拿不到矩阵时退化为单位矩阵（不自己猜翻转），日志里会明确记一条。
+              static const float kIdentityMatrix[16] = {
+                  1.0f, 0.0f, 0.0f, 0.0f,
+                  0.0f, 1.0f, 0.0f, 0.0f,
+                  0.0f, 0.0f, 1.0f, 0.0f,
+                  0.0f, 0.0f, 0.0f, 1.0f};
+              std::memcpy(externalTransform, kIdentityMatrix, sizeof(externalTransform));
+              loggedTransform = false;  // 下一帧仍拿不到就再记一次
+            } else {
+              matrixChanged = std::memcmp(externalTransform, lastLoggedTransform,
+                                          sizeof(externalTransform)) != 0;
+            }
+            // 诊断（一次性 + 变化时）：矩阵语义是「裁剪区域 + 翻转/旋转」，来自
+            // native_image.h 的 "transform matrix of the texture image by producer
+            // transform type"。典型值应含 scaleY=-1 或平移 1（列主序）。
+            const long long matrixNowMs = NowMs();
+            if (!loggedTransform ||
+                (matrixChanged && matrixNowMs - lastTransformLogMs >= 1000)) {
+              loggedTransform = true;
+              lastTransformLogMs = matrixNowMs;
+              std::memcpy(lastLoggedTransform, externalTransform,
+                          sizeof(lastLoggedTransform));
+              char line[400];
+              std::snprintf(
+                  line, sizeof(line),
+                  "session=%s texture transform: %.3f %.3f %.3f %.3f | %.3f %.3f "
+                  "%.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+                  renderer->sessionId.c_str(), externalTransform[0],
+                  externalTransform[1], externalTransform[2], externalTransform[3],
+                  externalTransform[4], externalTransform[5], externalTransform[6],
+                  externalTransform[7], externalTransform[8], externalTransform[9],
+                  externalTransform[10], externalTransform[11], externalTransform[12],
+                  externalTransform[13], externalTransform[14], externalTransform[15]);
+              LogLine(line);
+            }
+            if (drawExternalAndSwap()) {
+              geometryDirty = false;
+              ++externalPerfSwaps;
+              if (pickedUpUs != 0) externalPickupSwap.add(NowUs() - pickedUpUs);
+              if (arrivedUs > 0 && NowUs() >= arrivedUs)
+                externalFrameToSwap.add(NowUs() - arrivedUs);
+              const long long nowMs = NowMs();
+              if (lastLumaProbeMs == 0 || nowMs - lastLumaProbeMs >= 500) {
+                lastLumaProbeMs = nowMs;
+                probeExternalLuma();
+              }
+              logExternalStatsIfDue();
+            } else if (swapFailures >= kMaxSwapFailures) {
+              setFailure(EglErrorText("eglSwapBuffers (repeated)", lastEglError));
+              break;
+            }
+          } else if (lastSurfaceFailLogMs == 0 ||
+                     NowMs() - lastSurfaceFailLogMs >= 1000) {
+            lastSurfaceFailLogMs = NowMs();
+            // 窗口失效（surface 被销毁后重建）时 UpdateSurfaceImage 会失败。限频
+            // 记一条日志并继续按 4ms 轮询；真正恢复需要重新建立串流（见 render.h
+            // 里对 renderReleaseExternalSource 的说明）。
+            char line[224];
+            std::snprintf(line, sizeof(line),
+                          "session=%s UpdateSurfaceImage failed (%d); waiting for a new "
+                          "stream to re-acquire the source",
+                          renderer->sessionId.c_str(), updateResult);
+            LogLine(line);
+          }
+          publishStatsIfDue("running");
+        } else if (geometryDirty && presented && externalTexture != 0) {
+          // 尺寸/布局变化或缩放平移：用已经解码好的外部纹理重画一次。
+          if (drawExternalAndSwap()) geometryDirty = false;
+          publishStatsIfDue("running");
+        } else {
+          publishStatsIfDue("running");
+          // 等帧：帧可用回调唤醒，4ms 兜底轮询（与 BGRA 路径的空闲节奏一致）。
+          std::unique_lock<std::mutex> lock(renderer->mutex);
+          renderer->wake.wait_for(lock, std::chrono::milliseconds(kIdlePollMs), [&]() {
+            return renderer->stopRequested || renderer->suspended ||
+                   frameSignal->frameAvailable.load() || hasPendingTask();
+          });
+        }
+        continue;
+      }
       // 本次轮询的取帧时刻（0 = 本轮没取到帧），pickupToSwap 的起点。
       long long pickupUs = 0;
       tianguan::FrameGrab grab;
@@ -907,6 +1500,35 @@ void RenderLoop(const std::shared_ptr<Renderer> renderer, uint64_t surfaceId,
     }
   } while (false);
 
+  // 零拷贝源的收尾：先让帧可用回调失效（late callback 只碰 shared_ptr 信号），
+  // 再销毁 NativeImage 与 OES 纹理。仍在本线程、GL 上下文尚未销毁之前。
+  {
+    std::lock_guard<std::mutex> lock(frameSignal->mutex);
+    frameSignal->alive = false;
+    frameSignal->owner.reset();
+    frameSignal->frameAvailable.store(false);
+  }
+  if (nativeImage != nullptr) {
+    OH_NativeImage_UnsetOnFrameAvailableListener(nativeImage);
+    OH_NativeImage_Destroy(&nativeImage);
+  }
+  if (lumaFbo != 0) glDeleteFramebuffers(1, &lumaFbo);
+  if (lumaRenderbuffer != 0) glDeleteRenderbuffers(1, &lumaRenderbuffer);
+  if (externalTexture != 0) glDeleteTextures(1, &externalTexture);
+  if (externalVertexBuffer != 0) glDeleteBuffers(1, &externalVertexBuffer);
+  if (externalProgram != 0) glDeleteProgram(externalProgram);
+  externalActive = false;
+  renderer->externalSourceActive.store(false);
+  // 放开还阻塞在 taskDone 上的控制命令调用方（线程已经结束，不会再有结果）。
+  {
+    std::lock_guard<std::mutex> lock(renderer->taskMutex);
+    renderer->loopFinished.store(true);
+    renderer->taskKind = 0;
+    renderer->taskOk = false;
+    renderer->taskFinished = true;
+  }
+  renderer->taskDone.notify_all();
+
   // Tear everything this thread created down, in reverse order. GL objects
   // first (the context is still current), then its EGL surface and context,
   // then the native window. The shared display is intentionally NOT
@@ -976,6 +1598,10 @@ std::string attachRenderSurface(const std::string& sessionId, const std::string&
   if (parsed == 0) return "ERROR:INVALID_SURFACE_ID";
 
   std::shared_ptr<Renderer> renderer(new Renderer(sessionId, startSuspended));
+  // The frame-available callback reaches the renderer through this weak_ptr, so
+  // a callback that races with renderer teardown cannot resurrect or touch a
+  // freed object.
+  renderer->frameSignal->owner = renderer;
   {
     std::lock_guard<std::mutex> lock(renderer->statsMutex);
     renderer->stats.state = "starting";
@@ -1122,6 +1748,104 @@ std::string setRenderSurfaceSuspended(const std::string& sessionId, bool suspend
                 suspended ? "suspended" : "resumed");
   LogLine(line);
   return suspended ? "OK:SUSPENDED" : "OK:RESUMED";
+}
+
+namespace {
+
+std::shared_ptr<Renderer> FindRenderer(const std::string& sessionId) {
+  std::lock_guard<std::mutex> lock(g_registryMutex);
+  const auto found = g_renderers.find(sessionId);
+  return found == g_renderers.end() ? std::shared_ptr<Renderer>() : found->second;
+}
+
+void RenderLogLine(const std::string& line) { LogLine(line.c_str()); }
+
+}  // namespace
+
+bool renderCreateExternalSource(const std::string& sessionId, unsigned int* textureId,
+                                NativeWindow** nativeWindow) {
+  if (sessionId.empty() || textureId == nullptr || nativeWindow == nullptr) return false;
+  // 解码线程在第一次 setup 时调用：ArkTS 的 XComponent surface 可能还没 attach，
+  // 这里最多等 10 秒（每 20ms 查一次注册表）。等不到就让调用方回退 Buffer 模式。
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  std::shared_ptr<Renderer> renderer;
+  while (std::chrono::steady_clock::now() < deadline) {
+    renderer = FindRenderer(sessionId);
+    if (renderer) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (!renderer) {
+    RenderLogLine("render surface not attached within 10s; surface source unavailable");
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(renderer->mutex);
+    if (renderer->stopRequested) return false;
+    // 窗口被隐藏时渲染线程停在 park 里，控制命令不会被处理；直接失败让视频路径
+    // 回退 Buffer 模式，避免白等 10 秒。
+    if (renderer->suspended) {
+      RenderLogLine("render surface suspended; surface source unavailable");
+      return false;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(renderer->taskMutex);
+    if (renderer->taskKind != 0 || renderer->loopFinished.load()) return false;
+    renderer->taskKind = 1;
+    renderer->taskOk = false;
+    renderer->taskFinished = false;
+    renderer->taskTextureId = 0;
+    renderer->taskWindow = nullptr;
+  }
+  renderer->wake.notify_all();
+  {
+    std::unique_lock<std::mutex> lock(renderer->taskMutex);
+    if (!renderer->taskDone.wait_until(lock, deadline, [&]() {
+          return renderer->taskFinished || renderer->loopFinished.load();
+        })) {
+      RenderLogLine("surface source creation timed out on the render thread");
+      return false;
+    }
+    if (!renderer->taskOk) return false;
+    *textureId = renderer->taskTextureId;
+    *nativeWindow = renderer->taskWindow;
+  }
+  return true;
+}
+
+void renderSetExternalSourceSize(const std::string& sessionId, int width, int height) {
+  if (width <= 0 || height <= 0) return;
+  const std::shared_ptr<Renderer> renderer = FindRenderer(sessionId);
+  if (!renderer) return;
+  // 只记录尺寸并唤醒渲染线程：下一帧（或这一次的空闲轮询）会把 contain 几何按新
+  // 尺寸重算，再经 drawExternalAndSwap/publishStatsIfDue 发布到 renderStats。
+  renderer->sourceWidth.store(width);
+  renderer->sourceHeight.store(height);
+  renderer->wake.notify_all();
+}
+
+void renderReleaseExternalSource(const std::string& sessionId) {
+  const std::shared_ptr<Renderer> renderer = FindRenderer(sessionId);
+  if (!renderer) return;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  {
+    std::unique_lock<std::mutex> lock(renderer->taskMutex);
+    // 等上一个命令结束（正常不会有）；渲染线程已经结束就什么都不用做。
+    renderer->taskDone.wait_until(lock, deadline, [&]() {
+      return renderer->taskKind == 0 || renderer->loopFinished.load();
+    });
+    if (renderer->loopFinished.load()) return;
+    renderer->taskKind = 2;
+    renderer->taskOk = false;
+    renderer->taskFinished = false;
+  }
+  renderer->wake.notify_all();
+  {
+    std::unique_lock<std::mutex> lock(renderer->taskMutex);
+    renderer->taskDone.wait_until(lock, deadline, [&]() {
+      return renderer->taskFinished || renderer->loopFinished.load();
+    });
+  }
 }
 
 }  // namespace tianguan

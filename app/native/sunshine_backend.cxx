@@ -1161,6 +1161,26 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
       sinkHost->commitFrame(sinkHost->user, frameGeneration, rects, count,
                             width, height);
   };
+  // 零拷贝（Surface 模式）桥接：视频 sink 只会转调宿主的同名回调，宿主不实现时
+  // 视频路径回退 Buffer 模式。
+  frameSink.acquireExternalSource = [](void* user, int frameGeneration,
+                                       unsigned int* textureId,
+                                       void** nativeWindow) -> bool {
+    const SunshineHost* sinkHost = static_cast<const SunshineHost*>(user);
+    if (sinkHost->acquireExternalSource == nullptr) return false;
+    return sinkHost->acquireExternalSource(sinkHost->user, frameGeneration, textureId,
+                                           nativeWindow);
+  };
+  frameSink.setSourceSize = [](void* user, int frameGeneration, int width, int height) {
+    const SunshineHost* sinkHost = static_cast<const SunshineHost*>(user);
+    if (sinkHost->setSourceSize != nullptr)
+      sinkHost->setSourceSize(sinkHost->user, frameGeneration, width, height);
+  };
+  frameSink.releaseExternalSource = [](void* user, int frameGeneration) {
+    const SunshineHost* sinkHost = static_cast<const SunshineHost*>(user);
+    if (sinkHost->releaseExternalSource != nullptr)
+      sinkHost->releaseExternalSource(sinkHost->user, frameGeneration);
+  };
   video->bindFrameSink(frameSink, generation);
 
   const int videoFormats = chooseVideoFormats(options, static_cast<uint32_t>(codecSupport));
@@ -1417,15 +1437,16 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
           //   解码侧（sunshine_video.cxx）netToSubmit / submitToOutput / convert /
           //     commit 与 in/dec 帧率；
           //   渲染侧（render.cxx）实际上屏帧率 out、取帧滞后 lag、取帧到 swap 返回
-          //     的 swap。
+          //     的 swap；Surface（零拷贝）源下 lag=帧可用->UpdateSurfaceImage，
+          //     swap=UpdateSurfaceImage->swap，surface=帧可用->swap（另含 vsync 等待）。
           // 两边都是进程级只读快照，读它不阻塞解码或渲染线程。
           const SunshineVideoPerf videoPerf = sunshineVideoPerf();
           const RenderFramePerf renderPerf = renderFramePerf();
           logWarn(formatText(
               "sunshine perf: in=%.1ffps dec=%.1ffps out=%.1ffps "
               "netToSubmit=%.1f/%.1f submitToOutput=%.1f/%.1f convert=%.1f/%.1f "
-              "commit=%.1f/%.1f lag=%.1f/%.1f swap=%.1f/%.1f (avg/p95 ms, "
-              "window=%llums, dropped=%llu)",
+              "commit=%.1f/%.1f lag=%.1f/%.1f swap=%.1f/%.1f surface=%.1f/%.1f "
+              "(avg/p95 ms, window=%llums, dropped=%llu)",
               videoPerf.inFps, videoPerf.decFps, renderPerf.outFps,
               videoPerf.netToSubmitAvgMs, videoPerf.netToSubmitP95Ms,
               videoPerf.submitToOutputAvgMs, videoPerf.submitToOutputP95Ms,
@@ -1433,7 +1454,9 @@ MediaOutcome runMediaStream(const SunshineHost& host, const SunshineOptions& opt
               videoPerf.commitAvgMs, videoPerf.commitP95Ms,
               renderPerf.lagAvgMs, renderPerf.lagP95Ms,
               renderPerf.pickupToSwapAvgMs, renderPerf.pickupToSwapP95Ms,
-              videoPerf.windowMs, videoPerf.droppedUnits));
+              renderPerf.frameAvailableToSwapAvgMs,
+              renderPerf.frameAvailableToSwapP95Ms, videoPerf.windowMs,
+              videoPerf.droppedUnits));
         }
       }
         });

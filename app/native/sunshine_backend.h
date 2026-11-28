@@ -135,6 +135,19 @@ struct SunshineHost {
   // 提交一帧解码结果（BGRA）：语义与 RdpHost::commitFrame 完全相同。
   void (*commitFrame)(void* user, int generation, const SunshineRect* rects,
                       size_t count, int width, int height) = nullptr;
+  // 零拷贝视频路径（Sunshine 专用，可选）：由宿主把会话的渲染表面包成外部纹理源。
+  //   acquireExternalSource: 成功时填 *textureId（OES 纹理）与 *nativeWindow（给
+  //     OH_VideoDecoder_SetSurface 的 OHNativeWindow，用 void* 表示）；返回 false
+  //     表示渲染表面还没 attach / 超时 / 被隐藏，视频路径会回退 Buffer 模式。
+  //     会在 common-c 视频线程（setup 内）阻塞等待，最长约 10 秒。
+  //   setSourceSize: Surface 模式的有效画面尺寸（无 stride/像素格式），宿主据此
+  //     更新状态里的宽高并按新尺寸重建（空的）镜像。
+  //   releaseExternalSource: 归还外部纹理源；视频路径保证在解码器 Stop/Destroy
+  //     之后才调用，宿主可以安全销毁 OH_NativeImage。
+  bool (*acquireExternalSource)(void* user, int generation, unsigned int* textureId,
+                                void** nativeWindow) = nullptr;
+  void (*setSourceSize)(void* user, int generation, int width, int height) = nullptr;
+  void (*releaseExternalSource)(void* user, int generation) = nullptr;
 
   // 客户端主动分辨率（NAPI requestDesktopSize）：会话线程在已连接期间每 200ms
   // 取一次。返回 true 时填 width/height，并把请求槽标记为 in-flight；语义与

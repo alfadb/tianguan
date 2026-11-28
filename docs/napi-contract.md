@@ -105,12 +105,12 @@
 | `submitToOutputMsAvg` | 送进 AVCodec 到对应帧输出回调的平均耗时（按 PTS 配对） |
 | `convertMsAvg` | 输出回调里 NV12/NV21 → BGRA 的 libswscale 转换平均耗时 |
 | `commitMsAvg` | `commitFrame`（含镜像拷贝）平均耗时 |
-| `lagMsAvg` / `lagMsP95` | 镜像提交时间戳到渲染线程取走该帧的滞后（平均 / P95） |
+| `lagMsAvg` / `lagMsP95` | Buffer 模式：镜像提交时间戳到渲染线程取走该帧的滞后；Surface 模式：帧可用回调到完成 `UpdateSurfaceImage`（见「零拷贝」一节） |
 | `perfWindowMs` | 上述 5 秒窗口的实际长度 |
 
 - 这些都是**只读快照**，读取不等待解码或渲染；窗口没有样本时为 `0`。未连接、还没攒满一个 5 秒窗口、或没有挂载原生渲染器时，对应字段为 `0`（`perfWindowMs=0` 表示解码侧尚未发布过窗口）。
-- 只有 Sunshine 的帧镜像会写提交时间戳（`commitTimeUs`），所以 `lagMsAvg`/`lagMsP95` 只对 Sunshine 有意义；VNC/RDP 不产生这两个字段。
-- 后端同时每 5 秒打一条 W 级日志：`sunshine perf: in=…fps dec=…fps out=…fps netToSubmit=…/… submitToOutput=…/… convert=…/… commit=…/… lag=…/… swap=…/… (avg/p95 ms, window=…ms, dropped=…)`，其中 `swap` 是「取到帧到 `eglSwapBuffers` 返回」的平均/P95（含拷贝、上传、绘制）；渲染线程自己的 `TianguanRender` 统计行也带 `lag=`/`pickupSwap=`。这些数字只用于定位瓶颈，不改变任何渲染或解码行为。
+- 只有 Sunshine 的帧镜像会写提交时间戳（`commitTimeUs`），所以 `lagMsAvg`/`lagMsP95` 只对 Sunshine 有意义；VNC/RDP 不产生这两个字段。Surface 模式下 `convertMsAvg`/`commitMsAvg` 恒为 0（CPU 转换与镜像拷贝都不存在）。
+- 后端同时每 5 秒打一条 W 级日志：`sunshine perf: in=…fps dec=…fps out=…fps netToSubmit=…/… submitToOutput=…/… convert=…/… commit=…/… lag=…/… swap=…/… surface=…/… (avg/p95 ms, window=…ms, dropped=…)`，其中 `swap` 是「取到帧（Surface 模式是完成 `UpdateSurfaceImage`）到 `eglSwapBuffers` 返回」，`surface` 只在 Surface 模式下非 0（帧可用到 swap 返回）；渲染线程自己的 `TianguanRender` 统计行也带 `lag=`/`pickupSwap=`（Surface 模式带 `src=surface`/`frameToSwap=`）。这些数字只用于定位瓶颈，不改变任何渲染或解码行为。
 
 ### 重新确认服务端指纹
 
@@ -135,7 +135,7 @@ submitPin(sessionId: string, pin: string): boolean
 - 服务端证书与配对时固定的指纹不一致（`PinMismatchError`）：`state=failed` + `errorCode="fingerprint-mismatch"`，`error` 说明需要重新配对；会话不会自动重试，由用户处理（当前版本没有通过 NAPI 清除 Sunshine pin 文件的入口）。
 - 配对成功后服务端证书与指纹由 native 侧落盘在 `sunshineStateDir`，不经过 ArkTS 信任库；`expectedFingerprint`/`forgetTrustedFingerprint` 只作用于 VNC/RDP 的信任锚，对 Sunshine 无效。
 - 连接建立后断线：会话进入 `state=reconnecting` + `errorCode="network"` 并按 1s/2s/4s 退避自动重连（每次重连重新走 `/serverinfo` → `/launch`）；`connected` 期间收到 `generation` 变化（`reconnectSession`）会立即拆流重连。
-- 视频用 OHOS AVCodec 硬解（NV12→BGRA 后走与 RDP 相同的 `resizeFrame`/`commitFrame` 帧提交），音频用 libopus 多流解码 + `OH_AudioRenderer` 播放；`width`/`height` 按协商到的流分辨率出现在状态里，`takeFrame` 交付解码后的 BGRA 帧。
+- 视频用 OHOS AVCodec 硬解：原生渲染器 attach 时走零拷贝 Surface 模式（见「画面」里的说明），否则回退 NV12→BGRA 的 Buffer 模式；音频用 libopus 多流解码 + `OH_AudioRenderer` 播放；`width`/`height` 按协商到的流分辨率出现在状态里。
 
 ## 画面
 
@@ -148,6 +148,15 @@ takeFrame(sessionId: string, buffer: ArrayBuffer, afterVersion: number, forceFul
 ```json
 { "x": 0, "y": 0, "w": 1920, "h": 1200, "version": 119, "generation": 3, "full": true }
 ```
+
+### 零拷贝（Surface 模式）视频路径
+
+Sunshine 会话在**原生渲染器已 attach** 时走零拷贝路径：AVCodec 用 Surface 模式（`OH_VideoDecoder_SetSurface`）把帧直接渲染进 `OH_NativeImage` 的 `OHNativeWindow`，渲染线程把同一块画面当 OES 外部纹理（`GL_TEXTURE_EXTERNAL_OES` + `samplerExternalOES`，采样坐标乘 `OH_NativeImage_GetTransformMatrixV2`）直接采样上屏。这条路上没有 NV12→BGRA 的 CPU 转换、没有整帧镜像拷贝、也没有每帧 `glTexSubImage2D` 上传。
+
+- **回退**：渲染表面还没 attach（最多等 10 秒）、窗口被隐藏、或解码器 `SetSurface`/`Configure`/`Prepare` 失败时，视频路径回退到原来的 Buffer 模式，行为与接入零拷贝前完全一致；日志里写的是 `surface mode (zero-copy)` 还是 `buffer mode NV12`。
+- **已知限制**：Surface 模式下没有像素写进 BGRA 帧镜像，所以 `takeFrame`/`copyRegion`/`takeFrameStruct` 在 Sunshine 会话下没有像素可交付（返回 `NONE`；镜像保持全黑，尺寸与状态里的 `width`/`height` 一致，由 `setSourceSize` 更新）；只有原生渲染器（XComponent 呈现）能看到画面。渲染表面在串流中途重建（`detachRenderSurface` 后重新 attach）时，旧的外部纹理源随旧渲染器销毁，解码器继续向失效窗口提交的帧会被丢弃，画面要等重新建立串流（重连）才恢复。
+- **黑屏检测**：Surface 模式下由渲染线程每 500 ms 把外部纹理画进 32×32 的 FBO 再 `glReadPixels`，按平均亮度判定（< 4 为黑，阈值与 Buffer 模式一致），结果照旧经 `pictureBlack` 字段暴露。
+- **统计**：`perf` 的 `convertMsAvg`/`commitMsAvg` 在 Surface 模式下恒为 0（这两段不存在）；`lagMsAvg` 是「帧可用回调 → 完成 `UpdateSurfaceImage`」，`swap` 是「完成 `UpdateSurfaceImage` → `eglSwapBuffers` 返回」，后端 5 秒 W 日志另外多一个 `surface=平均/P95`（帧可用 → swap 返回，含 `eglSwapInterval(1)` 的 vsync 等待）。渲染线程的 `TianguanRender` 统计行在该模式下带 `src=surface` 与 `frameToSwap=`。
 
 - 像素格式固定 **BGRA_8888**，`stride = w * 4`。
 - `buffer` 必须至少 `w*h*4`；不足时返回 `ERROR:BUFFER_TOO_SMALL`，不写入。

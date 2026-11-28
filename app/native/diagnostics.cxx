@@ -3224,6 +3224,43 @@ void sunshineCommitFrame(void* user, int generation,
   state.commitTimeUs = steadyNowUs();
 }
 
+// ---------------------------------------------------------------------------
+// 零拷贝（Surface 模式）视频路径的转发层：视频 sink 的三个回调直接落到渲染层的
+// 外部纹理源接口（render.h）。VNC/RDP 与 Sunshine 的 Buffer 模式完全不经过这里。
+// ---------------------------------------------------------------------------
+
+// 申请外部纹理源。渲染表面还没 attach（或窗口被隐藏）时 renderCreateExternalSource
+// 会等待/失败，这里把失败原样交给视频路径，由它回退 Buffer 模式。
+bool sunshineAcquireExternalSource(void* user, int generation, unsigned int* textureId,
+                                   void** nativeWindow) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (textureId == nullptr || nativeWindow == nullptr) return false;
+  if (state.stop || state.generation.load() != generation) return false;
+  NativeWindow* window = nullptr;
+  if (!tianguan::renderCreateExternalSource(state.id, textureId, &window)) return false;
+  if (window == nullptr) return false;
+  *nativeWindow = window;
+  return true;
+}
+
+// Surface 模式没有像素写进 BGRA 镜像：这里只按新尺寸重建（全黑的）镜像并更新状态
+// 宽高（statusJson.width/height 与 ArkTS 取帧缓冲尺寸靠它），渲染线程另用
+// renderSetExternalSourceSize 更新 contain 几何。因此 Sunshine 会话下任何读像素的
+// 功能（takeFrame/copyRegion）拿到的是黑图，见 docs/napi-contract.md。
+void sunshineSetSourceSize(void* user, int generation, int width, int height) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  if (state.stop || state.generation.load() != generation) return;
+  sunshineResizeFrame(user, generation, width, height);
+  tianguan::renderSetExternalSourceSize(state.id, width, height);
+}
+
+void sunshineReleaseExternalSource(void* user, int generation) {
+  SessionState& state = *static_cast<SessionState*>(user);
+  (void)generation;
+  // 视频路径保证此时解码器已经 Destroy，渲染线程可以安全销毁 NativeImage。
+  tianguan::renderReleaseExternalSource(state.id);
+}
+
 unsigned sunshinePrepareInput(void* user) {
   SessionState& state = *static_cast<SessionState*>(user);
   clearQueuedInputForReconnect(state);
@@ -3296,6 +3333,9 @@ void runSunshineSession(const std::shared_ptr<SessionState>& state) {
   bridge.setAppTitle = sunshineHostSetAppTitle;
   bridge.resizeFrame = sunshineResizeFrame;
   bridge.commitFrame = sunshineCommitFrame;
+  bridge.acquireExternalSource = sunshineAcquireExternalSource;
+  bridge.setSourceSize = sunshineSetSourceSize;
+  bridge.releaseExternalSource = sunshineReleaseExternalSource;
   bridge.takeDesktopSizeRequest = sunshineTakeDesktopSizeRequest;
   bridge.finishDesktopSizeRequest = sunshineFinishDesktopSizeRequest;
   bridge.takeCursorHiddenRequest = sunshineTakeCursorHiddenRequest;

@@ -64,6 +64,7 @@ extern "C" {
 #include <multimedia/player_framework/native_avcodec_videodecoder.h>
 #include <multimedia/player_framework/native_avformat.h>
 #include <native_buffer/native_buffer.h>
+#include <native_window/external_window.h>
 
 #if defined(__MUSL__)
 #include <hilog/log.h>
@@ -320,6 +321,10 @@ class AvCodecVideoSink : public SunshineVideoSink {
       : codec_(nullptr),
         running_(false),
         started_(false),
+        surfaceMode_(false),
+        externalSourceHeld_(false),
+        surfaceWidth_(0),
+        surfaceHeight_(0),
         activeCalls_(0),
         generation_(0),
         configuredFps_(0),
@@ -369,58 +374,43 @@ class AvCodecVideoSink : public SunshineVideoSink {
       return false;
     }
 
-    OH_AVCodec* codec = OH_VideoDecoder_CreateByMime(mime);
-    if (codec == nullptr) {
-      logWarn(formatText("sunshine video: CreateByMime(%s) failed (%dx%d@%d)",
-                         mime, width, height, fps));
-      return false;
-    }
-    OH_AVFormat* format = OH_AVFormat_Create();
-    if (format == nullptr) {
-      OH_VideoDecoder_Destroy(codec);
-      logWarn("sunshine video: OH_AVFormat_Create failed");
-      return false;
-    }
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, width);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, height);
-    // Buffer 模式：输出到调用方缓冲，颜色格式固定 NV12，由 swscale 转 BGRA。
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_NV12);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, fps);
-    // 串流是实时的：低延迟优先，宁可少缓冲也不要增加端到端延迟。平台不支持该
-    // 键时 SDK 不报错、退回普通解码流程（见头文件说明）。
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENABLE_LOW_LATENCY, 1);
-    OH_AVErrCode result = OH_VideoDecoder_Configure(codec, format);
-    OH_AVFormat_Destroy(format);
-    if (result != AV_ERR_OK) {
-      logWarn(formatText("sunshine video: Configure(%s %dx%d) failed: %d", mime,
-                         width, height, static_cast<int>(result)));
-      OH_VideoDecoder_Destroy(codec);
-      return false;
+    SunshineFrameSink sink;
+    int generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      sink = frameSink_;
+      generation = generation_;
     }
 
-    // 新接口（API 11+）：Buffer 模式的 onNeedInputBuffer/onNewOutputBuffer 直接给
-    // OH_AVBuffer，比旧的 SetCallback（OH_AVMemory + index）少一次索引查表，也才能
-    // 用 OH_AVBuffer_SetBufferAttr 设置 pts/flags。
-    OH_AVCodecCallback callbacks;
-    std::memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.onError = onErrorCallback;
-    callbacks.onStreamChanged = onStreamChangedCallback;
-    callbacks.onNeedInputBuffer = onNeedInputBufferCallback;
-    callbacks.onNewOutputBuffer = onNewOutputBufferCallback;
-    result = OH_VideoDecoder_RegisterCallback(codec, callbacks, this);
-    if (result != AV_ERR_OK) {
-      logWarn(formatText("sunshine video: RegisterCallback failed: %d",
-                         static_cast<int>(result)));
-      OH_VideoDecoder_Destroy(codec);
-      return false;
+    // 1) 先试零拷贝 Surface 路径：解码器直接渲染进宿主给的 OH_NativeImage 窗口，
+    //    由渲染线程把同一块画面当 OES 外部纹理采样。这样就没有 NV12->BGRA 的 CPU
+    //    转换、没有整帧镜像拷贝、也没有每帧 glTexSubImage2D 上传。
+    void* externalWindow = nullptr;
+    unsigned int externalTexture = 0;
+    bool surfaceMode = false;
+    if (sink.acquireExternalSource != nullptr) {
+      if (sink.acquireExternalSource(sink.user, generation, &externalTexture,
+                                     &externalWindow) &&
+          externalWindow != nullptr) {
+        surfaceMode = true;
+      } else {
+        logWarn("sunshine video: surface source unavailable (renderer not attached or "
+                "timed out), using buffer mode");
+      }
     }
-    result = OH_VideoDecoder_Prepare(codec);
-    if (result != AV_ERR_OK) {
-      logWarn(formatText("sunshine video: Prepare failed: %d",
-                         static_cast<int>(result)));
-      OH_VideoDecoder_Destroy(codec);
-      return false;
+    OH_AVCodec* codec =
+        surfaceMode ? startDecoder(mime, width, height, fps, externalWindow) : nullptr;
+    if (surfaceMode && codec == nullptr) {
+      // Surface 路径起不来（Configure/SetSurface/Prepare 失败）就回退，行为与原来
+      // 的 Buffer 模式完全一致；外部纹理源由宿主销毁。
+      logWarn("sunshine video: surface-mode decoder failed to start, falling back to "
+              "buffer mode");
+      if (sink.releaseExternalSource != nullptr)
+        sink.releaseExternalSource(sink.user, generation);
+      surfaceMode = false;
     }
+    if (codec == nullptr) codec = startDecoder(mime, width, height, fps, nullptr);
+    if (codec == nullptr) return false;
     // Prepare 之后注册的回调线程可能已经就绪，Start 一返回就可能交还输入 buffer。
     // 所以在 Start 之前先把 codec_/running_ 发布出去（否则回调会看到 running_ 为
     // false 而丢掉这些 buffer，解码器永远等不到它们），再用 started_ 区分「Start
@@ -437,6 +427,10 @@ class AvCodecVideoSink : public SunshineVideoSink {
       codec_ = codec;
       running_ = true;
       started_ = false;
+      surfaceMode_ = surfaceMode;
+      externalSourceHeld_ = surfaceMode;
+      surfaceWidth_ = 0;
+      surfaceHeight_ = 0;
       queue_.clear();
       freeInputs_.clear();
       geometryDirty_ = true;
@@ -461,7 +455,7 @@ class AvCodecVideoSink : public SunshineVideoSink {
     }
     // 新的连接从空的 5 秒统计窗口开始（进程级聚合器，见文件头的统计说明）。
     g_videoPerf.reset();
-    result = OH_VideoDecoder_Start(codec);
+    OH_AVErrCode result = OH_VideoDecoder_Start(codec);
     if (result != AV_ERR_OK) {
       logWarn(formatText("sunshine video: Start failed: %d", static_cast<int>(result)));
       // stop() 会等在途回调退出并销毁这个解码器（codec_ 已经发布出去）。
@@ -473,9 +467,9 @@ class AvCodecVideoSink : public SunshineVideoSink {
       started_ = true;
     }
     logWarn(formatText(
-        "sunshine video: OH_VideoDecoder(%s) started, buffer mode NV12, "
-        "%dx%d@%d, low-latency=1",
-        mime, width, height, fps));
+        "sunshine video: OH_VideoDecoder(%s) started, %s, %dx%d@%d, low-latency=1",
+        mime, surfaceMode ? "surface mode (zero-copy)" : "buffer mode NV12", width,
+        height, fps));
     return true;
   }
 
@@ -550,12 +544,22 @@ class AvCodecVideoSink : public SunshineVideoSink {
 
   void stop() override {
     OH_AVCodec* codec = nullptr;
+    SunshineFrameSink sink;
+    int generation = 0;
+    bool releaseExternal = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       running_ = false;
       started_ = false;
       codec = codec_;
       codec_ = nullptr;
+      releaseExternal = externalSourceHeld_;
+      externalSourceHeld_ = false;
+      surfaceMode_ = false;
+      surfaceWidth_ = 0;
+      surfaceHeight_ = 0;
+      sink = frameSink_;
+      generation = generation_;
       queue_.clear();
       freeInputs_.clear();
       pendingSubmits_.clear();
@@ -573,6 +577,12 @@ class AvCodecVideoSink : public SunshineVideoSink {
       OH_VideoDecoder_Stop(codec);  // 已经 EOS/stopped 时返回错误，忽略即可。
       OH_VideoDecoder_Destroy(codec);
       logDebug("sunshine video: OH_VideoDecoder destroyed");
+    }
+    // 解码器已经停掉，才能归还 Surface 模式的 OHNativeImage 窗口（否则解码器可能
+    // 还在往一个正在销毁的 surface 提交帧）。
+    if (releaseExternal && sink.releaseExternalSource != nullptr) {
+      sink.releaseExternalSource(sink.user, generation);
+      logWarn("sunshine video: surface source released");
     }
     // sws 上下文与 BGRA 缓冲只在输出回调线程里用；activeCalls_ 归零之后不会再有
     // 线程使用它们。
@@ -644,6 +654,79 @@ class AvCodecVideoSink : public SunshineVideoSink {
   }
 
   // ---- 输入路径 -------------------------------------------------------------
+
+  // 创建并 Prepare 解码器。surfaceWindow 非空 = Surface 模式：像素格式用
+  // AV_PIXEL_FORMAT_SURFACE_FORMAT，并在 Prepare 之前 OH_VideoDecoder_SetSurface
+  // 把 OH_NativeImage 的窗口交给解码器（帧直接渲染进 OES 外部纹理，没有 CPU 可读
+  // 缓冲）；为空 = 原来的 Buffer 模式（NV12 输出，由 swscale 转 BGRA）。失败返回
+  // nullptr（已打日志并销毁实例）。
+  OH_AVCodec* startDecoder(const char* mime, int width, int height, int fps,
+                           void* surfaceWindow) {
+    OH_AVCodec* codec = OH_VideoDecoder_CreateByMime(mime);
+    if (codec == nullptr) {
+      logWarn(formatText("sunshine video: CreateByMime(%s) failed (%dx%d@%d)", mime,
+                         width, height, fps));
+      return nullptr;
+    }
+    OH_AVFormat* format = OH_AVFormat_Create();
+    if (format == nullptr) {
+      OH_VideoDecoder_Destroy(codec);
+      logWarn("sunshine video: OH_AVFormat_Create failed");
+      return nullptr;
+    }
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, width);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, height);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
+                            surfaceWindow != nullptr ? AV_PIXEL_FORMAT_SURFACE_FORMAT
+                                                     : AV_PIXEL_FORMAT_NV12);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, fps);
+    // 串流是实时的：低延迟优先，宁可少缓冲也不要增加端到端延迟。平台不支持该
+    // 键时 SDK 不报错、退回普通解码流程（见头文件说明）。
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENABLE_LOW_LATENCY, 1);
+    OH_AVErrCode result = OH_VideoDecoder_Configure(codec, format);
+    OH_AVFormat_Destroy(format);
+    if (result != AV_ERR_OK) {
+      logWarn(formatText("sunshine video: Configure(%s %dx%d) failed: %d", mime,
+                         width, height, static_cast<int>(result)));
+      OH_VideoDecoder_Destroy(codec);
+      return nullptr;
+    }
+    if (surfaceWindow != nullptr) {
+      result = OH_VideoDecoder_SetSurface(
+          codec, reinterpret_cast<OHNativeWindow*>(surfaceWindow));
+      if (result != AV_ERR_OK) {
+        logWarn(formatText("sunshine video: SetSurface failed: %d",
+                           static_cast<int>(result)));
+        OH_VideoDecoder_Destroy(codec);
+        return nullptr;
+      }
+    }
+
+    // 新接口（API 11+）：Buffer 模式的 onNeedInputBuffer/onNewOutputBuffer 直接给
+    // OH_AVBuffer，比旧的 SetCallback（OH_AVMemory + index）少一次索引查表，也才能
+    // 用 OH_AVBuffer_SetBufferAttr 设置 pts/flags。
+    OH_AVCodecCallback callbacks;
+    std::memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.onError = onErrorCallback;
+    callbacks.onStreamChanged = onStreamChangedCallback;
+    callbacks.onNeedInputBuffer = onNeedInputBufferCallback;
+    callbacks.onNewOutputBuffer = onNewOutputBufferCallback;
+    result = OH_VideoDecoder_RegisterCallback(codec, callbacks, this);
+    if (result != AV_ERR_OK) {
+      logWarn(formatText("sunshine video: RegisterCallback failed: %d",
+                         static_cast<int>(result)));
+      OH_VideoDecoder_Destroy(codec);
+      return nullptr;
+    }
+    result = OH_VideoDecoder_Prepare(codec);
+    if (result != AV_ERR_OK) {
+      logWarn(formatText("sunshine video: Prepare failed: %d",
+                         static_cast<int>(result)));
+      OH_VideoDecoder_Destroy(codec);
+      return nullptr;
+    }
+    return codec;
+  }
 
   // 把单元填进解码器交还的输入 buffer 并下发。调用方持有 ActiveCall，因此这里
   // 可以放心使用 codec（stop() 会等这一轮结束）。
@@ -743,6 +826,53 @@ class AvCodecVideoSink : public SunshineVideoSink {
       geometryDirty_ = true;
     }
     logWarn(formatText("sunshine video: stream changed -> %dx%d", width, height));
+  }
+
+  // Surface 模式的有效画面尺寸：输出描述里的 PIC_WIDTH/PIC_HEIGHT（裁剪后的可见
+  // 尺寸）；取不到就退回 Configure 的协商宽高。只在首帧或 onStreamChanged 之后查
+  // 一次，然后交给宿主（镜像/状态尺寸 + 渲染线程的 contain 几何）。Surface 模式
+  // 没有像素写进镜像（镜像是黑的），所以这里不 commit。
+  void updateSurfaceGeometry(OH_AVCodec* codec) {
+    int fallbackWidth = 0;
+    int fallbackHeight = 0;
+    bool need = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      need = geometryDirty_ || surfaceWidth_ <= 0;
+      fallbackWidth = stats_.width;
+      fallbackHeight = stats_.height;
+    }
+    if (!need) return;
+    int32_t picWidth = 0;
+    int32_t picHeight = 0;
+    OH_AVFormat* description = OH_VideoDecoder_GetOutputDescription(codec);
+    if (description != nullptr) {
+      if (!OH_AVFormat_GetIntValue(description, OH_MD_KEY_VIDEO_PIC_WIDTH, &picWidth))
+        OH_AVFormat_GetIntValue(description, OH_MD_KEY_WIDTH, &picWidth);
+      if (!OH_AVFormat_GetIntValue(description, OH_MD_KEY_VIDEO_PIC_HEIGHT, &picHeight))
+        OH_AVFormat_GetIntValue(description, OH_MD_KEY_HEIGHT, &picHeight);
+      OH_AVFormat_Destroy(description);
+    }
+    if (picWidth <= 0) picWidth = fallbackWidth;
+    if (picHeight <= 0) picHeight = fallbackHeight;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      geometryDirty_ = false;
+    }
+    if (picWidth <= 0 || picHeight <= 0) return;
+    SunshineFrameSink sink;
+    int generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (surfaceWidth_ == picWidth && surfaceHeight_ == picHeight) return;
+      surfaceWidth_ = picWidth;
+      surfaceHeight_ = picHeight;
+      sink = frameSink_;
+      generation = generation_;
+    }
+    if (sink.setSourceSize != nullptr)
+      sink.setSourceSize(sink.user, generation, picWidth, picHeight);
+    logWarn(formatText("sunshine video: surface source %dx%d", picWidth, picHeight));
   }
 
   // 读解码器输出描述（stride / sliceHeight / 可见宽高 / 像素格式）。输出描述是
@@ -859,6 +989,25 @@ class AvCodecVideoSink : public SunshineVideoSink {
         if (submitToOutputUs == 0) submitToOutputUs = lastSubmitToOutputUs_;
       }
       if (submitToOutputUs != 0) g_videoPerf.noteSubmitToOutput(submitToOutputUs);
+    }
+    if (surfaceMode_) {
+      // Surface 模式（零拷贝）：解码器已经把帧渲染进 OH_NativeImage 的窗口，这里
+      // 不再有 CPU 可读缓冲（没有 NV12/BGRA、没有 stride）。只做三件事：
+      //   1) 计解码输出帧数（convert/commit 在这个模式下不存在，保持 0）；
+      //   2) 首帧/onStreamChanged 之后从输出描述更新有效画面尺寸并交给宿主；
+      //   3) 把 buffer 交还解码器：RenderOutputBuffer 同时触发向 surface 的呈现，
+      //      失败时退回 FreeOutputBuffer，避免解码器因为 buffer 不回收而卡住。
+      g_videoPerf.noteDecodedFrame();
+      updateSurfaceGeometry(codec);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.frames;
+        if ((attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0) ++stats_.idrFrames;
+      }
+      if (OH_VideoDecoder_RenderOutputBuffer(codec, index) != AV_ERR_OK) {
+        OH_VideoDecoder_FreeOutputBuffer(codec, index);
+      }
+      return;
     }
     uint8_t* addr = OH_AVBuffer_GetAddr(buffer);
     const int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
@@ -1058,6 +1207,12 @@ class AvCodecVideoSink : public SunshineVideoSink {
   OH_AVCodec* codec_;                 // 受 mutex_ 保护
   bool running_;                      // 受 mutex_ 保护（Start 之前就发布）
   bool started_;                      // 受 mutex_ 保护（Start 已成功）
+  // 本次 setup 走的是零拷贝 Surface 路径（受 mutex_ 保护）。externalSourceHeld_ 表示
+  // 宿主的外部纹理源还在我们手里，必须在 Stop/Destroy 之后再归还。
+  bool surfaceMode_;
+  bool externalSourceHeld_;
+  int surfaceWidth_;   // 受 mutex_ 保护：Surface 模式的有效画面尺寸
+  int surfaceHeight_;
   int activeCalls_;                   // 受 mutex_ 保护
   SunshineFrameSink frameSink_;       // 受 mutex_ 保护
   int generation_;                    // 受 mutex_ 保护

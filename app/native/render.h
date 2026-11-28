@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <string>
+// native_window/external_window.h 的 `typedef struct NativeWindow OHNativeWindow;`
+// 的全局前置声明：本头文件不引入 OHOS 头，签名里用 NativeWindow*。
+struct NativeWindow;
 namespace tianguan {
 
 // Remote-page presenter: one native EGL/GLES render thread per session,
@@ -56,8 +59,12 @@ std::string renderStats(const std::string& sessionId);
 // 一个会话在串流，多个渲染器时以最后发布的为准；没有渲染器时全 0）。
 //   outFps         实际上屏帧率（成功 eglSwapBuffers 的次数 / 窗口长度）；
 //   lagAvgMs/P95Ms 取到帧的时刻减镜像提交时间戳（FrameGrab::commitTimeUs，
-//                  steady_clock 微秒），即「画面提交后多久才被取走」；
-//   pickupToSwap   取到帧到 eglSwapBuffers 返回（含拷贝/上传/绘制）。
+//                  steady_clock 微秒），即「画面提交后多久才被取走」；Surface
+//                  （零拷贝）源下它是「帧可用回调 -> 完成 UpdateSurfaceImage」；
+//   pickupToSwap   取到帧到 eglSwapBuffers 返回（含拷贝/上传/绘制）；Surface 源
+//                  下是 UpdateSurfaceImage 完成到 swap 返回；
+//   frameAvailableToSwapAvgMs/P95Ms  仅 Surface 源有意义：帧可用回调到 swap 返回
+//                  （上面两段之和，含 eglSwapInterval(1) 等待的 vsync）。
 struct RenderFramePerf {
   RenderFramePerf()
       : outFps(0.0),
@@ -65,15 +72,36 @@ struct RenderFramePerf {
         lagP95Ms(0.0),
         pickupToSwapAvgMs(0.0),
         pickupToSwapP95Ms(0.0),
+        frameAvailableToSwapAvgMs(0.0),
+        frameAvailableToSwapP95Ms(0.0),
         windowMs(0) {}
   double outFps;
   double lagAvgMs;
   double lagP95Ms;
   double pickupToSwapAvgMs;
   double pickupToSwapP95Ms;
+  double frameAvailableToSwapAvgMs;
+  double frameAvailableToSwapP95Ms;
   unsigned long long windowMs;  // 0 = 还没有发布过
 };
 RenderFramePerf renderFramePerf();
+
+// 零拷贝视频源（Sunshine 的 AVCodec Surface 模式）。解码器直接渲染进
+// OH_NativeImage 的 OHNativeWindow，渲染线程把同一块画面当 OES 外部纹理解码出来：
+// 没有 NV12->BGRA 转换、没有整帧镜像拷贝、没有 glTexSubImage2D 上传。
+//
+// renderCreateExternalSource: 等到本会话的渲染 surface attach（最多 10 秒；解码
+// 线程调用，会阻塞），然后在渲染线程（GL 上下文当前）建 OES 纹理与 OH_NativeImage，
+// 返回纹理 id 与给 OH_VideoDecoder_SetSurface 用的窗口。失败返回 false，调用方必须
+// 回退到 Buffer 模式。成功后该会话的渲染线程不再读 BGRA 镜像。
+// renderSetExternalSourceSize: 视频路径报告有效画面尺寸，作为 contain 几何的纹理
+// 尺寸（同时发布 texWidth/texHeight，坐标映射继续走 renderStats）。可在任意线程调。
+// renderReleaseExternalSource: 在渲染线程销毁 NativeImage 与纹理；调用方必须已经
+// 停止解码器（否则解码器会向已销毁的窗口提交帧）。会话没有渲染器时是空操作。
+bool renderCreateExternalSource(const std::string& sessionId, unsigned int* textureId,
+                                NativeWindow** nativeWindow);
+void renderSetExternalSourceSize(const std::string& sessionId, int width, int height);
+void renderReleaseExternalSource(const std::string& sessionId);
 // Sets this session's view transform. zoom is clamped to [1, kMaxViewZoom];
 // panX/panY are surface-pixel offsets from the centred position and are
 // clamped against the live surface size while drawing. Returns "OK" or

@@ -66,7 +66,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
     #                            dlopen/dlsym 动态解析，现在直链）
     #   native_buffer            OH_NativeBuffer_GetConfig / Unreference（输出
     #                            缓冲 stride 的兜底来源）
+    #   native_image             OH_NativeImage_Create/AcquireNativeWindow/
+    #                            UpdateSurfaceImage/GetTransformMatrixV2/Destroy：
+    #                            Sunshine 的零拷贝路径（AVCodec Surface 模式 ->
+    #                            OES 外部纹理 -> render.cxx 直接采样）。
     native_media_vdec native_media_core native_media_codecbase native_buffer
+    native_image
     # Static FreeRDP stack, in link order: client-common, core, WinPR, then the
     # static OpenSSL/zlib dependencies. No shared FreeRDP/OpenSSL.
     freerdp-client3 freerdp3 winpr3

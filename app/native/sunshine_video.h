@@ -35,6 +35,20 @@ struct SunshineFrameSink {
   void (*resize)(void* user, int generation, int width, int height) = nullptr;
   void (*commit)(void* user, int generation, const SunshineRect* rects,
                  size_t count, int width, int height) = nullptr;
+
+  // 零拷贝（Surface 模式）帧源，Sunshine 专用；可选，宿主不实现时解码器走原来的
+  // Buffer 模式（NV12 -> BGRA -> commit）。
+  //   acquireExternalSource: 申请一个外部纹理源。成功时填 *textureId（OES 纹理）
+  //     与 *nativeWindow（交给 OH_VideoDecoder_SetSurface 的 OHNativeWindow，用
+  //     void* 表示，避免本头文件依赖 OHOS 类型），失败返回 false（surface 尚未
+  //     attach、超时、或平台不支持）——调用方必须回退 Buffer 模式。
+  //   setSourceSize: 报告 Surface 模式下的有效画面尺寸（没有 stride/像素格式），
+  //     宿主用它更新镜像/状态尺寸，渲染线程用它做 contain 几何。
+  //   releaseExternalSource: 归还外部纹理源，必须在解码器 Stop/Destroy 之后调用。
+  bool (*acquireExternalSource)(void* user, int generation, unsigned int* textureId,
+                                void** nativeWindow) = nullptr;
+  void (*setSourceSize)(void* user, int generation, int width, int height) = nullptr;
+  void (*releaseExternalSource)(void* user, int generation) = nullptr;
 };
 
 // 只读计数，供后端定期打日志（不含任何像素内容）。
